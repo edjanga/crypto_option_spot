@@ -95,7 +95,7 @@ class OptionChainData:
         if multithreading:
             for idx in range(0, len(dates), 7):
                 print(f'[FETCHING]: Option chain data between {dates[idx].strftime("%Y-%m-%d")} and '
-                      f'{dates[idx+7].strftime("%Y-%m-%d")} is being processed...')
+                      f'{dates[idx+6].strftime("%Y-%m-%d")} is being processed...')
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     futures = [executor.submit(lambda x: x, x=date) for date in dates[idx:idx + 7]]
                     for future in concurrent.futures.as_completed(futures):
@@ -116,53 +116,53 @@ class OptionChainData:
                             f'_OPTIONS.csv.gz'))
                         for _, chunk in enumerate(tmp):
                             chunk = chunk.loc[chunk.symbol.str.contains('|'.join(universe)), :]
-                            chunk = chunk.drop(['local_timestamp', 'underlying_index', 'open_interest', 'exchange',
-                                                'last_price', 'ask_iv', 'bid_iv', 'bid_price', 'ask_price'], axis=1)
-                            chunk['timestamp'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in chunk['timestamp']]
-                            chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='ISO8601', utc=True)
-                            chunk['mark_iv'] = chunk['mark_iv'].div(100) ** .5
-                            chunk['volume'] = (chunk['bid_amount'] + chunk['ask_amount']).mul(chunk['mark_price']).mul(
-                                chunk['underlying_price'])
-                            chunk = chunk.drop(['bid_amount', 'ask_amount'], axis=1)
-                            chunk = chunk.set_index('timestamp')
+                            # chunk = chunk.drop(['local_timestamp', 'underlying_index', 'open_interest', 'exchange',
+                            #                     'last_price', 'ask_iv', 'bid_iv', 'bid_price', 'ask_price'], axis=1)
+                            # chunk['timestamp'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in chunk['timestamp']]
+                            # chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='ISO8601', utc=True)
+                            # chunk['mark_iv'] = chunk['mark_iv'].div(100) ** .5
+                            # chunk['volume'] = (chunk['bid_amount'] + chunk['ask_amount']).mul(chunk['mark_price']).mul(
+                            #     chunk['underlying_price'])
+                            # chunk = chunk.drop(['bid_amount', 'ask_amount'], axis=1)
+                            # chunk = chunk.set_index('timestamp')
                             data.append(pd.DataFrame(chunk))
                         data = pd.concat(data)
-                        data = OptionChainData.resample_option_chain_data(data=data)
+                        # data = OptionChainData.resample_option_chain_data(data=data)
                         print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
                               f'has been processed.')
                         data.to_parquet(f'../data_centre/tmp/datasets/{date.strftime("%Y-%m-%d")}')
         else:
             for date in dates:
                 data = list()
-                print(f'[FETCHING]: Option chain data between {date.strftime("%Y-%m-%d")} and '
-                      f'{date.strftime("%Y-%m-%d")} is being processed...')
+                print(f'[FETCHING]: Option chain data between {date.strftime("%Y-%m-%d")} is being processed...')
                 datasets.download(exchange='deribit', data_types=['options_chain'],
                                   from_date=date.strftime('%Y-%m-%d'),
                                   to_date=date.strftime('%Y-%m-%d'), symbols=['OPTIONS'],
                                   api_key=API_KEY, format='csv',
-                                  download_dir=f'{self._target_path}/tmp/')
+                                  download_dir='../data_centre/tmp/datasets')
+                                  #f'{self._target_path}/tmp/')
                 print(f'[PROCESSING]: Option chain data between {date.strftime("%Y-%m-%d")} is being processed...')
                 tmp = pd.read_csv(
-                    f'{self._target_path}/tmp/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz',
+                    f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz',
                     compression='gzip', chunksize=100_000)
                 os.remove(path=os.path.abspath(
-                    f'{self._target_path}/tmp/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz'))
+                    f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz'))
                 for _, chunk in enumerate(tmp):
                     chunk['volume'] = \
                         (chunk['bid_amount'].mul(chunk['bid_price'])).add(chunk['ask_amount'].mul(chunk['ask_price']))
                     chunk = chunk.loc[chunk.symbol.str.contains('|'.join(universe)), :]
-                    chunk = chunk.drop(['local_timestamp', 'underlying_index', 'open_interest', 'exchange',
-                                        'last_price', 'ask_iv', 'bid_iv', 'bid_price', 'ask_price'], axis=1)
-                    chunk['timestamp'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in chunk['timestamp']]
-                    chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='ISO8601', utc=True)
+                    # chunk = chunk.drop(['local_timestamp', 'underlying_index', 'open_interest', 'exchange',
+                    #                     'last_price', 'ask_iv', 'bid_iv', 'bid_price', 'ask_price'], axis=1)
+                    # chunk['timestamp'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in chunk['timestamp']]
+                    # chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='ISO8601', utc=True)
                     chunk['mark_iv'] = chunk['mark_iv'].div(100)
-                    chunk = chunk.drop(['bid_amount', 'ask_amount'], axis=1)
-                    chunk = chunk.set_index('timestamp')
+                    # chunk = chunk.drop(['bid_amount', 'ask_amount'], axis=1)
+                    # chunk = chunk.set_index('timestamp')
                     data.append(pd.DataFrame(chunk))
                 data = pd.concat(data)
-                data = self.resample_option_chain_data(data=data)
+                # data = self.resample_option_chain_data(data=data)
                 print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} has been processed.')
-                data.to_parquet(f'./tmp/datasets/{date.strftime("%Y-%m-%d")}')
+                data.to_parquet(f'../data_centre/tmp/datasets/{date.strftime("%Y-%m-%d")}')
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str = '5min') -> pd.DataFrame:
@@ -198,7 +198,9 @@ if __name__ == '__main__':
     parser.add_argument('--target_path', type=str, help='Target directory to store data.',
                         default='./data_centre/tmp')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
-    parser.add_argument('--end_date', type=str, help='End date (excluded).', default='2023-06-30')
+    parser.add_argument('--end_date', type=str, help='End date (excluded).', default='2023-07-01')
+    parser.add_argument('--multithreading', type=int, help='Use of multithreading or not', default=1)
     args = parser.parse_args()
     option_chain_data_obj = OptionChainData(target_path=args.target_path)
-    option_chain_data_obj.download_option_chain_data(start_date=args.start_date, end_date=args.end_date)
+    option_chain_data_obj.download_option_chain_data(start_date=args.start_date, end_date=args.end_date,
+                                                     multithreading=bool(args.multithreading))
