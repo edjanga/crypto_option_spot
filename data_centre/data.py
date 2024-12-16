@@ -10,11 +10,17 @@ import argparse
 import pytz
 import numpy as np
 from scipy.stats.mstats import winsorize
+import timeit
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
 
 data_centre_dir_data = os.path.abspath(__file__).replace('/data.py', '/tmp/underlying')
+
+agg_features = {feature: 'last' for feature in ['type', 'strike_price', 'expiration', 'last_price',
+                                                'bid_price', 'bid_amount', 'bid_iv', 'ask_price', 'ask_amount',
+                                                'ask_iv', 'mark_price', 'mark_iv', 'underlying_index',
+                                                'underlying_price', 'delta', 'gamma', 'vega', 'theta', 'rho']}
 
 
 class Reader:
@@ -85,8 +91,8 @@ class OptionChainData:
     def __init__(self, target_path: str):
         self._target_path = target_path
 
-    def download_option_chain_data(self, start_date: str, end_date: str, multithreading: bool = True,
-                                   universe: Union[str, List[str]] = 'ETH') -> None:
+    def download_option_chain_data(self, start_date: str, end_date: str, freq: str, chunksize: int,
+                                   multithreading: bool = True, universe: Union[str, List[str]] = 'ETH') -> None:
         start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
         end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
@@ -110,27 +116,18 @@ class OptionChainData:
                             pd.read_csv(
                                 f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
                                 f'_OPTIONS.csv.gz',
-                                compression='gzip', chunksize=100_000)
+                                compression='gzip', chunksize=chunksize)
                         os.remove(path=os.path.abspath(
                             f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
                             f'_OPTIONS.csv.gz'))
                         for _, chunk in enumerate(tmp):
                             chunk = chunk.loc[chunk.symbol.str.contains('|'.join(universe)), :]
-                            # chunk = chunk.drop(['local_timestamp', 'underlying_index', 'open_interest', 'exchange',
-                            #                     'last_price', 'ask_iv', 'bid_iv', 'bid_price', 'ask_price'], axis=1)
-                            # chunk['timestamp'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in chunk['timestamp']]
-                            # chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='ISO8601', utc=True)
-                            # chunk['mark_iv'] = chunk['mark_iv'].div(100) ** .5
-                            # chunk['volume'] = (chunk['bid_amount'] + chunk['ask_amount']).mul(chunk['mark_price']).mul(
-                            #     chunk['underlying_price'])
-                            # chunk = chunk.drop(['bid_amount', 'ask_amount'], axis=1)
-                            # chunk = chunk.set_index('timestamp')
                             data.append(pd.DataFrame(chunk))
                         data = pd.concat(data)
-                        # data = OptionChainData.resample_option_chain_data(data=data)
+                        data = OptionChainData.resample_option_chain_data(data=data, freq=freq)
                         print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
                               f'has been processed.')
-                        data.to_parquet(f'../data_centre/tmp/datasets/{date.strftime("%Y-%m-%d")}')
+                        data.to_parquet(f'../data_centre/tmp/datasets/{date.strftime("%Y-%m-%d")}', compression='gzip')
         else:
             for date in dates:
                 data = list()
@@ -140,29 +137,20 @@ class OptionChainData:
                                   to_date=date.strftime('%Y-%m-%d'), symbols=['OPTIONS'],
                                   api_key=API_KEY, format='csv',
                                   download_dir='../data_centre/tmp/datasets')
-                                  #f'{self._target_path}/tmp/')
                 print(f'[PROCESSING]: Option chain data between {date.strftime("%Y-%m-%d")} is being processed...')
                 tmp = pd.read_csv(
                     f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz',
-                    compression='gzip', chunksize=100_000)
+                    compression='gzip', chunksize=chunksize)
                 os.remove(path=os.path.abspath(
                     f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz'))
                 for _, chunk in enumerate(tmp):
-                    chunk['volume'] = \
-                        (chunk['bid_amount'].mul(chunk['bid_price'])).add(chunk['ask_amount'].mul(chunk['ask_price']))
                     chunk = chunk.loc[chunk.symbol.str.contains('|'.join(universe)), :]
-                    # chunk = chunk.drop(['local_timestamp', 'underlying_index', 'open_interest', 'exchange',
-                    #                     'last_price', 'ask_iv', 'bid_iv', 'bid_price', 'ask_price'], axis=1)
-                    # chunk['timestamp'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in chunk['timestamp']]
-                    # chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='ISO8601', utc=True)
-                    chunk['mark_iv'] = chunk['mark_iv'].div(100)
-                    # chunk = chunk.drop(['bid_amount', 'ask_amount'], axis=1)
-                    # chunk = chunk.set_index('timestamp')
+                    chunk.loc[:, 'mark_iv'] = chunk['mark_iv'].values / 100
                     data.append(pd.DataFrame(chunk))
                 data = pd.concat(data)
-                # data = self.resample_option_chain_data(data=data)
+                data = OptionChainData.resample_option_chain_data(data=data, freq=freq)
                 print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} has been processed.')
-                data.to_parquet(f'../data_centre/tmp/datasets/{date.strftime("%Y-%m-%d")}')
+                data.to_parquet(f'../data_centre/tmp/datasets/{date.strftime("%Y-%m-%d")}', compression='gzip')
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str = '5min') -> pd.DataFrame:
@@ -170,26 +158,20 @@ class OptionChainData:
         put = data.query('type == "put"')
         data = list()
         for tmp in [call, put]:
-            tmp = tmp.assign(option_tag=['-'.join(option_tag[:-1]) for option_tag in tmp['symbol'].str.split('-')])
-            tmp = tmp.drop('symbol', axis=1)
-            tmp = tmp.set_index(['option_tag'], append=True).swaplevel(i=-1, j=0)
-            tmp['mark_price'] = tmp['mark_price'] * tmp['underlying_price']
-            tmp['expiration'] = [datetime.fromtimestamp(idx / 1_000_000) for idx in tmp['expiration']]
+            tmp.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in tmp['symbol'].str.split('-')]
+            tmp.loc[:, 'timestamp'] = \
+                [datetime.fromtimestamp(idx / 1_000_000) for idx in tmp['timestamp'].astype(int)]
+            tmp['timestamp'] = pd.to_datetime(tmp['timestamp'], format='ISO8601', utc=True)
+            tmp.loc[:, 'expiration'] = \
+                [datetime.fromtimestamp(idx / 1_000_000) for idx in tmp['expiration'].astype(int)]
             tmp['expiration'] = pd.to_datetime(tmp['expiration'], format='ISO8601', utc=True)
-            tmp = tmp.assign(moneyness=tmp['underlying_price'].div(tmp['strike_price']))
+            tmp.set_index(['option_tag', 'timestamp'], append=False, inplace=True)
             tmp = tmp.groupby(by=[pd.Grouper(level='option_tag'),
-                                  pd.Grouper(level='timestamp', freq=freq)]).agg({'type': 'last',
-                                                                                  'strike_price': 'last',
-                                                                                  'mark_price': 'last',
-                                                                                  'mark_iv': 'last',
-                                                                                  'underlying_price': 'last',
-                                                                                  'delta': 'last',
-                                                                                  'gamma': 'last', 'vega': 'last',
-                                                                                  'theta': 'last', 'rho': 'last',
-                                                                                  'volume': 'sum',
-                                                                                  'expiration': 'last'})
+                                  pd.Grouper(level='timestamp', freq=freq)], group_keys=False).agg(agg_features)
+            tmp.loc[:, 'moneyness'] = tmp['underlying_price'].values / tmp['strike_price'].values
+            tmp.loc[:, 'mark_price'] = tmp['mark_price'] * tmp['underlying_price']
             data.append(tmp)
-        data = pd.concat(data)
+        data = pd.concat(data).dropna()
         return data
 
 
@@ -200,7 +182,10 @@ if __name__ == '__main__':
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date (excluded).', default='2023-07-01')
     parser.add_argument('--multithreading', type=int, help='Use of multithreading or not', default=1)
+    parser.add_argument('--freq', type=str, help='Frequency used to resample option chain data', default='1h')
+    parser.add_argument('--chunksize', type=int, help='Size of chunk to speed up fetching process', default=100_000)
     args = parser.parse_args()
     option_chain_data_obj = OptionChainData(target_path=args.target_path)
     option_chain_data_obj.download_option_chain_data(start_date=args.start_date, end_date=args.end_date,
-                                                     multithreading=bool(args.multithreading))
+                                                     multithreading=bool(args.multithreading), freq=args.freq,
+                                                     chunksize=args.chunksize)
