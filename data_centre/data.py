@@ -157,9 +157,6 @@ class OptionChainData:
                         f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
                 print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
                       f'has been processed.')
-                os.remove(path=os.path.abspath(
-                    f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
-                    f'_OPTIONS.csv.gz'))
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str = '5min') -> pd.DataFrame:
