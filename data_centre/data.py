@@ -123,16 +123,15 @@ class OptionChainData:
                             data.append(pd.DataFrame(chunk))
                         data = pd.concat(data)
                         data = OptionChainData.resample_option_chain_data(data=data, freq=freq)
-                data.reset_index('option_tag', inplace=True)
-                for symbol in universe:
-                    pdb.set_trace()
-                    data.loc[data.option_tag.str.contains(symbol), :].to_parquet(
-                        f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
-                print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
-                      f'has been processed.')
-                os.remove(path=os.path.abspath(
-                    f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
-                    f'_OPTIONS.csv.gz'))
+                        data.reset_index('option_tag', inplace=True)
+                        for symbol in universe:
+                            data.loc[data.option_tag.str.contains(symbol), :].to_parquet(
+                                f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
+                        print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
+                              f'has been processed.')
+                        os.remove(path=os.path.abspath(
+                            f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
+                            f'_OPTIONS.csv.gz'))
         else:
             for date in dates:
                 data = list()
