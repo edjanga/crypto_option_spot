@@ -10,6 +10,7 @@ import argparse
 import pytz
 import numpy as np
 from scipy.stats.mstats import winsorize
+# import model.constants
 
 
 load_dotenv()
@@ -122,16 +123,17 @@ class OptionChainData:
                             chunk = OptionChainData.process_option_chain_data_chunk(chunk, universe)
                             data.append(pd.DataFrame(chunk))
                         data = pd.concat(data)
-                        data = OptionChainData.resample_option_chain_data(data=data, freq=freq)
-                        data.reset_index('option_tag', inplace=True)
-                        for symbol in universe:
-                            data.loc[data.option_tag.str.contains(symbol), :].to_parquet(
-                                f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
-                        print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
-                              f'has been processed.')
                         os.remove(path=os.path.abspath(
                             f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
                             f'_OPTIONS.csv.gz'))
+                        for symbol in universe:
+                            symbol_option_chain = data.loc[data.option_tag.str.contains(symbol), :].copy()
+                            symbol_option_chain = \
+                                OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                            symbol_option_chain.to_parquet(
+                                f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
+                        print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
+                              f'has been processed.')
         else:
             for date in dates:
                 data = list()
@@ -147,30 +149,35 @@ class OptionChainData:
                     chunk = OptionChainData.process_option_chain_data_chunk(chunk, universe)
                     data.append(pd.DataFrame(chunk))
                 data = pd.concat(data)
-                data = OptionChainData.resample_option_chain_data(data=data, freq=freq)
                 os.remove(path=os.path.abspath(
                     f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz'))
-                data.reset_index('option_tag', inplace=True)
                 for symbol in universe:
-                    data.loc[data.option_tag.str.contains(symbol), :].to_parquet(
+                    symbol_option_chain = data.loc[data.option_tag.str.contains(symbol), :].copy()
+                    symbol_option_chain = \
+                        OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                    symbol_option_chain.to_parquet(
                         f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
                 print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
                       f'has been processed.')
 
     @staticmethod
-    def resample_option_chain_data(data: pd.DataFrame, freq: str = '5min') -> pd.DataFrame:
-        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
+    def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
         data.set_index(['option_tag', 'timestamp'], append=False, inplace=True)
-        data = data.groupby(by=[pd.Grouper(level='option_tag'),
-                                pd.Grouper(level='timestamp', freq=freq)], group_keys=False).agg(agg_features)
-        data.loc[:, 'moneyness'] = data['underlying_price'].values / data['strike_price'].values
-        data.loc[:, 'mark_price'] = data['mark_price'] * data['underlying_price']
-        data.dropna(inplace=True)
-        return data
+        resample_option_chain = list()
+        for type in ['call', 'put']:
+            tmp = data.query(f'type == "{type}"').copy()
+            tmp = tmp.groupby(by=[pd.Grouper(level='option_tag'),
+                                  pd.Grouper(level='timestamp', freq=freq, sort=True)],
+                              group_keys=False).agg(agg_features).dropna()
+            tmp.loc[:, 'moneyness'] = tmp['underlying_price'].values / tmp['strike_price'].values
+            tmp.loc[:, 'mark_price'] = tmp['mark_price'] * tmp['underlying_price']
+            resample_option_chain.append(tmp)
+        return pd.concat(resample_option_chain)
 
     @staticmethod
     def process_option_chain_data_chunk(data: pd.DataFrame, universe: List[str]) -> pd.DataFrame:
         data = data.loc[data.symbol.str.contains('|'.join(universe)), :]
+        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
         data.loc[:, 'mark_iv'] = data['mark_iv'].values / 100
         data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
         data.loc[:, 'timestamp'] = [int(idx / 1_000_000) for idx in data['timestamp']]
