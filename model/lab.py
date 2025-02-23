@@ -1,368 +1,464 @@
-import pdb
-import matplotlib.pyplot as plt
-from data_centre.data import Reader
-# from catalogue import RealNVP
+import concurrent.futures
+from constants import *
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch import distributions
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Lasso
 from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import StandardScaler
-import lightgbm as lgb
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-from typing import Tuple, List, Union, Dict, Callable, Any
-import glob
-import numpy as np
+from typing import List, Union
 import itertools
-from scipy.spatial.distance import euclidean
-from scipy.interpolate import splrep, splev, bisplrep, bisplev, griddata, RectBivariateSpline
-from scipy.optimize import minimize
-from scipy.stats import truncnorm
-import time
-import concurrent.futures
-from scipy.stats import norm, truncnorm
-import torch
 import optuna
 from optuna.samplers import RandomSampler
 from functools import partial
-from preprocessor import DataPreProcessor
-import plotly.express as px
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
+import lightgbm as lgb
+from torch.utils.data import DataLoader
+from .lstm_room import TimeSeriesDataset, LSTMModel
+from sklearn.preprocessing import MaxAbsScaler
+from tqdm import tqdm
+from datetime import datetime
+from sklearn.model_selection import ParameterSampler
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
 
-NUM_BOOST_ROUND = 50
-STOPPING_ROUNDS = 3
-MAX_ITER = 10
-N_TRIALS = 3
-N_JOBS = 1
-EPOCH = 1_000
-EARLY_STOPPING_PATIENCE = 5
 DEVICE = 'cpu'
-# if torch.backends.mps.is_available():
-#     DEVICE = 'mps'
-# elif torch.cuda.is_available():
-#     DEVICE = 'cuda'
-DATE_FORMAT = '%Y-%m-%d'
-BUCKET = 288
-L_train_converter_days = {'1W': 7, '1M': 30, '6M': 180}
+if torch.backends.mps.is_available():
+    DEVICE = 'mps'
+elif torch.cuda.is_available():
+    DEVICE = 'cuda'
+RESAMPLING_MAT_MONEYNESS = ['gex', 'vax', 'vex', 'vox', 'volume', 'gex_exp', 'vax_exp', 'vex_exp', 'vox_exp']
+RESAMPLING_MAT_MONEYNESS = {feature: 'sum' for feature in RESAMPLING_MAT_MONEYNESS}
+RESAMPLING_MAT_MONEYNESS.update({feature: 'last' for feature in ['tau', 'moneyness', 'mark_iv']})
+resampling = RESAMPLING.copy()
+for key in ['ask_iv', 'bid_iv', 'rho', 'theta']:
+    resampling.pop(key)
+mkt_participants_resampling = {'volume': 'sum', 'mark_iv': 'mean'}
 
 
-def custom_loss_metric(tv_pred, data):
-    tv_true = data.get_label()  # Ground truth labels
-    pdb.set_trace()
-    # mae = np.mean(np.abs(y_true - y_pred))  # Calculate MAE
-    # return 'custom_mae', mae, False  # False means lower is better
+class FeatureBuilder:
+    def __init__(self):
+        pass
 
-
-def objective(trial: optuna.trial.Trial, X_train: pd.DataFrame, X_valid: pd.DataFrame):
-    pdb.set_trace()
-    train_loader = lgb.Dataset(data=X_train, label=X_train['total_variance'], free_raw_data=False,
-                               categorical_feature=X_train.filter(regex='is').columns.tolist())
-    valid_loader = lgb.Dataset(data=X_valid, label=X_valid['total_variance'], free_raw_data=False,
-                               categorical_feature=X_train.filter(regex='is').columns.tolist())
-    param = {
-        'objective': 'regression', 'verbosity': -1,
-        'max_depth': trial.suggest_int('max_depth', 1, 3),
-        'lr': trial.suggest_categorical(name='lr', choices=[.01, .05, .1]),
-        'tree_learner': 'data',
-        'extra_tree': True, 'boosting_type': 'goss',
-        #'metric': 'mse' # to be removed when adding custom metric, i.e. arbitrage free total variance feval=custom_mae_metric in lgb.train
-    }
-    tmp_rres = lgb.train(params=param, train_set=train_loader, valid_sets=[valid_loader], feval=custom_loss_metric,
-                         num_boost_round=NUM_BOOST_ROUND,
-                         callbacks=[lgb.early_stopping(STOPPING_ROUNDS,
-                                                       first_metric_only=True, verbose=True, min_delta=0.0)])
-    loss = mean_squared_error(X_valid['total_variance'], tmp_rres.predict(X_valid))
-    trial.set_user_attr(key='best_estimator', value=tmp_rres)
-    return loss
-
-
-def callback(study, trial):
-    if study.best_trial.number == trial.number:
-        study.set_user_attr(key='best_estimator', value=trial.user_attrs['best_estimator'])
-
-
-class HelperIVS(object):
-
-    _deltas = np.linspace(1, 9, 9) / 10
-    _taus = np.array([0, 7, 30, 180, 360])#np.array([0, 1, 7, 30, 45, 60, 90, 180, 360])
     @staticmethod
-    def regress_implied_q_and_r(df: pd.DataFrame) -> np.ndarray:
+    def iv_mat_moneyness(tags: List[List[str]], data: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame()
+        for idx, tag in enumerate(tags):
+            tag_mark_iv = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}" & level_3 == "gex"')
+            tag_mark_iv = tag_mark_iv.drop(['tau', 'moneyness', 'level_3'], axis=1).set_index('timestamp')
+            tag_mark_iv = tag_mark_iv.rename(columns={'mark_iv': f'mark_iv_{tag[0]}_{tag[1]}'})
+            features = \
+                features.join(tag_mark_iv, how={True: 'left', False: 'right'}[features.shape[0] > tag_mark_iv.shape[0]])
+        features.ffill(inplace=True)
+        return features
+
+    @staticmethod
+    def dealer_exposure(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        features = pd.DataFrame()
+        if 'market_participants' in data.columns:
+            tags = data[['market_participants']].values.tolist()
+            tags.sort()
+            tags = list(tag for tag, _ in itertools.groupby(tags))
+            for idx, tag in enumerate(tags):
+                tag_exp = data.query(f'market_participants == "{tag[0]}"')[['exp', 'timestamp']]
+                tag_exp = tag_exp.groupby(by=pd.Grouper(key='timestamp')).mean()
+                tag_exp = tag_exp.rename(columns={'exp': f'exp_{tag[0]}'})
+                features = pd.concat([features, tag_exp], axis=1)
+        else:
+            tags = kwargs['tags']
+            for idx, tag in enumerate(tags):
+                tag_exp = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}"')
+                tag_exp['tag'] = \
+                    [f'{row["level_3"]}_{row["tau"]}_{row["moneyness"]}' for _, row in
+                     tag_exp[['level_3', 'tau', 'moneyness']].iterrows()]
+                tag_exp.drop(['tau', 'moneyness', 'level_3'], axis=1, inplace=True)
+                tag_exp = tag_exp.groupby(by=[pd.Grouper(key='tag'), pd.Grouper(key='timestamp')]).mean().reset_index()
+                tag_exp = pd.pivot_table(data=tag_exp, columns='tag', values='exp', index='timestamp')
+                features = \
+                    features.join(tag_exp, how={True: 'left', False: 'right'}[features.shape[0] > tag_exp.shape[0]])
+            features.ffill(inplace=True)
+        return features
+
+    @staticmethod
+    def option_imbalance(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        features = pd.DataFrame()
+        if 'market_participants' in data.columns:
+            tags = data[['market_participants']].values.tolist()
+            tags.sort()
+            tags = list(tag for tag, _ in itertools.groupby(tags))
+            for idx, tag in enumerate(tags):
+                tag_volume = data.query(f'market_participants == "{tag[0]}"')[['volume', 'timestamp']]
+                tag_volume = tag_volume.groupby(by=pd.Grouper(key='timestamp')).sum()
+                tag_volume = tag_volume.rename(columns={'volume': f'volume_{tag[0]}'})
+                features = pd.concat([features, tag_volume], axis=1)
+        else:
+            tags = kwargs['tags']
+            for idx, tag in enumerate(tags):
+                tag_volume = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}" & level_3 == "gex"')
+                tag_volume = tag_volume.drop(['tau', 'moneyness', 'level_3'], axis=1).set_index('timestamp')
+                tag_volume = tag_volume.rename(columns={'volume': f'volume_{tag[0]}_{tag[1]}'})
+                features = \
+                    features.join(tag_volume,
+                                  how={True: 'left', False: 'right'}[features.shape[0] > tag_volume.shape[0]])
+        features.ffill(inplace=True)
+        return features
+
+    @staticmethod
+    def returns_moments(data: pd.DataFrame, freq: str, lowerbound: int = 2, upperbound: int = 6) -> pd.DataFrame:
         """
-        :return: Two column vectors where the first = dividend yield and the second one = the rate
+        :param lowerbound:  lowerbound (inclusive)
+        :param upperbound:  upperbound (inclusive)
         """
-        y = df.mark_price.values.reshape(-1, 1)
-        X = df[['underlying_price', 'strike_price']].values
-        lr = LinearRegression(fit_intercept=False)
-        lr.fit(X=X, y=y)
-        return np.hstack((np.array(-np.log(lr.coef_[0][0])), np.array(-np.log(lr.coef_[0][1]))), dtype=float)
+        symbol = data.columns[0]
+        returns = (np.log(data.div(data.shift())))
+        rv = (returns**2).resample(freq).sum().rename(columns={symbol: 'RV'})
+        returns = returns.resample(freq).sum().rename(columns={symbol: 'returns'})
+        ret_orders = pd.DataFrame()
+        K = pd.to_timedelta('360D')//pd.to_timedelta(freq)
+        for moment_mth in range({True: lowerbound + 1, False: lowerbound}[lowerbound == 2], upperbound+1):
+            ret_orders = pd.concat([ret_orders,\
+                (K ** (moment_mth-2)/2) * (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum() / \
+            np.sqrt(rv.values ** moment_mth)], axis=1)
+        ret_orders.columns = [f'm{moment_mth}' for moment_mth in range(lowerbound + 1, upperbound+1)]
+        ret_orders = pd.concat([ret_orders, rv, returns], axis=1) if lowerbound == 2 else ret_orders
+        return ret_orders
 
     @staticmethod
-    def implied_q_and_r(df: pd.DataFrame, start: datetime, date: datetime, freq: str) -> pd.DataFrame:
-        call = df.loc[(df.index.date >= start) & (df.index.date <= date), :].query(
-            f'type == "call"').set_index('option_tag', append=True).sort_index()
-        put = df.loc[(df.index.date >= start) & (df.index.date <= date), :].query(
-            f'type == "put"').set_index('option_tag', append=True).sort_index()
-        call = call.loc[~call.index.duplicated(keep='first'), :]
-        put = put.loc[~put.index.duplicated(keep='first'), :]
-        common_idx = call.index.intersection(put.index)
-        call, put = call.loc[common_idx, :], put.loc[common_idx, :]
-        assert call.shape == put.shape
-        target = call.mark_price.subtract(put.mark_price)
-        implied_q_and_r = pd.concat([target, call[['underlying_price', 'strike_price', 'tau']]], axis=1).groupby(
-            by=pd.Grouper(level='timestamp', freq=freq)).apply(lambda x: HelperIVS.regress_implied_q_and_r(x))
-        implied_q_and_r = pd.DataFrame(implied_q_and_r.tolist(), index=implied_q_and_r.index, columns=['q', 'r'])
-        return implied_q_and_r
+    def define_market_participants(data: pd.DataFrame) -> pd.DataFrame:
+        tmp = data.copy()
+        tmp.loc[:, 'market_participants'] = 'retail'
+        tmp.loc[data.moneyness == 'OTM', 'market_participants'] = 'institutions'
+        tmp.loc[data.moneyness.isin(['ATM', 'ITM', 'DITM']), 'market_participants'] = 'informed_traders'
+        return tmp
 
     @staticmethod
-    def preprocess_train_data(df: pd.DataFrame, start: datetime, date: datetime, freq: str) -> pd.DataFrame:
-        implied_q_and_r = HelperIVS.implied_q_and_r(df, start, date, freq)
-        implied_q_and_r = implied_q_and_r.reindex(df.index)
-        implied_q_and_r.ffill(inplace=True)
-        df = pd.concat([df, implied_q_and_r], axis=1)
-        df[['q', 'r']] = df[['q', 'r']].apply(lambda x, y: x.div(y), y=df.tau)
-        df.fillna(0, inplace=True)
-        df.loc[:, 'm'] = HelperIVS.delta2m(df[['mark_iv', 'tau', 'q', 'delta']])
-        return df
+    def compute_exposure(data: pd.DataFrame) -> pd.DataFrame:
+        for exp, greek in GREEKS_EXPOSURE.items():
+            if exp == 'dex':
+                data[exp] = data['netDealerExposure'].mul(data[GREEKS_EXPOSURE[exp]]).mul(data['underlying_price'])
+            elif exp == 'gex':
+                data[exp] = data['netDealerExposure'].mul(data[GREEKS_EXPOSURE[exp]]).mul(data['underlying_price'] ** 2)
+            elif exp == 'vex':
+                data[exp] = data['gex'].mul(data['tau']).mul(data['mark_iv'] ** 2)
+            elif exp == 'vax':
+                data[exp] = data['gex'].mul(np.log(data['strike_price'].div(data['underlying_price'])) +
+                                            .5 * (data['tau'].mul(data['mark_iv'] ** 2)))
+            elif exp == 'vox':
+                data[exp] = data['vax'].mul(-np.log(data['strike_price'].div(data['underlying_price'])) -
+                                            .5 * (data['tau'].mul(data['mark_iv'] ** 2)))
+        return data
 
     @staticmethod
-    def delta2m(df: pd.DataFrame) -> pd.Series:
-        return .5 * df.mark_iv ** 2 * df.tau - \
-            df.mark_iv * df.mark_iv ** .5 * norm.pdf(np.exp(df.q * df.tau) * df.delta)
+    def put_call_ratio(data: pd.DataFrame) -> pd.Series:
+        put_call_ratio = \
+            data.groupby(by=[pd.Grouper(key='type'), pd.Grouper(level='timestamp')])[['volume']].sum()
+        put_call_ratio.reset_index(level=0, inplace=True)
+        put_call_ratio = \
+            put_call_ratio.query('type == "put"').volume.div(put_call_ratio.query('type == "call"').volume)
+        put_call_ratio.name = 'put_call_ratio'
+        return put_call_ratio
 
     @staticmethod
-    def dfw_coefficients(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-        X = df.copy()
-        X = X.assign(m2=X.m ** 2, tau2=X.tau ** 2, m_tau=X.m * X.tau).dropna()
-        lrs = X.groupby(by=pd.Grouper(level='timestamp', freq=freq)).apply(
-            lambda x: LinearRegression(fit_intercept=True).fit(y=x['mark_iv'].values.reshape(-1, 1),
-                                                               X=x[['m', 'tau', 'm2', 'tau2', 'm_tau']].values))
-        lrs = lrs.apply(lambda x: np.vstack((x.intercept_, x.coef_.reshape(-1, 1))).tolist())
-        lrs = lrs.apply(lambda x: list(map(lambda y: y[0], x)))
-        idx = X.index.unique()
-        lrs = pd.DataFrame(lrs.values.tolist(), index=idx.to_series().resample(freq).asfreq())
-        return lrs.reset_index().dropna().set_index('timestamp')
+    def avg_volatility(data: pd.DataFrame, moneyness_label: str, freq: str) -> pd.Series:
+        vol = data.query(f'moneyness == "{moneyness_label}"').drop('moneyness', axis=1)
+        vol['weighted_mark_iv'] = vol['mark_iv'].mul(vol['volume'])
+        vol_weighted_mark_iv = \
+            vol.groupby([pd.Grouper(key='type'),
+                         pd.Grouper(level='timestamp', sort=True, freq=freq)])['weighted_mark_iv'].sum()
+        vol_volume = \
+            vol.groupby([pd.Grouper(key='type'), pd.Grouper(level='timestamp', sort=True, freq=freq)])['volume'].sum()
+        vol = vol_weighted_mark_iv.div(vol_volume).reset_index()
+        vol = \
+            pd.concat([vol.query(f'type == "call"').pivot(index='timestamp', columns='type', values=0),
+                       vol.query(f'type == "put"').pivot(index='timestamp', columns='type', values=0)], axis=1)
+        return vol
 
     @staticmethod
-    def generate_grid(method: str = 'uniform') -> Tuple[np.ndarray]:
-        if method == 'uniform':
-            deltas = HelperIVS._deltas
-        elif method == 'dense_atm':
-            np.random.seed(333)
-            delta_min, delta_max = 0, 1
-            delta_atm, sigma = 0.5, 0.5
-            deltas = \
-                truncnorm.rvs((delta_min - delta_atm) / sigma, (delta_max - delta_atm) / sigma, loc=delta_atm,
-                              scale=sigma, size=50)
-            deltas = np.sort(deltas).tolist()
-        grid = \
-            np.meshgrid(deltas, HelperIVS._taus) if method == 'uniform' else \
-                np.meshgrid(deltas, np.linspace(0, 360, len(deltas))/360)
-        return grid
+    def volatility_skew(data: pd.DataFrame, freq: str) -> pd.DataFrame:
+        moneyness_data = data.copy()
+        volatility_skew = list()
+        dotm = FeatureBuilder.avg_volatility(data=moneyness_data, moneyness_label='DOTM', freq=freq)
+        for idx, label in enumerate(LABELS[1:]):
+            tmp = FeatureBuilder.avg_volatility(data=moneyness_data, moneyness_label=label, freq=freq)
+            tmp = dotm.subtract(tmp).rename(columns={option: f'{option}_DOTM_{label}' for option in tmp.columns})
+            volatility_skew.append(tmp)
+        return pd.concat(volatility_skew, axis=1)
 
     @staticmethod
-    def ivs_interpolation(grid: Tuple[np.ndarray], coef: pd.DataFrame) -> np.ndarray:
-        term1 = coef.iloc[:, 0]
-        term2 = coef.iloc[:, 1].apply(lambda x, y: x * y, y=grid[0])
-        term3 = coef.iloc[:, 2].apply(lambda x, y: x * y, y=grid[1])
-        term4 = coef.iloc[:, 3].apply(lambda x, y: x * y ** 2, y=grid[0])
-        term5 = coef.iloc[:, 4].apply(lambda x, y: x * y ** 2, y=grid[1])
-        term6 = coef.iloc[:, 5].apply(lambda x, y: x * grid[0] * grid[1], y=grid)
-        tmp_grid = term1 + term2 + term3 + term4 + term5 + term6
-        tmp_grid = tmp_grid.apply(lambda x: np.where(x > .01, x, .01))
-        tmp_grid = np.array(list(map(lambda x: x, tmp_grid.values)))
-        return tmp_grid
+    def mkt_participants_pivot_table(group: pd.Grouper) -> pd.DataFrame:
+        data = group.agg(mkt_participants_resampling).reset_index('type')
+        data = \
+            pd.concat([data.query(f'type == "{option_type}"').drop('type', axis=1).rename(
+                columns={col: f'{col}_{option_type}' for col in ['volume', 'mark_iv']}) for
+                option_type in ['call', 'put']], axis=1).reset_index('market_participants')
+        data = \
+            pd.concat([data.query(f'market_participants == "{mkt_participants}"').drop(
+                'market_participants', axis=1).rename(columns={col: f'{mkt_participants}_{col}' for
+                                                               col in data.columns}) for
+                       mkt_participants in MKT_PARTICIPANTS], axis=1)
+        return data
+
+    @staticmethod
+    def lags(data: pd.DataFrame, min_lag: str, max_lag: str):
+        lags_features = LAGS[::]
+        if min_lag not in LAGS:
+            lags_features = [min_lag] + lags_features
+        if max_lag not in LAGS:
+            lags_features = lags_features + [max_lag]
+        tmp = data.drop(['symbol', 'RV', 'returns'], axis=1)
+        for lag in lags_features:
+            if (pd.to_timedelta(lag)//pd.to_timedelta('1D')) == 0:
+                data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
+            else:
+                data = data.join(tmp.rolling(pd.to_timedelta(lag)).mean(), how='left', rsuffix=f'_{lag}')
+        return data.filter(regex='RV|returns|symbol|_([0-9]|[1-9][0-9])([a-zA-Z])')
 
 
-class ForecastIVS(DataPreProcessor, HelperIVS):
+class Regressor:
 
-    def __init__(self, L: str, symbol: Union[str, List[str]], h: str, option_type: str):
-        super().__init__(L=L, h=h)
-        self._symbol = symbol
-        self._option_type = option_type
+    def __init__(self, name: str):
+        self._name = name
 
     @property
-    def option_type(self):
-        return self._option_type
+    def name(self):
+        return self._name
 
-    @option_type.setter
-    def option_type(self, option_type: str):
-        self._option_type = option_type
-
-    @staticmethod
-    def reshape_ivs(ivs_time_of_day: np.ndarray) -> torch.Tensor:
-        len_tau = len(ivs_time_of_day.iloc[0][0])
-        ivs_time_of_day = \
-            np.array([ivs[0].reshape(np.cumprod(ivs[0].shape)[1]) for ivs in ivs_time_of_day.values.tolist()])
-        ivs_time_of_day = \
-            ivs_time_of_day.reshape((ivs_time_of_day.shape[0], len_tau, ivs_time_of_day.shape[-1] // len_tau))
-        return torch.from_numpy(ivs_time_of_day)
+    def model_train(self, features: Union[pd.DataFrame, np.ndarray],
+                    target: Union[pd.DataFrame, np.ndarray], study_name: str):
+        study = optuna.create_study(direction='minimize', study_name=study_name, sampler=RandomSampler(123))
+        objective = partial(self.objective, train_X=features, train_y=target)
+        study.optimize(objective, n_trials=N_TRIALS, callbacks=[self.callback], show_progress_bar=True,
+                       n_jobs=N_JOBS)
+        return study
 
     @staticmethod
-    def objective(trial: optuna.trial.Trial, train: torch.Tensor, valid: torch.Tensor, I0: np.ndarray, **kwargs):
-        generative_model = trial.study.study_name.split('_')[:2]
-        tag = '_'.join(trial.study.study_name.split('_')[2:])
-        generative_model = \
-            '_'.join(generative_model) if generative_model == ['normalising', 'flows'] else generative_model[0]
-        tag = '_'.join([generative_model, tag])
-        print(f'[Start of Training]: Training of {tag} has started.')
-        if generative_model == 'normalising_flows':
-            start = kwargs['date'] - relativedelta(days=L_train_converter_days[kwargs['L_train']])
-            underlying = kwargs['underlying_price']
-            underlying = underlying.filter(regex=kwargs['symbol']).loc[(underlying.index.date >= start) &
-                                                                       (underlying.index.date < kwargs['date']), :]
-            underlying = \
-                underlying.resample(kwargs['h']).sum().mul((pd.to_timedelta('360D') // pd.to_timedelta(kwargs['h'])))
-            rv_matrix = underlying.mean().loc[kwargs['symbol']] * np.eye(N=I0[0].shape[0], M=I0[0].shape[-1])
-            param = {
-                'lr': trial.suggest_categorical(name='lr', choices=[1e-04, 5e-04, 1e-03]),
-                'num_layers': trial.suggest_categorical(name='num_layers', choices=list(range(1, 5))),
-                'size_layers': I0[0].shape[0]
-            }
-            param.update({'sigma2': rv_matrix})
-            prior = distributions.MultivariateNormal(torch.zeros(I0[0].shape[0]), torch.from_numpy(rv_matrix))
-            # prior = np.random.multivariate_normal(np.zeros(I0[0].shape[0]), rv_matrix, I0[0].shape[0])
-            tmp_mask1 = [1 if i % 2 != 0 else 0 for i in range(1, I0[0].shape[0] + 1)]
-            tmp_mask2 = [1 if i % 2 == 0 else 0 for i in range(1, I0[0].shape[0] + 1)]
-            mask = [tmp_mask1, tmp_mask2]
-            mask = torch.from_numpy(np.array(mask * (I0[0].shape[0] // 2)))
-            nets = \
-                lambda: nn.Sequential(nn.Linear(mask.shape[0], param['size_layers'], device=DEVICE,
-                                                dtype=torch.float64),
-                                      nn.LeakyReLU(),
-                                      nn.Linear(param['size_layers'], param['size_layers'], device=DEVICE,
-                                                dtype=torch.float64),
-                                      nn.LeakyReLU(),
-                                      nn.Linear(param['size_layers'], param['size_layers'], device=DEVICE,
-                                                dtype=torch.float64))
-            nett = \
-                lambda: nn.Sequential(nn.Linear(mask.shape[0], param['size_layers'], device=DEVICE,
-                                                dtype=torch.float64),
-                                      nn.LeakyReLU(),
-                                      nn.Linear(param['size_layers'], param['size_layers'], device=DEVICE,
-                                                dtype=torch.float64),
-                                      nn.LeakyReLU(),
-                                      nn.Linear(param['size_layers'], param['size_layers'], device=DEVICE,
-                                                dtype=torch.float64))
-            flow = RealNVP(prior=prior, num_layers=param['num_layers'], mask=mask, nets=nets, nett=nett)
-            optimizer = torch.optim.Adam([p for p in flow.parameters() if p.requires_grad is True], lr=1e-4)
-            best_val_loss = np.inf
-            epochs_without_improvement = 0
-            for epoch in range(0, EPOCH):
-                loss = -flow.log_prob(train).mean()
-                optimizer.zero_grad()
-                loss.backward(retain_graph=True)
-                optimizer.step()
-                pdb.set_trace()
-                if epoch % 100 == 0:
-                    print('iter %s:' % epoch, 'loss = %.3f' % loss)
-
-        elif generative_model == 'vae':
-            pass
+    def model_fine_tune(train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series,
+                        model: Union[Lasso, lgb.LGBMRegressor], n_trials: int,
+                        L: str, target: str, date: datetime, **kwargs):
+        study = optuna.create_study(direction='minimize',
+                                    study_name=f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_'
+                                               f'{date.strftime("%Y-%m-%d")}',
+                                    sampler=RandomSampler(123))
+        study.set_user_attr(key='best_estimator', value=model)
+        objective = partial(Regressor.objective, train_X=train_fine_tune_X, train_y=train_fine_tune_y)
+        study.optimize(objective, n_trials=n_trials, callbacks=[Regressor.callback], show_progress_bar=True,
+                       n_jobs=N_JOBS)
+        return study
 
     @staticmethod
-    def callback(study: optuna.study.study.Study, trial: optuna.trial.Trial):
+    def callback(study, trial):
         if study.best_trial.number == trial.number:
             study.set_user_attr(key='best_estimator', value=trial.user_attrs['best_estimator'])
 
-    def latent_features(self, train: torch.Tensor, valid: torch.Tensor,
-                        extraction_method: str, symbol: str, date: datetime, time_bucket: int, I0: Tuple[np.ndarray]):
-        if extraction_method == 'pca':
-            pdb.set_trace()
-        else:
-            study_name = f'{extraction_method}_{self._L}_{symbol}_{date.strftime("%Y-%m-%d")}_{time_bucket}'
-            study = optuna.create_study(direction='minimize', study_name=study_name, sampler=RandomSampler(123))
-            objective = partial(self.objective, train=train, valid=valid, I0=I0) \
-                if extraction_method != 'normalising_flows' else \
-                partial(self.objective, train=train, valid=valid, h=self._h, date=date, L_train=self._L, symbol=symbol,
-                        underlying_price=self._underlying, I0=I0)
-            study.optimize(objective, n_trials=N_TRIALS, callbacks=[self.callback], n_jobs=N_JOBS)
-            rres = study.user_attrs['best_estimator']
-            return date, rres
-        pdb.set_trace()
-
-    def extract_latent_features_symbol(self, mkt_data: pd.DataFrame, symbol: str, extraction_method: str):
-        dates = list(np.unique([timestamp.date() for timestamp in mkt_data['timestamp']]))
-        mkt_data.set_index('timestamp', inplace=True)
-        start_date = dates[0] + relativedelta(days=L_train_converter_days[self._L])
-        start_idx = dates.index(start_date)
-        # I0 = self.generate_grid(method='dense_atm')
-        eigenvalues_ls = list()
-        for date in dates[start_idx:]:
-            print(f'[Model Calibration]: Parameter calibration for {date.strftime(DATE_FORMAT)} has started...')
-            start = date - relativedelta(days=L_train_converter_days[self._L])
-            train = mkt_data.loc[(mkt_data.index.date >= start) & (mkt_data.index.date <= date), :].copy()
-            train = train.query(f'type == "{self._option_type}"')
-            train = pd.pivot_table(train[['option_tag', 'mark_iv']].reset_index(), columns='option_tag',
-                                   values='mark_iv', index='timestamp')
-            # train = train.subtract(train.min()).div(train.max().subtract(train.min()))
-            train.fillna(0, inplace=True)
-            train_cov = np.cov(train.values.transpose())
-            S = np.linalg.svd(train_cov)[1]
-            S = S / S.sum()
-            eigenvalues_ls.append(S)
-        pd.DataFrame(eigenvalues_ls)[[0]].plot()
-        plt.show()
-        pdb.set_trace()
-
-    def spectral_analysis(self, mkt_data: pd.DataFrame, normalise: bool = False):
-        mkt_data.set_index('timestamp', inplace=True)
-        eigenvalues = pd.DataFrame()
-        for L in ['1W', '1M', '6M']:
-            if L != '1W':
-                self.L = L
-            if L == '6M':
-                break
-            dates = list(np.unique([timestamp.date() for timestamp in mkt_data.index]))
-            start_date = dates[0] + relativedelta(days=L_train_converter_days[self._L])
-            start_idx = dates.index(start_date)
-            eigenvalues_ls = list()
-            for date in dates[start_idx:]:
-                start = date - relativedelta(days=L_train_converter_days[self._L])
-                train = mkt_data.loc[(mkt_data.index.date >= start) & (mkt_data.index.date <= date), :].copy()
-                train = train.query(f'type == "{self._option_type}"')
-                train = pd.pivot_table(train[['option_tag', 'mark_iv']].reset_index(), columns='option_tag',
-                                       values='mark_iv', index='timestamp')
-                if normalise:
-                    train = train.subtract(train.min()).div(train.max().subtract(train.min()))
-                train.fillna(0, inplace=True)
-                train_cov = np.cov(train.values.transpose())
-                S = np.linalg.svd(train_cov)[1]
-                S = S / S.sum()
-                eigenvalues_ls.append(S)
-            tmp = \
-                pd.DataFrame(eigenvalues_ls, index=dates[start_idx:]).cumsum(axis=1).iloc[:, :5].unstack().reset_index()
-            tmp['L'] = self._L
-            eigenvalues = pd.concat([eigenvalues, tmp])
-        fig = make_subplots(rows=5, cols=2, shared_xaxes=False, shared_yaxes=False, vertical_spacing=0.05,
-                            horizontal_spacing=0.1, row_titles=list(range(1, 6, 1)), column_titles=['1W', '1M'])
-        tmp_fig = px.line(data_frame=eigenvalues, facet_row='level_0', facet_col='L', y=0, x='level_1')
-        for idx in range(0, len(tmp_fig.data), 2):
-            fig.add_trace(go.Scatter(x=tmp_fig.data[idx].x, y=tmp_fig.data[idx].y), row=(idx // 2 + 1),
-                          col=idx % 2 + 1)
-            fig.add_trace(go.Scatter(x=tmp_fig.data[idx + 1].x, y=tmp_fig.data[idx + 1].y), row=(idx // 2 + 1),
-                          col=idx % 2 + 2)
-        fig.update_layout(showlegend=False)
-        fig.show()
+    @staticmethod
+    def objective(trial: optuna.trial.Trial, train_X: Union[pd.DataFrame, np.ndarray],
+                  train_y: Union[pd.Series, np.ndarray]) -> float:
+        train_dates = train_X.index.unique()
+        train_dates, valid_dates = train_dates[:int(.8*len(train_dates))], train_dates[int(.8*len(train_dates)):]
+        train_X, valid_X = train_X.loc[train_X.index.isin(train_dates), :], \
+            train_X.loc[train_X.index.isin(valid_dates), :]
+        train_y, valid_y = train_y.loc[train_y.index.isin(train_dates)], \
+            train_y.loc[train_y.index.isin(valid_dates)]
+        if 'lasso' in trial.study.study_name:
+            param = {'objective': 'regression', 'metric': 'mse', 'verbosity': -1,
+                     'alpha': trial.suggest_float('alpha', 1e-1, 3e-1, log=False)
+                     }
+            rres = Lasso(alpha=param['alpha'], fit_intercept=True, random_state=123, max_iter=MAX_ITER,
+                         warm_start=True, selection='random') if len(trial.study.user_attrs) == 0 else \
+                Lasso(**trial.study.user_attrs['best_estimator'].get_params())
+            rres.fit(train_X, train_y.values.reshape(-1, 1))
+        elif ('lightgbm' in trial.study.study_name) | ('booster' in trial.study.study_name):
+            train_loader, valid_loader = lgb.Dataset(train_X, label=train_y), lgb.Dataset(valid_X, label=valid_y)
+            param = {
+                'objective': 'regression', 'metric': 'mse', 'verbosity': -1,
+                'max_depth': trial.suggest_int('max_depth', 1, 3),
+                'lr': trial.suggest_categorical(name='lr', choices=[.01, .05, .1]),
+                'tree_learner': 'data',
+                'feature_fraction': trial.suggest_float('feature_fraction', .1, .8, step=.1, log=False),
+                'extra_tree': True, 'boosting_type': 'goss', 'early_stopping_round': STOPPING_ROUNDS
+            }
+            if 'Fine' not in trial.study.study_name:
+                rres = lgb.train(param, train_set=train_loader, valid_sets=[valid_loader],
+                                 num_boost_round=NUM_BOOST_ROUND,
+                                 callbacks=[lgb.early_stopping(STOPPING_ROUNDS, first_metric_only=True, verbose=True,
+                                                               min_delta=0.0)])
+            else:
+                rres = lgb.train(params=param, init_model=trial.study.user_attrs['best_estimator'],
+                                 train_set=train_loader, valid_sets=[valid_loader], num_boost_round=NUM_BOOST_ROUND,
+                                 callbacks=[lgb.early_stopping(STOPPING_ROUNDS, first_metric_only=True, verbose=True,
+                                                               min_delta=0.0)])
+        loss = mean_squared_error(train_y.values.reshape(-1, 1), rres.predict(train_X).reshape(-1, 1))
+        trial.set_user_attr(key='best_estimator', value=rres)
+        trial.set_user_attr(key='best_score', value=loss)
+        return loss
 
 
-if __name__ == '__main__':
-    reader_obj = Reader()
-    underlying_price = reader_obj.prices_read().resample('5min').last()
-    files = [file for file in glob.glob('../data_centre/tmp/options/*-*-*')]
-    files.sort()
-    data = pd.concat([pd.read_parquet(option_chain) for option_chain in files])
-    data.reset_index(inplace=True)
-    data['timestamp'] = pd.to_datetime(data['timestamp'], utc=True)
-    data = data.set_index('timestamp').join(underlying_price, how='left')
-    data.reset_index(inplace=True)
-    data.drop('underlying_price', axis=1, inplace=True)
-    data = data.rename(columns={'ETHUSDT': 'underlying_price'})
-    data.loc[:, 'tau'] = data['expiration'].subtract(data['timestamp']).div(pd.to_timedelta('1D'))
-    latent_features_obj = ForecastIVS(L='1W', h='1H', symbol='ETHUSDT', option_type='call')
-    #latent_features_obj.extract_latent_features_symbol(mkt_data=data, symbol='ETHUSDT', extraction_method='pca')
-    latent_features_obj.spectral_analysis(mkt_data=data)
+class LassoRegressor(Regressor):
+
+    def __init__(self, name: str = 'lasso'):
+        super(LassoRegressor, self).__init__(name=name)
+
+
+class BoostingRegressor(Regressor):
+
+    def __init__(self, name: str = 'lightgbm'):
+        super(BoostingRegressor, self).__init__(name=name)
+
+
+class LSTMRegressor(Regressor):
+    def __init__(self, name: str = 'lstm', **kwargs):
+        super(LSTMRegressor, self).__init__(name=name)
+        if len(kwargs) > 0:
+            self._model = LSTMModel(**kwargs)
+        self._maxabsscaler = MaxAbsScaler()
+
+    @property
+    def maxabsscaler(self) -> MaxAbsScaler:
+        return self._maxabsscaler
+
+    @property
+    def model(self) -> LSTMModel:
+        return self._model
+
+    @model.setter
+    def model(self, model: LSTMModel) -> None:
+        self._model = model
+
+    def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
+                    n_trials: int = N_TRIALS, max_epochs: int = EPOCH) -> None:
+        train_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_X.iloc[:, :-2])
+        valid_X.iloc[:, :-2] = self._maxabsscaler.transform(X=valid_X.iloc[:, :-2])
+        train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
+        valid_dataset = TimeSeriesDataset(valid_X.values, valid_y.values)
+        best_valid_loss = float('inf')
+        best_params = None
+        best_model = None
+        params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
+        for trial, params in enumerate(params_list):
+            print(f'\nTrial {trial + 1}/{n_trials}')
+            print(f'Parameters: {params}')
+            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=7, persistent_workers=True)
+            valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=7, persistent_workers=True)
+            model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
+                              num_layers=params['num_layers'], learning_rate=params['learning_rate'],
+                              feature_names=train_X.columns.tolist())
+            trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
+                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
+                                 enable_progress_bar=True, num_sanity_val_steps=0)
+            trainer.fit(model, train_loader, valid_loader)
+            valid_loss = trainer.callback_metrics.get('valid_loss', float('inf'))
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                best_params = params
+                best_model = model
+            print(f'Trial {trial + 1} completed. Validation loss: {valid_loss:.4f}')
+        print('\nBest parameters:', best_params)
+        print(f'Best validation loss: {best_valid_loss:.2f}')
+        self._model = best_model
+
+    def model_fine_tune(self, train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
+                        date: datetime, L: str, target: str, n_trials: int = N_TRIALS,
+                        max_epochs: int = EPOCH) -> LSTMModel:
+        print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} has started..')
+        for name, param in model.named_parameters():
+            if name not in ['fc.weight', 'fc.bias']:
+                param.requires_grad = False
+                print(f'Network in {name} layer has been frozen')
+        train_fine_tune_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_fine_tune_X.iloc[:, :-2])
+        train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
+        best_train_loss = float('inf')
+        best_params = None
+        best_model = None
+        params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
+        for trial, params in enumerate(params_list):
+            print(f"\nTrial {trial + 1}/{n_trials}")
+            print(f"Parameters: {params}")
+            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=7, persistent_workers=True)
+            trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
+                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
+                                 enable_progress_bar=True)
+            trainer.fit(model, train_loader)
+            train_loss = trainer.callback_metrics.get('train_loss', float('inf'))
+            if train_loss < best_train_loss:
+                best_train_loss = train_loss
+                best_params = params
+                best_model = model
+            print(f'Trial {trial + 1} completed. Validation loss: {train_loss:.4f}')
+        print(f'\nBest parameters:', best_params)
+        print(f'Best training loss: {best_train_loss:.2f}')
+        print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} completed.')
+        return best_model
+
+
+class PermutationFeatureImportance:
+    def __init__(self, test: Union[pd.DataFrame, np.ndarray, DataLoader] = None,
+                 model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor] = None,
+                 avg_1step: pd.DataFrame = None, test_y: pd.Series = None):
+        self._model = model
+        self._test = test
+        self._avg_1step = avg_1step
+        self._test_y = test_y
+        self.score = dict()
+
+    @property
+    def model(self) -> Union[LassoRegressor, BoostingRegressor, LSTMRegressor]:
+        return self._model
+
+    @model.setter
+    def model(self, model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor]) -> None:
+        self._model = model
+
+    @property
+    def avg_1step(self) -> pd.DataFrame:
+        return self._avg_1step
+
+    @property
+    def test(self) -> Union[pd.DataFrame, np.ndarray, DataLoader]:
+        return self._test
+
+    @test.setter
+    def test(self, test: Union[pd.DataFrame, np.ndarray, DataLoader]) -> None:
+        self._test = test
+
+    @avg_1step.setter
+    def avg_1step(self, avg_1step: pd.DataFrame) -> None:
+        self._avg_1step = avg_1step
+
+    @property
+    def test_y(self) -> pd.Series:
+        return self._test_y
+
+    @test_y.setter
+    def test_y(self, test_y: pd.Series) -> None:
+        self._test_y = test_y
+
+    def shuffle_single_feature(self, feature: str) -> pd.DataFrame:
+        # np.random.seed(123)
+        if isinstance(self._test, pd.DataFrame):
+            shuffled_test = self._test.copy()
+        shuffled_test[feature] = np.random.permutation(shuffled_test[feature].values)
+        return shuffled_test
+
+    def compute_score(self) -> pd.Series:
+        feature_importance = dict([(feature, list()) for feature in self._test.columns])
+        for feature in tqdm(self._test.columns):
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(lambda x: x) for _ in range(0, N_SHUFFLES)]
+                for _ in concurrent.futures.as_completed(futures):
+                    shuffled_test = self.shuffle_single_feature(feature)
+                    if isinstance(self._model, LSTMModel):
+                        shuffled_test = \
+                            torch.from_numpy(shuffled_test.values.reshape((shuffled_test.shape[0], 1,
+                                                                           shuffled_test.shape[1])).astype(np.float32))
+                    self._test_y.iloc[:, 1] = self._model.predict(shuffled_test) \
+                        if isinstance(self._model, (Lasso, lgb.basic.Booster)) else \
+                        self._model(shuffled_test).detach().numpy()
+                    mase = pd.concat([self._test_y.iloc[:, :2], self._test_y['symbol']], axis=1)
+                    mase = mase.set_index('symbol', append=True).swaplevel(-1, 0)
+                    mase = mase.div(self._avg_1step.iloc[0]).abs()
+                    feature_importance[feature].append((mase.mean() - self.mase_benchmark.mean()).abs().iloc[0])
+        return pd.DataFrame(feature_importance).mean()
+
+
+
+
+
 
