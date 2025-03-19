@@ -1,4 +1,6 @@
 import concurrent.futures
+import pdb
+
 from constants import *
 import pandas as pd
 import torch
@@ -198,17 +200,15 @@ class FeatureBuilder:
 
     @staticmethod
     def lags(data: pd.DataFrame, min_lag: str, max_lag: str):
-        lags_features = LAGS[::]
-        if min_lag not in LAGS:
-            lags_features = [min_lag] + lags_features
-        if max_lag not in LAGS:
-            lags_features = lags_features + [max_lag]
+        lags_features = INTRADAY_LAGS+INTERDAY_LAGS
+        lags_features = lags_features[lags_features.index(min_lag):lags_features.index(max_lag)]
         tmp = data.drop(['symbol', 'RV', 'returns'], axis=1)
         for lag in lags_features:
-            if (pd.to_timedelta(lag)//pd.to_timedelta('1D')) == 0:
+            if lag in INTRADAY_LAGS:
                 data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
             else:
-                data = data.join(tmp.rolling(pd.to_timedelta(lag)).mean(), how='left', rsuffix=f'_{lag}')
+                data = data.join(tmp.rolling(pd.to_timedelta(L_TRAIN_CONVERTER_DAYS[lag], unit='D')).mean(), how='left',
+                                 rsuffix=f'_{lag}')
         return data.filter(regex='RV|returns|symbol|_([0-9]|[1-9][0-9])([a-zA-Z])')
 
 
@@ -431,7 +431,6 @@ class PermutationFeatureImportance:
         self._test_y = test_y
 
     def shuffle_single_feature(self, feature: str) -> pd.DataFrame:
-        # np.random.seed(123)
         if isinstance(self._test, pd.DataFrame):
             shuffled_test = self._test.copy()
         shuffled_test[feature] = np.random.permutation(shuffled_test[feature].values)
