@@ -1,14 +1,13 @@
-import pdb
 import numpy as np
 NUM_BOOST_ROUND = 1_000
 STOPPING_ROUNDS = 3
-MAX_ITER = 1#_000
+MAX_ITER = 250
 N_TRIALS = 100
 N_JOBS = 1
-EPOCH = 100
+EPOCH = 50
 EARLY_STOPPING_PATIENCE = 5
 DATE_FORMAT = '%Y-%m-%d'
-L_TRAIN_CONVERTER_DAYS = {'1W': 7, '1M': 30, '6M': 180, '1Y': 360}
+DAYS_CONVERTER = {'1D': 1, '1W': 7, '1M': 30, '6M': 180, '1Y': 360}
 FREQUENCY_CONVERTER = {'1D': 360, '1W': 52}
 # Maturity tags
 zeroDTE, SHORT, MID = 1/360, 7/360, 30/360
@@ -34,15 +33,15 @@ FEES_SPOT = .001
 FEES_STRADDLE_CAP = .125
 FEES_OPTIONS = .0003
 # Core lags
-LAGS = ['30min', '1h', '3h', '6h', '12h', '1D']
+INTRADAY_LAGS = ['15min', '30min', '1h', '3h', '6h', '12h', '1D']
+INTERDAY_LAGS = ['1W', '1M']
 # Volatility regimes
 VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for LSTM
-PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 3, 2)], 'num_layers': list(range(1, 3)),
+PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 8)], 'num_layers': list(range(1, 5)),
                'learning_rate': [0.001, 0.005, 0.01]}
-
-MARKETS = {'returns': 'spot', 'rv': 'options'}
-OPTION_CHAIN_DATA_COLUMNS = ['option_tag', 'type', 'bid_price', 'ask_price', 'moneyness']
-
+MARKETS = {'returns': 'spot', 'RV': 'options'}
+OPTION_CHAIN_DATA_COLUMNS = ['option_tag', 'type', 'bid_price', 'ask_price', 'moneyness', 'mark_iv', 'expiration']
+YEARS = [2021, 2022, 2023]
