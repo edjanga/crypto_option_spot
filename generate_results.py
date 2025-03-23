@@ -1,4 +1,5 @@
 import argparse
+import pdb
 import torch
 import pytz
 import sqlite3
@@ -12,7 +13,8 @@ import glob
 import itertools
 import concurrent.futures
 import optuna
-
+from sklearn.preprocessing import MaxAbsScaler
+from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
 
 RESAMPLING_MAT_MONEYNESS = ['gex', 'vax', 'vex', 'vox', 'volume', 'gex_exp', 'vax_exp', 'vex_exp', 'vox_exp']
 RESAMPLING_MAT_MONEYNESS = {feature: 'sum' for feature in RESAMPLING_MAT_MONEYNESS}
@@ -30,16 +32,18 @@ if __name__ == '__main__':
     parser.add_argument('--regression', type=str, help='Regression technique to be used for modelling.')
     parser.add_argument('--L', type=str, help='Parameter controlling the size of the training set size.')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
-    parser.add_argument('--end_date', type=str, help='End date.', default='2022-01-01')
+    parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target', type=str, help='RV or returns.', default='returns')
     parser.add_argument('--freq', type=str, help='Frequency used to resample and aggregate data', default='1h')
     parser.add_argument('--options', type=int,
                         help='Tag indicating whether options dynamics are included in the models', default=0)
     parser.add_argument('--D', type=str, help='Number of days ahead to forecast values for', default='1D')
+    parser.add_argument('--missing_dates', type=int, help='Check for missing dates', default=0)
     args = parser.parse_args()
     print(args)
     benchmark_model = {True: LassoRegressor(), False: None}[args.regression != 'lasso']
     feature_builder = FeatureBuilder()
+    mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     symbols = ['BTC', 'ETH']
     symbols = list(map(lambda x: f'{x}USDT', symbols))
@@ -170,70 +174,70 @@ if __name__ == '__main__':
     ####################################################################################################################
     features =  \
         pd.concat([features, pd.get_dummies(features['symbol'], prefix='is', prefix_sep='_').astype(int)], axis=1)
-    features.sort_index(inplace=True)
+    features = features.set_index('symbol', append=True).swaplevel(0, 1).sort_index()
+    dates = pd.date_range(start=args.start_date, end=args.end_date, freq='1D', inclusive='left', tz=pytz.UTC)
+    dates = list(dates)
+    ####################################################################################################################
+    ## Check missing dates
+    ####################################################################################################################
+    if args.missing_dates == 1:
+        date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left')
+        missing_dates = list(set(date_range).difference(set(dates)))
+        if len(missing_dates) > 0:
+            missing_dates.sort()
+            print('Data is missing for the following days: \n')
+            for missing_date in missing_dates:
+                print(f'{missing_date.strftime(DATE_FORMAT)}\n')
+        else:
+            print('No Data is missing.\n')
     ####################################################################################################################
     ## Modelling
     ####################################################################################################################
-    benchmark_model = models_factory_dd['lasso']
     model = models_factory_dd[args.regression]
-    dates = pd.date_range(start=args.start_date, end=args.end_date, freq='1D', inclusive='left', tz=pytz.UTC)
-    dates = list(dates)
-    start_idx = dates.index(dates[0]+relativedelta(days=L_TRAIN_CONVERTER_DAYS[args.L]))
+    start_idx = dates.index(dates[0]+relativedelta(days=DAYS_CONVERTER[args.L]))
     models = pd.Series(data=np.nan, index=dates)
-    benchmark_models = pd.Series(data=np.nan, index=dates)
-    avg_1step = dict()
     features_importance = dict()
-    for idx, date in enumerate(dates[start_idx::L_TRAIN_CONVERTER_DAYS[args.L]]):
-        start_date = date-relativedelta(days=L_TRAIN_CONVERTER_DAYS[args.L])
-        train_X = features.loc[(features.index.date >= start_date.date()) & (features.index.date < date.date()), :]
-        in_sample_symbols = train_X.pop('symbol')
+    model_tag = \
+        f'{model.name.upper()}<sup>({args.target}, {args.D}, {dict([(0, "S"), (1, "O")])[args.options]}, ' \
+        f'{args.freq})</sup>'
+    for idx, date in enumerate(dates[start_idx::DAYS_CONVERTER[args.L]]):
+        start_date = date-relativedelta(days=DAYS_CONVERTER[args.L])
+        train_X = features.loc[(features.index.get_level_values(1).date >= start_date.date()) &
+                               (features.index.get_level_values(1).date < date.date()), :]
         train_y = train_X[[args.target]]
         train_X.drop(['RV', 'returns'], axis=1, inplace=True)
-        train_dates = train_X.index.unique()
+        train_dates = list(np.unique(train_X.index.get_level_values(1)))
         train_dates, valid_dates = train_dates[:int(.8 * len(train_dates))], train_dates[int(.8 * len(train_dates)):]
-        train_X, valid_X = train_X.loc[train_X.index.isin(train_dates), :], \
-            train_X.loc[train_X.index.isin(valid_dates), :]
-        train_y, valid_y = train_y.loc[train_y.index.isin(train_dates)], \
-            train_y.loc[train_y.index.isin(valid_dates)]
+        train_X, valid_X = train_X.loc[train_X.index.get_level_values(1).isin(train_dates), :], \
+            train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
+        train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
+            train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
         study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime("%Y-%m-%d")}'
         if model.name in ['lasso', 'lightgbm']:
             rres_study = model.model_train(features=train_X, target=train_y.loc[:, args.target], study_name=study_name)
             models.loc[date] = rres_study.user_attrs['best_estimator']
         else:
-            model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y, n_trials=1,
-                              max_epochs=2)
+            model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y, n_trials=N_TRIALS//10,
+                              max_epochs=EPOCH*5)
             models.loc[date] = model
-        if model.name != 'lasso':
-            benchmark_models.loc[date] = \
-                benchmark_model.model_train(features=train_X, target=train_y.loc[:, args.target],
-                                            study_name=study_name.replace(args.regression, 'lasso_benchmark'))
-        in_sample = pd.DataFrame(data=models.loc[date].predict(train_X),
-                                 index=train_X.index, columns=['y_hat']) if args.regression == 'lasso' else \
-            pd.DataFrame(data=benchmark_models.loc[date].user_attrs['best_estimator'].predict(train_X),
-                         index=train_X.index, columns=['y_hat'])
-        in_sample = pd.concat([in_sample, in_sample_symbols.loc[train_dates]], axis=1)
-        in_sample_shift = \
-            in_sample.groupby(by=pd.Grouper(key='symbol'), group_keys=True)[['y_hat']].apply(lambda x: x.shift())
-        in_sample = in_sample.set_index('symbol', append=True).swaplevel(0, 1)
-        avg_1step[date] = in_sample.sub(in_sample_shift).abs().mean()
-    avg_1step = pd.concat(avg_1step).sort_index(level=0).droplevel(axis=0, level=1)
     models.ffill(inplace=True)
     models.dropna(inplace=True)
     ####################################################################################################################
     ## Performance evaluation
     ####################################################################################################################
-    missing_dates = list()
     forecasts = list()
     mase = list()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(lambda x: x, x=date) for date in dates[start_idx::pd.to_timedelta(args.D).days]]
+        futures = \
+            [executor.submit(lambda x: x, x=date) for date in
+             dates[start_idx::pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days]]
         for future in concurrent.futures.as_completed(futures):
             start_date_forecast = future.result().date()
-            end_date_forecast = (start_date_forecast+relativedelta(days=pd.to_timedelta(args.D).days))
-            test_X = features.loc[(features.index.date >= start_date_forecast) &
-                                  (features.index.date < end_date_forecast), :]
-            out_sample_symbols = test_X.pop('symbol')
+            end_date_forecast = \
+                (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days))
+            test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
+                                  (features.index.get_level_values(1).date < end_date_forecast), :]
             test_y = test_X[[args.target]]
             test_X.drop(['RV', 'returns'], axis=1, inplace=True)
             fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
@@ -250,59 +254,50 @@ if __name__ == '__main__':
                 ########################################################################################################
                 ## Fine-tuning
                 ########################################################################################################
-                train_fine_tune_X = features.loc[(features.index.date >= (date.date()-relativedelta(
-                    days=pd.to_timedelta(args.D)//pd.to_timedelta('1D')))) & (features.index.date < date.date()), :]
-                train_fine_tune_symbols = train_fine_tune_X.pop('symbol')
+                train_fine_tune_X = \
+                    features.loc[features.index.get_level_values(1).date == date.date()-relativedelta(days=1), :]
                 train_fine_tune_y = train_fine_tune_X[[args.target]]
                 train_fine_tune_X.drop(['RV', 'returns'], axis=1, inplace=True)
-                fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=5,
+                fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
                                                          train_fine_tune_y=train_fine_tune_y,
-                                                         model=fine_tuned_model, max_epochs=EPOCH//20, date=date,
+                                                         model=fine_tuned_model, max_epochs=EPOCH, date=date,
                                                          L=args.L, target=args.target)
                 test_y.loc[:, f'{args.target}_hat'] = fine_tuned_model(test_X_tensor).detach().numpy() if \
                     model.name == 'lstm' else fine_tuned_model.user_attrs['best_estimator'].predict(test_X)
             except Exception:
                 if test_X.empty:
-                    missing_dates.append(date)
+                    continue
             else:
                 ########################################################################################################
                 ## Model assessement
                 ########################################################################################################
-                test_y = pd.concat([test_y, out_sample_symbols], axis=1)
-                test_y.loc[:, 'diff'] = test_y[[args.target, f'{args.target}_hat']].diff(axis=1).dropna(axis=1).values
-                y_diff = test_y[['diff', 'symbol']].set_index('symbol', append=True).swaplevel(-1, 0)
-                test_y.drop('diff', inplace=True, axis=1)
-                mase.append(y_diff.div(avg_1step.loc[date]).abs().rename(columns={'diff': 'mase'}))
-                mase[-1].loc[:, 'model_tag'] = \
-                    f'{model.name.upper()}<sup>({args.target}, {args.D}, {dict([(0, "S"), (1, "O")])[args.options]}, ' \
-                    f'{args.freq})</sup>'
-                mase[-1].loc[:, 'model'] = model.name
-                mase[-1].loc[:, 'target'] = args.target
-                mase[-1].loc[:, 'horizon'] = args.D
-                mase[-1].loc[:, 'options'] = args.options
-                mase[-1].loc[:, 'freq'] = args.freq
-                forecasts.append(test_y.rename(columns={args.target: 'values',
-                                                        f'{args.target}_hat': 'forecast'}).assign(target=args.target))
+                mase.append([mase_score(y_true=test_y.iloc[:, 0].droplevel(axis=0, level=0).values,
+                                        y_pred=test_y.iloc[:, 1].droplevel(axis=0, level=0).values,
+                                        y_train=train_y.droplevel(axis=0, level=0).values), start_date_forecast,
+                             model_tag])
+                forecasts.append(
+                    test_y.rename(columns={args.target: 'values', f'{args.target}_hat': 'forecast'}).assign(
+                        model_tag=model_tag))
                 ########################################################################################################
                 ## Feature importance
                 ########################################################################################################
-                permutation_feature_importance_obj.mase_benchmark = mase[-1].loc[:, 'mase']
+                permutation_feature_importance_obj.mase_benchmark = mase[-1][0]
                 if isinstance(fine_tuned_model, optuna.study.study.Study):
                     permutation_feature_importance_obj.model = fine_tuned_model.user_attrs['best_estimator']
                 else:
                     permutation_feature_importance_obj.model = fine_tuned_model
                 permutation_feature_importance_obj.test = test_X
                 permutation_feature_importance_obj.test_y = test_y
-                permutation_feature_importance_obj.avg_1step = avg_1step.dropna()
-                permutation_feature_importance_obj.score[test_y.index[0].date()] = \
+                permutation_feature_importance_obj.train_y = train_y
+                permutation_feature_importance_obj.score[start_date_forecast] = \
                     permutation_feature_importance_obj.compute_score()
     features_importance = pd.DataFrame(permutation_feature_importance_obj.score).transpose()
     features_importance.index = pd.to_datetime(features_importance.index, utc=True)
-    metric = pd.concat(mase).reset_index(level=0).sort_index()
-    forecasts = pd.concat(forecasts)
+    metric = pd.DataFrame(mase, columns=['MASE', 'timestamp', 'model_tag']).set_index('timestamp')
+    forecasts = pd.concat(forecasts).reset_index('symbol')
     metric.index = pd.to_datetime(metric.index, utc=True)
     metric.index.name = 'timestamp'
-    volatility_regime = reader_obj.rv_read(symbol=symbols).resample(args.freq).sum()
+    volatility_regime = reader_obj.rv_read(symbol=symbols).resample('1D').sum()
     volatility_regime = \
         volatility_regime.loc[(volatility_regime.index.date >= metric.index.unique()[0].date()) &
                               (volatility_regime.index.date <= metric.index.unique()[-1].date())].mean(axis=1)
@@ -312,8 +307,8 @@ if __name__ == '__main__':
     features_importance = features_importance.join(volatility_regime, how='left')
     features_importance = pd.melt(ignore_index=False, id_vars=['volatility_regime'],
                                   value_name='MASE', var_name='features', frame=features_importance)
-    features_importance = features_importance.assign(model=model.name, target=args.target, horizon=args.D,
-                                                     options=args.options, freq=args.freq)
+    features_importance = features_importance.assign(regression=args.regression, D=args.D, freq=args.freq,
+                                                     market=args.options)
     ####################################################################################################################
     ## Database insertion
     ####################################################################################################################

@@ -1,6 +1,4 @@
 import concurrent.futures
-import pdb
-
 from constants import *
 import pandas as pd
 import torch
@@ -21,6 +19,8 @@ from sklearn.model_selection import ParameterSampler
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
+from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
+import pdb
 
 DEVICE = 'cpu'
 if torch.backends.mps.is_available():
@@ -114,11 +114,11 @@ class FeatureBuilder:
         rv = (returns**2).resample(freq).sum().rename(columns={symbol: 'RV'})
         returns = returns.resample(freq).sum().rename(columns={symbol: 'returns'})
         ret_orders = pd.DataFrame()
-        K = pd.to_timedelta('360D')//pd.to_timedelta(freq)
+        K = pd.to_timedelta('1D')//pd.to_timedelta(freq)
         for moment_mth in range({True: lowerbound + 1, False: lowerbound}[lowerbound == 2], upperbound+1):
-            ret_orders = pd.concat([ret_orders,\
-                (K ** (moment_mth-2)/2) * (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum() / \
-            np.sqrt(rv.values ** moment_mth)], axis=1)
+            tmp_ret_order = (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum()
+            tmp_ret_order = tmp_ret_order.div(np.sqrt(rv**moment_mth).values).mul(K ** ((moment_mth-2)/2))
+            ret_orders = pd.concat([ret_orders, tmp_ret_order], axis=1)
         ret_orders.columns = [f'm{moment_mth}' for moment_mth in range(lowerbound + 1, upperbound+1)]
         ret_orders = pd.concat([ret_orders, rv, returns], axis=1) if lowerbound == 2 else ret_orders
         return ret_orders
@@ -207,7 +207,7 @@ class FeatureBuilder:
             if lag in INTRADAY_LAGS:
                 data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
             else:
-                data = data.join(tmp.rolling(pd.to_timedelta(L_TRAIN_CONVERTER_DAYS[lag], unit='D')).mean(), how='left',
+                data = data.join(tmp.rolling(pd.to_timedelta(DAYS_CONVERTER[lag], unit='D')).mean(), how='left',
                                  rsuffix=f'_{lag}')
         return data.filter(regex='RV|returns|symbol|_([0-9]|[1-9][0-9])([a-zA-Z])')
 
@@ -251,12 +251,12 @@ class Regressor:
     @staticmethod
     def objective(trial: optuna.trial.Trial, train_X: Union[pd.DataFrame, np.ndarray],
                   train_y: Union[pd.Series, np.ndarray]) -> float:
-        train_dates = train_X.index.unique()
+        train_dates = list(np.unique(train_X.index.get_level_values(1)))
         train_dates, valid_dates = train_dates[:int(.8*len(train_dates))], train_dates[int(.8*len(train_dates)):]
-        train_X, valid_X = train_X.loc[train_X.index.isin(train_dates), :], \
-            train_X.loc[train_X.index.isin(valid_dates), :]
-        train_y, valid_y = train_y.loc[train_y.index.isin(train_dates)], \
-            train_y.loc[train_y.index.isin(valid_dates)]
+        train_X, valid_X = train_X.loc[train_X.index.get_level_values(1).isin(train_dates), :], \
+            train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
+        train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
+            train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
         if 'lasso' in trial.study.study_name:
             param = {'objective': 'regression', 'metric': 'mse', 'verbosity': -1,
                      'alpha': trial.suggest_float('alpha', 1e-1, 3e-1, log=False)
@@ -391,12 +391,13 @@ class LSTMRegressor(Regressor):
 class PermutationFeatureImportance:
     def __init__(self, test: Union[pd.DataFrame, np.ndarray, DataLoader] = None,
                  model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor] = None,
-                 avg_1step: pd.DataFrame = None, test_y: pd.Series = None):
+                 test_y: pd.Series = None, train_y: pd.Series = None):
         self._model = model
         self._test = test
-        self._avg_1step = avg_1step
         self._test_y = test_y
+        self._train_y = train_y
         self.score = dict()
+        self.mase_score = MeanAbsoluteScaledError()
 
     @property
     def model(self) -> Union[LassoRegressor, BoostingRegressor, LSTMRegressor]:
@@ -406,9 +407,6 @@ class PermutationFeatureImportance:
     def model(self, model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor]) -> None:
         self._model = model
 
-    @property
-    def avg_1step(self) -> pd.DataFrame:
-        return self._avg_1step
 
     @property
     def test(self) -> Union[pd.DataFrame, np.ndarray, DataLoader]:
@@ -418,9 +416,6 @@ class PermutationFeatureImportance:
     def test(self, test: Union[pd.DataFrame, np.ndarray, DataLoader]) -> None:
         self._test = test
 
-    @avg_1step.setter
-    def avg_1step(self, avg_1step: pd.DataFrame) -> None:
-        self._avg_1step = avg_1step
 
     @property
     def test_y(self) -> pd.Series:
@@ -429,6 +424,14 @@ class PermutationFeatureImportance:
     @test_y.setter
     def test_y(self, test_y: pd.Series) -> None:
         self._test_y = test_y
+
+    @property
+    def train_y(self) -> pd.Series:
+        return self._train_y
+
+    @train_y.setter
+    def train_y(self, train_y: pd.Series) -> None:
+        self._train_y = train_y
 
     def shuffle_single_feature(self, feature: str) -> pd.DataFrame:
         if isinstance(self._test, pd.DataFrame):
@@ -450,10 +453,11 @@ class PermutationFeatureImportance:
                     self._test_y.iloc[:, 1] = self._model.predict(shuffled_test) \
                         if isinstance(self._model, (Lasso, lgb.basic.Booster)) else \
                         self._model(shuffled_test).detach().numpy()
-                    mase = pd.concat([self._test_y.iloc[:, :2], self._test_y['symbol']], axis=1)
-                    mase = mase.set_index('symbol', append=True).swaplevel(-1, 0)
-                    mase = mase.div(self._avg_1step.iloc[0]).abs()
-                    feature_importance[feature].append((mase.mean() - self.mase_benchmark.mean()).abs().iloc[0])
+                    feature_importance[feature].append(
+                        self.mase_score(y_true=self._test_y.iloc[:, 0].droplevel(axis=0, level=0).values,
+                                        y_pred=self._test_y.iloc[:, 1].droplevel(axis=0, level=0).values,
+                                        y_train=self._train_y.droplevel(axis=0, level=0).values)
+                    )
         return pd.DataFrame(feature_importance).mean()
 
 
