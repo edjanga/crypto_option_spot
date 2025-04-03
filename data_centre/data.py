@@ -10,8 +10,8 @@ import argparse
 import pytz
 import numpy as np
 from scipy.stats.mstats import winsorize
-# import model.constants
 
+DATE_FORMAT = '%Y-%m-%d'
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
@@ -26,41 +26,27 @@ agg_features = {feature: 'last' for feature in ['type', 'strike_price', 'expirat
 
 class Reader:
 
-    def __init__(self, num_sym: int = 20):
+    def __init__(self):
 
-        self._num_sym = num_sym
+        # self._num_sym = num_sym
         self._directory = data_centre_dir_data
         self._df = \
             pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in [2021, 2022, 2023]])
         self._df = self._df.fillna(self._df.ewm(span=12, min_periods=12).mean())
         self._df.dropna(axis=1, inplace=True)
-        self._volume_df = \
-            pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}_volume') for
-                       year in [2021, 2022, 2023]])[self._df.columns]
         self._df.index = pd.to_datetime(self._df.index, utc=pytz.UTC)
-        self._volume_df.index = pd.to_datetime(self._volume_df.index, utc=pytz.UTC)
-        most_liquid_pairs = self._volume_df.mul(self._df).sum().sort_values(ascending=False)[:self._num_sym].index
-        self._df = self._df[most_liquid_pairs]
-        self._volume_df = self._volume_df[most_liquid_pairs]
+        self._df = self._df[['BTCUSDT', 'ETHUSDT']]
 
-    def prices_read(self, symbol: Union[str, List[str]] = 'ETHUSDT') -> pd.DataFrame:
+    def prices_read(self, symbol: Union[str, List[str]] = ['BTCUSDT', 'ETHUSDT']) -> pd.DataFrame:
         if symbol:
             if isinstance(symbol, str):
                 symbol = [symbol]
-
             return self._df[symbol]
         else:
             return self._df
 
-    def volumes_read(self) -> pd.DataFrame:
-        volumes = pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}_volume')
-                             for year in [2021, 2022, 2023]])
-        volumes = volumes[self._df.columns]
-        volumes.index = pd.to_datetime(volumes.index, utc=pytz.UTC)
-        return volumes
-
     def returns_read(self, cutoff_low: float = .01, cutoff_high: float = .01, raw: bool = False,
-                     resampled: bool = True, symbol: Union[List[str], str] = 'ETHUSDT') -> pd.DataFrame:
+                     resampled: bool = True, symbol: Union[List[str], str] = ['BTCUSDT', 'ETHUSDT']) -> pd.DataFrame:
         returns_df = np.log(self._df.div(self._df.shift()))
         if symbol:
             if isinstance(symbol, str):
@@ -76,7 +62,7 @@ class Reader:
         return returns_df
 
     def rv_read(self, cutoff_low: float = .01, cutoff_high: float = .01, raw: bool = False,
-                symbol: Union[List[str], str] = 'ETHUSDT', variance: bool = True)-> pd.DataFrame:
+                symbol: Union[List[str], str] = ['BTCUSDT', 'ETHUSDT'], variance: bool = True)-> pd.DataFrame:
         rv_df = \
             self.returns_read(cutoff_low=cutoff_low, cutoff_high=cutoff_high, raw=raw, resampled=False,
                               symbol=symbol)**2
@@ -93,72 +79,47 @@ class OptionChainData:
         self._target_path = target_path
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str, chunksize: int,
-                                   universe: str, multithreading: bool = True) -> None:
-        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
-        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                                   universe: str) -> None:
+        start_date = datetime.strptime(start_date, DATE_FORMAT).date()
+        end_date = datetime.strptime(end_date, DATE_FORMAT).date()
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
         universe = universe.split('-')
         if isinstance(universe, str):
             universe = [universe]
-        if multithreading:
-            for idx in range(0, len(dates), 7):
-                print(f'[FETCHING]: Option chain data between {dates[idx].strftime("%Y-%m-%d")} and '
-                      f'{dates[idx+6].strftime("%Y-%m-%d")} is being processed...')
+        for date in dates:
+            print(f'[FETCHING]: Option chain data between {date.strftime(DATE_FORMAT)} is being fetched...')
+            datasets.download(exchange='deribit', data_types=['options_chain'],
+                              from_date=date.strftime(DATE_FORMAT), to_date=date.strftime(DATE_FORMAT),
+                              symbols=['OPTIONS'], api_key=API_KEY, format='csv', download_dir='../data_centre')
+            print(f'[PROCESSING]: Option chain data between {date.strftime(DATE_FORMAT)} is being processed...')
+            tmp = pd.read_csv(f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
+                              compression='gzip', chunksize=chunksize)
+            data = (OptionChainData.process_option_chain_data_chunk(chunk, universe) for chunk in tmp)
+            os.remove(path=os.path.abspath(
+                f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz'))
+            for chunk in data:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    futures = [executor.submit(lambda x: x, x=date) for date in dates[idx:idx + 7]]
+                    futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
                     for future in concurrent.futures.as_completed(futures):
-                        data = list()
-                        date = future.result()
-                        datasets.download(exchange='deribit', data_types=['options_chain'],
-                                          from_date=date.strftime('%Y-%m-%d'),
-                                          to_date=date.strftime('%Y-%m-%d'), symbols=['OPTIONS'],
-                                          api_key=API_KEY, format='csv', download_dir='../data_centre/tmp/datasets')
-                        print(f'[PROCESSING]: Option chain data {date.strftime("%Y-%m-%d")} is being processed...')
-                        tmp = \
-                            pd.read_csv(
-                                f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
-                                f'_OPTIONS.csv.gz',
-                                compression='gzip', chunksize=chunksize)
-                        for _, chunk in enumerate(tmp):
-                            chunk = OptionChainData.process_option_chain_data_chunk(chunk, universe)
-                            data.append(pd.DataFrame(chunk))
-                        data = pd.concat(data)
-                        os.remove(path=os.path.abspath(
-                            f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}'
-                            f'_OPTIONS.csv.gz'))
-                        for symbol in universe:
-                            symbol_option_chain = data.loc[data.option_tag.str.contains(symbol), :].copy()
-                            symbol_option_chain = \
-                                OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
-                            symbol_option_chain.to_parquet(
-                                f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
-                        print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
-                              f'has been processed.')
-        else:
-            for date in dates:
-                data = list()
-                print(f'[FETCHING]: Option chain data between {date.strftime("%Y-%m-%d")} is being processed...')
-                datasets.download(exchange='deribit', data_types=['options_chain'], from_date=date.strftime('%Y-%m-%d'),
-                                  to_date=date.strftime('%Y-%m-%d'), symbols=['OPTIONS'], api_key=API_KEY, format='csv',
-                                  download_dir='../data_centre/tmp/datasets')
-                print(f'[PROCESSING]: Option chain data between {date.strftime("%Y-%m-%d")} is being processed...')
-                tmp = pd.read_csv(
-                    f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz',
-                    compression='gzip', chunksize=chunksize)
-                for _, chunk in enumerate(tmp):
-                    chunk = OptionChainData.process_option_chain_data_chunk(chunk, universe)
-                    data.append(pd.DataFrame(chunk))
-                data = pd.concat(data)
-                os.remove(path=os.path.abspath(
-                    f'../data_centre/tmp/datasets/deribit_options_chain_{date.strftime("%Y-%m-%d")}_OPTIONS.csv.gz'))
-                for symbol in universe:
-                    symbol_option_chain = data.loc[data.option_tag.str.contains(symbol), :].copy()
+                        symbol = future.result()
+                        symbol_option_chain = chunk.loc[chunk.option_tag.str.contains(symbol), :].copy()
+                        if not os.path.exists(f'../data_centre/{symbol}'):
+                            os.mkdir(f'../data_centre/{symbol}')
+                        symbol_option_chain.to_parquet(
+                            f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}', engine='fastparquet',
+                            append=os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
+                for future in concurrent.futures.as_completed(futures):
+                    symbol = future.result()
+                    symbol_option_chain = pd.read_parquet(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}')
+                    os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
                     symbol_option_chain = \
                         OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
                     symbol_option_chain.to_parquet(
-                        f'../data_centre/tmp/datasets/{symbol}/{date.strftime("%Y-%m-%d")}', compression='gzip')
-                print(f'[END PROCESSING]: Option chain data for {date.strftime("%Y-%m-%d")} '
-                      f'has been processed.')
+                        f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
+            print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
+                  f'has been processed.')
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -170,34 +131,30 @@ class OptionChainData:
                                   pd.Grouper(level='timestamp', freq=freq, sort=True)],
                               group_keys=False).agg(agg_features).dropna()
             tmp.loc[:, 'moneyness'] = tmp['underlying_price'].values / tmp['strike_price'].values
-            tmp.loc[:, 'mark_price'] = tmp['mark_price'] * tmp['underlying_price']
             resample_option_chain.append(tmp)
         return pd.concat(resample_option_chain)
 
     @staticmethod
     def process_option_chain_data_chunk(data: pd.DataFrame, universe: List[str]) -> pd.DataFrame:
         data = data.loc[data.symbol.str.contains('|'.join(universe)), :]
-        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
-        data.loc[:, 'mark_iv'] = data['mark_iv'].values / 100
-        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
-        data.loc[:, 'timestamp'] = [int(idx / 1_000_000) for idx in data['timestamp']]
-        data.loc[:, 'expiration'] = [int(idx / 1_000_000) for idx in data['expiration']]
-        timestamp = [datetime.fromtimestamp(idx) for idx in data['timestamp']]
-        expiration = [datetime.fromtimestamp(idx) for idx in data['expiration']]
+        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data.loc[:, 'symbol'].str.split('-')]
+        data.loc[:, 'mark_iv'] = data.loc[:, 'mark_iv'].values / 100
+        data.loc[:, 'timestamp'] = [int(idx / 1_000_000) for idx in data.loc[:, 'timestamp']]
+        data.loc[:, 'expiration'] = [int(idx / 1_000_000) for idx in data.loc[:, 'expiration']]
+        timestamp = [datetime.fromtimestamp(idx) for idx in data.loc[:, 'timestamp']]
+        expiration = [datetime.fromtimestamp(idx) for idx in data.loc[:, 'expiration']]
         data.drop(['timestamp', 'expiration'], axis=1, inplace=True)
-        data['timestamp'] = pd.to_datetime(timestamp, format='ISO8601', utc=True, errors='coerce')
-        data['expiration'] = pd.to_datetime(expiration, format='ISO8601', utc=True, errors='coerce')
+        data.loc[:, 'timestamp'] = pd.to_datetime(timestamp, format='ISO8601', utc=True, errors='coerce')
+        data.loc[:, 'expiration'] = pd.to_datetime(expiration, format='ISO8601', utc=True, errors='coerce')
         return data
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script handling data fetching from Tardis.')
-    parser.add_argument('--universe', type=str, help='Symbols to fetch data for.', default='ETH-BTC')
-    parser.add_argument('--target_path', type=str, help='Target directory to store data.',
-                        default='./data_centre/tmp')
+    parser.add_argument('--universe', type=str, help='Symbols to fetch data for.', default='ETH-BTC-BNB-SOL-XRP')
+    parser.add_argument('--target_path', type=str, help='Target directory to store data.', default='./data_centre/tmp')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date (excluded).', default='2023-07-01')
-    parser.add_argument('--multithreading', type=int, help='Use of multithreading or not', default=1)
     parser.add_argument('--freq', type=str, help='Frequency used to resample option chain data', default='5min')
     parser.add_argument('--chunksize', type=int, help='Size of chunk to speed up fetching process', default=100_000)
     args = parser.parse_args()
