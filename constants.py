@@ -33,7 +33,7 @@ FEES_SPOT = .001
 FEES_STRADDLE_CAP = .125
 FEES_OPTIONS = .0003
 # Core lags
-INTRADAY_LAGS = ['15min', '30min', '1h', '3h', '6h', '12h', '1D']
+INTRADAY_LAGS = ['15min', '30min', '1h', '1D'] #, '3h', '6h', '12h', '1D
 INTERDAY_LAGS = ['1W', '1M']
 # Volatility regimes
 VOL_REGIMES = ['Low', 'Normal', 'High']
@@ -45,3 +45,11 @@ PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 8)], 'num_layers': list(ra
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 OPTION_CHAIN_DATA_COLUMNS = ['option_tag', 'type', 'bid_price', 'ask_price', 'moneyness', 'mark_iv', 'expiration']
 YEARS = [2021, 2022, 2023]
+# Font sizes for plots
+TITLE_FONT_SIZE = 40
+LABEL_AXIS_FONT_SIZE = 30
+LEGEND_FONT_SIZE = 20
+HEIGHT = 900
+WIDTH = 1_300
+SYMBOLS = ['BTCUSDT', 'ETHUSDT']
+ATM_MONEYNESSES = np.log(np.linspace(.85, 1.15, 31))
