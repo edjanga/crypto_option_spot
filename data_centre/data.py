@@ -116,7 +116,7 @@ class OptionChainData:
                     symbol = future.result()
                     try:
                         symbol_option_chain = pd.read_parquet(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}')
-                    except FileExistsError:
+                    except FileNotFoundError:
                         continue
                     else:
                         symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
