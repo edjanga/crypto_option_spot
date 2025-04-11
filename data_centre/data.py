@@ -123,6 +123,8 @@ class OptionChainData:
                         os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
                         symbol_option_chain = \
                             OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                        if not os.path.exists(f'../data_centre/{symbol}/{date.year}'):
+                            os.mkdir(f'../data_centre/{symbol}/{date.year}')
                         symbol_option_chain.to_parquet(
                             f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
             print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
