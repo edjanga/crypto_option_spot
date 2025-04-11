@@ -22,8 +22,9 @@ agg_features = {feature: 'last' for feature in ['type', 'strike_price', 'expirat
                                                 'bid_price', 'bid_amount', 'bid_iv', 'ask_price', 'ask_amount',
                                                 'ask_iv', 'mark_price', 'mark_iv', 'underlying_index',
                                                 'underlying_price', 'delta', 'gamma', 'vega', 'theta', 'rho']}
+COLUMNS = ['type', 'strike_price', 'last_price', 'bid_price', 'bid_amount', 'bid_iv',
+           'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega', 'theta', 'rho', 'expiration']
 
-timestamp2datetime = np.vectorize(datetime.fromtimestamp)
 
 
 class Reader:
@@ -113,13 +114,17 @@ class OptionChainData:
                 futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
                 for future in concurrent.futures.as_completed(futures):
                     symbol = future.result()
-                    symbol_option_chain = pd.read_parquet(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}')
-                    symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
-                    os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
-                    symbol_option_chain = \
-                        OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
-                    symbol_option_chain.to_parquet(
-                        f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
+                    try:
+                        symbol_option_chain = pd.read_parquet(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}')
+                    except FileExistsError:
+                        continue
+                    else:
+                        symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
+                        os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
+                        symbol_option_chain = \
+                            OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                        symbol_option_chain.to_parquet(
+                            f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
             print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
                   f'has been processed.')
 
@@ -129,9 +134,8 @@ class OptionChainData:
         data = data.groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=freq, sort=True)],
                             group_keys=False).agg(agg_features).dropna().reset_index('symbol')
         data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data.loc[:, 'symbol'].str.split('-')]
-        data.drop('symbol', axis=1)
         data.loc[:, 'moneyness'] = data['underlying_price'].values / data['strike_price'].values
-        return data
+        return data[COLUMNS]
 
     @staticmethod
     def process_option_chain_data_chunk(data: pd.DataFrame) -> pd.DataFrame:
