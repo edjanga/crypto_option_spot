@@ -23,6 +23,8 @@ agg_features = {feature: 'last' for feature in ['type', 'strike_price', 'expirat
                                                 'ask_iv', 'mark_price', 'mark_iv', 'underlying_index',
                                                 'underlying_price', 'delta', 'gamma', 'vega', 'theta', 'rho']}
 
+timestamp2datetime = np.vectorize(datetime.fromtimestamp)
+
 
 class Reader:
 
@@ -35,7 +37,6 @@ class Reader:
         self._df = self._df.fillna(self._df.ewm(span=12, min_periods=12).mean())
         self._df.dropna(axis=1, inplace=True)
         self._df.index = pd.to_datetime(self._df.index, utc=pytz.UTC)
-        self._df = self._df[['BTCUSDT', 'ETHUSDT']]
 
     def prices_read(self, symbol: Union[str, List[str]] = ['BTCUSDT', 'ETHUSDT']) -> pd.DataFrame:
         if symbol:
@@ -92,9 +93,8 @@ class OptionChainData:
                               from_date=date.strftime(DATE_FORMAT), to_date=date.strftime(DATE_FORMAT),
                               symbols=['OPTIONS'], api_key=API_KEY, format='csv', download_dir='../data_centre')
             print(f'[PROCESSING]: Option chain data between {date.strftime(DATE_FORMAT)} is being processed...')
-            tmp = pd.read_csv(f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
-                              compression='gzip', chunksize=chunksize)
-            data = (OptionChainData.process_option_chain_data_chunk(chunk, universe) for chunk in tmp)
+            data = pd.read_csv(f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
+                               compression='gzip', chunksize=chunksize)
             os.remove(path=os.path.abspath(
                 f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz'))
             for chunk in data:
@@ -102,17 +102,19 @@ class OptionChainData:
                     futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
                     for future in concurrent.futures.as_completed(futures):
                         symbol = future.result()
-                        symbol_option_chain = chunk.loc[chunk.option_tag.str.contains(symbol), :].copy()
-                        if not os.path.exists(f'../data_centre/{symbol}'):
-                            os.mkdir(f'../data_centre/{symbol}')
-                        symbol_option_chain.to_parquet(
-                            f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}', engine='fastparquet',
-                            append=os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
+                        symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :]
+                        if not symbol_option_chain.empty:
+                            if not os.path.exists(f'../data_centre/{symbol}'):
+                                os.mkdir(f'../data_centre/{symbol}')
+                            symbol_option_chain.to_parquet(
+                                f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}', engine='fastparquet',
+                                append=os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
                 for future in concurrent.futures.as_completed(futures):
                     symbol = future.result()
                     symbol_option_chain = pd.read_parquet(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}')
+                    symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
                     os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
                     symbol_option_chain = \
                         OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
@@ -123,29 +125,20 @@ class OptionChainData:
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
-        data.set_index(['option_tag', 'timestamp'], append=False, inplace=True)
-        resample_option_chain = list()
-        for type in ['call', 'put']:
-            tmp = data.query(f'type == "{type}"').copy()
-            tmp = tmp.groupby(by=[pd.Grouper(level='option_tag'),
-                                  pd.Grouper(level='timestamp', freq=freq, sort=True)],
-                              group_keys=False).agg(agg_features).dropna()
-            tmp.loc[:, 'moneyness'] = tmp['underlying_price'].values / tmp['strike_price'].values
-            resample_option_chain.append(tmp)
-        return pd.concat(resample_option_chain)
+        data.set_index(['symbol', 'timestamp'], append=False, inplace=True)
+        data = data.groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=freq, sort=True)],
+                            group_keys=False).agg(agg_features).dropna().reset_index('symbol')
+        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data.loc[:, 'symbol'].str.split('-')]
+        data.drop('symbol', axis=1)
+        data.loc[:, 'moneyness'] = data['underlying_price'].values / data['strike_price'].values
+        return data
 
     @staticmethod
-    def process_option_chain_data_chunk(data: pd.DataFrame, universe: List[str]) -> pd.DataFrame:
-        data = data.loc[data.symbol.str.contains('|'.join(universe)), :]
-        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data.loc[:, 'symbol'].str.split('-')]
+    def process_option_chain_data_chunk(data: pd.DataFrame) -> pd.DataFrame:
         data.loc[:, 'mark_iv'] = data.loc[:, 'mark_iv'].values / 100
-        data.loc[:, 'timestamp'] = [int(idx / 1_000_000) for idx in data.loc[:, 'timestamp']]
-        data.loc[:, 'expiration'] = [int(idx / 1_000_000) for idx in data.loc[:, 'expiration']]
-        timestamp = [datetime.fromtimestamp(idx) for idx in data.loc[:, 'timestamp']]
-        expiration = [datetime.fromtimestamp(idx) for idx in data.loc[:, 'expiration']]
-        data.drop(['timestamp', 'expiration'], axis=1, inplace=True)
-        data.loc[:, 'timestamp'] = pd.to_datetime(timestamp, format='ISO8601', utc=True, errors='coerce')
-        data.loc[:, 'expiration'] = pd.to_datetime(expiration, format='ISO8601', utc=True, errors='coerce')
+        data.loc[:, ['timestamp', 'expiration']] = data.loc[:, ['timestamp', 'expiration']] // 1_000_000
+        data.loc[:, ['timestamp', 'expiration']] = \
+            data.loc[:, ['timestamp', 'expiration']].astype('int64').astype('datetime64[s, UTC]')
         return data
 
 
@@ -160,5 +153,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     option_chain_data_obj = OptionChainData(target_path=args.target_path)
     option_chain_data_obj.download_option_chain_data(start_date=args.start_date, end_date=args.end_date,
-                                                     multithreading=bool(args.multithreading), freq=args.freq,
-                                                     chunksize=args.chunksize, universe=args.universe)
+                                                     freq=args.freq, chunksize=args.chunksize, universe=args.universe)
