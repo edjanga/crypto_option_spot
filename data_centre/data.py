@@ -1,7 +1,7 @@
 import pdb
 from datetime import datetime
 from tardis_dev import datasets
-from typing import Union, List
+from typing import Union, List, Generator
 import pandas as pd
 from dotenv import load_dotenv
 import os
@@ -22,9 +22,11 @@ agg_features = {feature: 'last' for feature in ['type', 'strike_price', 'expirat
                                                 'bid_price', 'bid_amount', 'bid_iv', 'ask_price', 'ask_amount',
                                                 'ask_iv', 'mark_price', 'mark_iv', 'underlying_index',
                                                 'underlying_price', 'delta', 'gamma', 'vega', 'theta', 'rho']}
-COLUMNS = ['type', 'strike_price', 'last_price', 'bid_price', 'bid_amount', 'bid_iv',
-           'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega', 'theta', 'rho', 'expiration']
-
+INT_COLUMNS = ['strike_price', 'expiration', 'timestamp']
+FLOAT_COLUMNS = ['last_price', 'bid_price', 'bid_amount', 'bid_iv', 'ask_price', 'ask_amount', 'mark_iv', 'delta',
+                 'gamma', 'vega', 'theta', 'rho']
+STR_COLUMNS = ['type', 'symbol']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT']
 
 
 class Reader:
@@ -39,7 +41,7 @@ class Reader:
         self._df.dropna(axis=1, inplace=True)
         self._df.index = pd.to_datetime(self._df.index, utc=pytz.UTC)
 
-    def prices_read(self, symbol: Union[str, List[str]] = ['BTCUSDT', 'ETHUSDT']) -> pd.DataFrame:
+    def prices_read(self, symbol: Union[str, List[str]] = SYMBOLS) -> pd.DataFrame:
         if symbol:
             if isinstance(symbol, str):
                 symbol = [symbol]
@@ -48,7 +50,7 @@ class Reader:
             return self._df
 
     def returns_read(self, cutoff_low: float = .01, cutoff_high: float = .01, raw: bool = False,
-                     resampled: bool = True, symbol: Union[List[str], str] = ['BTCUSDT', 'ETHUSDT']) -> pd.DataFrame:
+                     resampled: bool = True, symbol: Union[List[str], str] = SYMBOLS) -> pd.DataFrame:
         returns_df = np.log(self._df.div(self._df.shift()))
         if symbol:
             if isinstance(symbol, str):
@@ -64,7 +66,7 @@ class Reader:
         return returns_df
 
     def rv_read(self, cutoff_low: float = .01, cutoff_high: float = .01, raw: bool = False,
-                symbol: Union[List[str], str] = ['BTCUSDT', 'ETHUSDT'], variance: bool = True)-> pd.DataFrame:
+                symbol: Union[List[str], str] = SYMBOLS, variance: bool = True) -> pd.DataFrame:
         rv_df = \
             self.returns_read(cutoff_low=cutoff_low, cutoff_high=cutoff_high, raw=raw, resampled=False,
                               symbol=symbol)**2
@@ -77,6 +79,8 @@ class Reader:
 
 class OptionChainData:
 
+    _reader_obj = Reader()
+
     def __init__(self, target_path: str):
         self._target_path = target_path
 
@@ -86,6 +90,7 @@ class OptionChainData:
         end_date = datetime.strptime(end_date, DATE_FORMAT).date()
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
         universe = universe.split('-')
+        underlying_prices = self._reader_obj.prices_read().resample('5min').last()
         if isinstance(universe, str):
             universe = [universe]
         for date in dates:
@@ -93,7 +98,8 @@ class OptionChainData:
             datasets.download(exchange='deribit', data_types=['options_chain'],
                               from_date=date.strftime(DATE_FORMAT), to_date=date.strftime(DATE_FORMAT),
                               symbols=['OPTIONS'], api_key=API_KEY, format='csv', download_dir='../data_centre')
-            print(f'[PROCESSING]: Option chain data between {date.strftime(DATE_FORMAT)} is being processed...')
+            print(f'[FETCHING]: Option chain data {date.strftime(DATE_FORMAT)} has been fetched.')
+            print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
             data = pd.read_csv(f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
                                compression='gzip', chunksize=chunksize)
             os.remove(path=os.path.abspath(
@@ -103,19 +109,23 @@ class OptionChainData:
                     futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
                     for future in concurrent.futures.as_completed(futures):
                         symbol = future.result()
-                        symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :]
+                        symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
                         if not symbol_option_chain.empty:
                             if not os.path.exists(f'../data_centre/{symbol}'):
                                 os.mkdir(f'../data_centre/{symbol}')
-                            symbol_option_chain.to_parquet(
-                                f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}', engine='fastparquet',
-                                append=os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
+                            symbol_option_chain.to_csv(
+                                f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                mode='a', compression='gzip',
+                                header=not os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
                 for future in concurrent.futures.as_completed(futures):
                     symbol = future.result()
                     try:
-                        symbol_option_chain = pd.read_parquet(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}')
+                        symbol_option_chain = \
+                            pd.read_csv(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                        chunksize=chunksize, compression='gzip',
+                                        usecols=INT_COLUMNS+FLOAT_COLUMNS+STR_COLUMNS)
                     except FileNotFoundError:
                         continue
                     else:
@@ -123,29 +133,43 @@ class OptionChainData:
                         os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
                         symbol_option_chain = \
                             OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                        symbol_option_chain.loc[:, 'moneyness'] = \
+                            np.log(underlying_prices[f'{symbol}USDT'].reindex(symbol_option_chain.index).div(
+                                symbol_option_chain['strike_price'].values))
                         if not os.path.exists(f'../data_centre/{symbol}/{date.year}'):
                             os.mkdir(f'../data_centre/{symbol}/{date.year}')
                         symbol_option_chain.to_parquet(
                             f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
             print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
                   f'has been processed.')
+            pdb.set_trace()
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
         data.set_index(['symbol', 'timestamp'], append=False, inplace=True)
         data = data.groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=freq, sort=True)],
-                            group_keys=False).agg(agg_features).dropna().reset_index('symbol')
-        data.loc[:, 'option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data.loc[:, 'symbol'].str.split('-')]
-        data.loc[:, 'moneyness'] = data['underlying_price'].values / data['strike_price'].values
-        return data[COLUMNS]
+                            group_keys=False).last().dropna().reset_index('symbol')
+        data['option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
+        return data[INT_COLUMNS[:-1]+FLOAT_COLUMNS+['option_tag']]
 
     @staticmethod
-    def process_option_chain_data_chunk(data: pd.DataFrame) -> pd.DataFrame:
-        data.loc[:, 'mark_iv'] = data.loc[:, 'mark_iv'].values / 100
-        data.loc[:, ['timestamp', 'expiration']] = data.loc[:, ['timestamp', 'expiration']] // 1_000_000
-        data.loc[:, ['timestamp', 'expiration']] = \
-            data.loc[:, ['timestamp', 'expiration']].astype('int64').astype('datetime64[s, UTC]')
-        return data
+    def process_option_chain_data_chunk(data: Union[pd.DataFrame, Generator]) -> pd.DataFrame:
+        if isinstance(data, pd.DataFrame):
+            for col_name, series in data.items():
+                if col_name in ['mark_iv', 'timestamp', 'expiration']:
+                    data.loc[:, col_name] = series.div(1_000_000).astype('int64').astype('datetime64[s, UTC]') \
+                        if col_name in ['timestamp', 'expiration'] else series.div(100)
+            return data
+        elif isinstance(data, pd.io.parsers.readers.TextFileReader):
+            tmp = list()
+            for chunk in data:
+                for col_name, series in chunk.items():
+                    if col_name in ['mark_iv', 'timestamp', 'expiration']:
+                        series = pd.to_numeric(series, errors='coerce')
+                        chunk[col_name] = series.div(1_000_000).astype('int64').astype('datetime64[s, UTC]') \
+                            if col_name in ['timestamp', 'expiration'] else series.div(100)
+                tmp.append(chunk)
+            return pd.concat(tmp)
 
 
 if __name__ == '__main__':
