@@ -142,7 +142,6 @@ class OptionChainData:
                             f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
             print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
                   f'has been processed.')
-            pdb.set_trace()
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
