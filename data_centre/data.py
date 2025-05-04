@@ -32,13 +32,15 @@ SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT']
 class Reader:
 
     def __init__(self):
-
-        # self._num_sym = num_sym
         self._directory = data_centre_dir_data
-        self._df = \
-            pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in [2021, 2022, 2023]])
+        try:
+            self._df = \
+                pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in range(2021, 2026)])
+        except Exception:
+            self._df = \
+                pd.concat([pd.read_csv(f'{self._directory}/aggregate{str(year)}',
+                                       index_col='timestamp') for year in range(2021, 2026)])
         self._df = self._df.fillna(self._df.ewm(span=12, min_periods=12).mean())
-        self._df.dropna(axis=1, inplace=True)
         self._df.index = pd.to_datetime(self._df.index, utc=pytz.UTC)
 
     def prices_read(self, symbol: Union[str, List[str]] = SYMBOLS) -> pd.DataFrame:
@@ -149,7 +151,7 @@ class OptionChainData:
         data = data.groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=freq, sort=True)],
                             group_keys=False).last().dropna().reset_index('symbol')
         data['option_tag'] = ['-'.join(option_tag[:-1]) for option_tag in data['symbol'].str.split('-')]
-        return data[INT_COLUMNS[:-1]+FLOAT_COLUMNS+['option_tag']]
+        return data[INT_COLUMNS[:-1]+FLOAT_COLUMNS+['option_tag', 'type']]
 
     @staticmethod
     def process_option_chain_data_chunk(data: Union[pd.DataFrame, Generator]) -> pd.DataFrame:
