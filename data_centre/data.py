@@ -10,6 +10,7 @@ import argparse
 import pytz
 import numpy as np
 from scipy.stats.mstats import winsorize
+from dateutil.relativedelta import relativedelta
 
 DATE_FORMAT = '%Y-%m-%d'
 
@@ -88,62 +89,62 @@ class OptionChainData:
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str, chunksize: int,
                                    universe: str) -> None:
-        start_date = datetime.strptime(start_date, DATE_FORMAT).date()
-        end_date = datetime.strptime(end_date, DATE_FORMAT).date()
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
         universe = universe.split('-')
         underlying_prices = self._reader_obj.prices_read().resample('5min').last()
         if isinstance(universe, str):
             universe = [universe]
-        for date in dates:
-            print(f'[FETCHING]: Option chain data between {date.strftime(DATE_FORMAT)} is being fetched...')
-            datasets.download(exchange='deribit', data_types=['options_chain'],
-                              from_date=date.strftime(DATE_FORMAT), to_date=date.strftime(DATE_FORMAT),
-                              symbols=['OPTIONS'], api_key=API_KEY, format='csv', download_dir='../data_centre')
-            print(f'[FETCHING]: Option chain data {date.strftime(DATE_FORMAT)} has been fetched.')
-            print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
-            data = pd.read_csv(f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
-                               compression='gzip', chunksize=chunksize)
-            os.remove(path=os.path.abspath(
-                f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz'))
-            for chunk in data:
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
-                    for future in concurrent.futures.as_completed(futures):
-                        symbol = future.result()
-                        symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
-                        if not symbol_option_chain.empty:
-                            if not os.path.exists(f'../data_centre/{symbol}'):
-                                os.mkdir(f'../data_centre/{symbol}')
-                            symbol_option_chain.to_csv(
-                                f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}',
-                                mode='a', compression='gzip',
-                                header=not os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [executor.submit(lambda x: x, x=symbol) for symbol in universe]
-                for future in concurrent.futures.as_completed(futures):
-                    symbol = future.result()
-                    try:
-                        symbol_option_chain = \
-                            pd.read_csv(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}',
-                                        chunksize=chunksize, compression='gzip',
-                                        usecols=INT_COLUMNS+FLOAT_COLUMNS+STR_COLUMNS)
-                    except FileNotFoundError:
-                        continue
-                    else:
-                        symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
-                        os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
-                        symbol_option_chain = \
-                            OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
-                        symbol_option_chain.loc[:, 'moneyness'] = \
-                            np.log(underlying_prices[f'{symbol}USDT'].reindex(symbol_option_chain.index).div(
-                                symbol_option_chain['strike_price'].values))
-                        if not os.path.exists(f'../data_centre/{symbol}/{date.year}'):
-                            os.mkdir(f'../data_centre/{symbol}/{date.year}')
-                        symbol_option_chain.to_parquet(
-                            f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}', compression='gzip')
-            print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
-                  f'has been processed.')
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(lambda x: x, x=date) for date in dates[::7]]
+            for future in concurrent.futures.as_completed(futures):
+                tmp_start_date = future.result().strftime(DATE_FORMAT)
+                tmp_end_date = (future.result() + relativedelta(days=7)).strftime(DATE_FORMAT)
+                print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
+                datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
+                                  to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
+                                  concurrency=7, download_dir='../data_centre')
+                print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} has been fetched....')
+                week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='both', freq='1D'))
+                for date in week:
+                    print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
+                    data = \
+                        pd.read_csv(f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
+                                    compression='gzip', chunksize=chunksize)
+                    os.remove(path=os.path.abspath(
+                        f'../data_centre/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz'))
+                    for chunk in data:
+                        for symbol in universe:
+                            symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
+                            if not symbol_option_chain.empty:
+                                if not os.path.exists(f'../data_centre/{symbol}'):
+                                    os.mkdir(f'../data_centre/{symbol}')
+                                symbol_option_chain.to_csv(
+                                    f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                    mode='a', compression='gzip',
+                                    header=not os.path.exists(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
+                    for symbol in universe:
+                        try:
+                            symbol_option_chain = \
+                                pd.read_csv(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                            chunksize=chunksize, compression='gzip',
+                                            usecols=INT_COLUMNS + FLOAT_COLUMNS + STR_COLUMNS)
+                        except FileNotFoundError:
+                            continue
+                        else:
+                            symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
+                            os.remove(path=os.path.abspath(f'../data_centre/{symbol}/{date.strftime(DATE_FORMAT)}'))
+                            symbol_option_chain = \
+                                OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                            symbol_option_chain.loc[:, 'moneyness'] = \
+                                np.log(underlying_prices[f'{symbol}USDT'].reindex(symbol_option_chain.index).div(
+                                    symbol_option_chain['strike_price'].values))
+                            if not os.path.exists(f'../data_centre/{symbol}/{date.year}'):
+                                os.mkdir(f'../data_centre/{symbol}/{date.year}')
+                            symbol_option_chain.to_parquet(
+                                f'../data_centre/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}',
+                                compression='gzip')
+                    print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
+                          f'has been processed.')
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
