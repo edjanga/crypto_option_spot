@@ -36,11 +36,11 @@ class Reader:
         self._directory = data_centre_dir_data
         try:
             self._df = \
-                pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in range(2021, 2026)])
+                pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in range(2024, 2026)])
         except Exception:
             self._df = \
                 pd.concat([pd.read_csv(f'{self._directory}/aggregate{str(year)}',
-                                       index_col='timestamp') for year in range(2021, 2026)])
+                                       index_col='timestamp') for year in range(2024, 2026)])
         self._df = self._df.fillna(self._df.ewm(span=12, min_periods=12).mean())
         self._df.index = pd.to_datetime(self._df.index, utc=pytz.UTC)
 
@@ -104,7 +104,7 @@ class OptionChainData:
                                   to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
                                   concurrency=7, download_dir=self._target_path)
                 print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} has been fetched....')
-                week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='both', freq='1D'))
+                week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='left', freq='1D'))
                 for date in week:
                     print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
                     data = \
