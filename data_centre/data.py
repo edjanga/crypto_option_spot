@@ -1,3 +1,4 @@
+import glob
 import pdb
 from datetime import datetime
 from tardis_dev import datasets
@@ -36,11 +37,11 @@ class Reader:
         self._directory = data_centre_dir_data
         try:
             self._df = \
-                pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in range(2024, 2026)])
+                pd.concat([pd.read_parquet(f'{self._directory}/aggregate{str(year)}') for year in range(2023, 2026)])
         except Exception:
             self._df = \
                 pd.concat([pd.read_csv(f'{self._directory}/aggregate{str(year)}',
-                                       index_col='timestamp') for year in range(2024, 2026)])
+                                       index_col='timestamp') for year in range(2023, 2026)])
         self._df = self._df.fillna(self._df.ewm(span=12, min_periods=12).mean())
         self._df.index = pd.to_datetime(self._df.index, utc=pytz.UTC)
 
@@ -90,15 +91,19 @@ class OptionChainData:
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str, chunksize: int,
                                    universe: str) -> None:
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
+        symbol_directories = dict()
+        for symbol in SYMBOLS:
+            symbol_directories[symbol.replace('USDT', '')] = \
+                [filename.split('/')[-1] for filename in glob.glob(f'../data_centre/{symbol.replace("USDT", "")}/*/*')]
         universe = universe.split('-')
         underlying_prices = self._reader_obj.prices_read().resample('5min').last()
         if isinstance(universe, str):
             universe = [universe]
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(lambda x: x, x=date) for date in dates[::7]]
+            futures = [executor.submit(lambda x: x, x=date) for date in dates[::2]]
             for future in concurrent.futures.as_completed(futures):
                 tmp_start_date = future.result().strftime(DATE_FORMAT)
-                tmp_end_date = (future.result() + relativedelta(days=7)).strftime(DATE_FORMAT)
+                tmp_end_date = (future.result() + relativedelta(days=2)).strftime(DATE_FORMAT)
                 print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
                 datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
                                   to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
@@ -115,40 +120,43 @@ class OptionChainData:
                         f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz'))
                     for chunk in data:
                         for symbol in universe:
-                            symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
-                            if not symbol_option_chain.empty:
-                                if not os.path.exists(f'{self._target_path}/{symbol}'):
-                                    os.mkdir(f'{self._target_path}/{symbol}')
-                                symbol_option_chain.to_csv(
-                                    f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}',
-                                    mode='a', compression='gzip',
-                                    header=not os.path.exists(
-                                        f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}')
-                                )
+                            if not date.strftime(DATE_FORMAT) in symbol_directories[symbol]:
+                                if not os.path.exists(f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}'):
+                                    symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
+                                    if not symbol_option_chain.empty:
+                                        if not os.path.exists(f'{self._target_path}/{symbol}'):
+                                            os.mkdir(f'{self._target_path}/{symbol}')
+                                        symbol_option_chain.to_csv(
+                                            f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                            mode='a', compression='gzip',
+                                            header=not os.path.exists(
+                                                f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}')
+                                        )
                     for symbol in universe:
-                        try:
-                            symbol_option_chain = \
-                                pd.read_csv(f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}',
-                                            chunksize=chunksize, compression='gzip',
-                                            usecols=INT_COLUMNS + FLOAT_COLUMNS + STR_COLUMNS)
-                        except FileNotFoundError:
-                            continue
-                        else:
-                            symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
-                            os.remove(
-                                path=os.path.abspath(f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}'))
-                            symbol_option_chain = \
-                                OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
-                            symbol_option_chain.loc[:, 'moneyness'] = \
-                                np.log(underlying_prices[f'{symbol}USDT'].reindex(symbol_option_chain.index).div(
-                                    symbol_option_chain['strike_price'].values))
-                            if not os.path.exists(f'{self._target_path}/{symbol}/{date.year}'):
-                                os.mkdir(f'{self._target_path}/{symbol}/{date.year}')
-                            symbol_option_chain.to_parquet(
-                                f'{self._target_path}/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}',
-                                compression='gzip')
-                    print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
-                          f'has been processed.')
+                        if not date.strftime(DATE_FORMAT) in symbol_directories[symbol]:
+                            try:
+                                symbol_option_chain = \
+                                    pd.read_csv(f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                                chunksize=chunksize, compression='gzip',
+                                                usecols=INT_COLUMNS + FLOAT_COLUMNS + STR_COLUMNS)
+                            except FileNotFoundError:
+                                continue
+                            else:
+                                symbol_option_chain = self.process_option_chain_data_chunk(symbol_option_chain)
+                                os.remove(
+                                    path=os.path.abspath(f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}'))
+                                symbol_option_chain = \
+                                    OptionChainData.resample_option_chain_data(data=symbol_option_chain, freq=freq)
+                                symbol_option_chain.loc[:, 'moneyness'] = \
+                                    np.log(underlying_prices[f'{symbol}USDT'].reindex(symbol_option_chain.index).div(
+                                        symbol_option_chain['strike_price'].values))
+                                if not os.path.exists(f'{self._target_path}/{symbol}/{date.year}'):
+                                    os.mkdir(f'{self._target_path}/{symbol}/{date.year}')
+                                symbol_option_chain.to_parquet(
+                                    f'{self._target_path}/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}',
+                                    compression='gzip')
+                            print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
+                                  f'has been processed.')
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -181,7 +189,7 @@ class OptionChainData:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script handling data fetching from Tardis.')
     parser.add_argument('--universe', type=str, help='Symbols to fetch data for.', default='ETH-BTC-BNB-SOL-XRP')
-    parser.add_argument('--target_path', type=str, help='Target directory to store data.', default='./data_centre/tmp')
+    parser.add_argument('--target_path', type=str, help='Target directory to store data.', default='../data_centre')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date (excluded).', default='2023-07-01')
     parser.add_argument('--freq', type=str, help='Frequency used to resample option chain data', default='5min')
