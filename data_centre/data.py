@@ -100,10 +100,10 @@ class OptionChainData:
         if isinstance(universe, str):
             universe = [universe]
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(lambda x: x, x=date) for date in dates[::2]]
+            futures = [executor.submit(lambda x: x, x=date) for date in dates[::3]]
             for future in concurrent.futures.as_completed(futures):
                 tmp_start_date = future.result().strftime(DATE_FORMAT)
-                tmp_end_date = (future.result() + relativedelta(days=2)).strftime(DATE_FORMAT)
+                tmp_end_date = (future.result() + relativedelta(days=3)).strftime(DATE_FORMAT)
                 print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
                 datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
                                   to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
@@ -121,17 +121,16 @@ class OptionChainData:
                     for chunk in data:
                         for symbol in universe:
                             if not date.strftime(DATE_FORMAT) in symbol_directories[symbol]:
-                                if not os.path.exists(f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}'):
-                                    symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
-                                    if not symbol_option_chain.empty:
-                                        if not os.path.exists(f'{self._target_path}/{symbol}'):
-                                            os.mkdir(f'{self._target_path}/{symbol}')
-                                        symbol_option_chain.to_csv(
-                                            f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}',
-                                            mode='a', compression='gzip',
-                                            header=not os.path.exists(
-                                                f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}')
-                                        )
+                                symbol_option_chain = chunk.loc[chunk.symbol.str.contains(symbol), :].dropna()
+                                if not symbol_option_chain.empty:
+                                    if not os.path.exists(f'{self._target_path}/{symbol}'):
+                                        os.mkdir(f'{self._target_path}/{symbol}')
+                                    symbol_option_chain.to_csv(
+                                        f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}',
+                                        mode='a', compression='gzip',
+                                        header=not os.path.exists(
+                                            f'{self._target_path}/{symbol}/{date.strftime(DATE_FORMAT)}')
+                                    )
                     for symbol in universe:
                         if not date.strftime(DATE_FORMAT) in symbol_directories[symbol]:
                             try:
@@ -155,8 +154,9 @@ class OptionChainData:
                                 symbol_option_chain.to_parquet(
                                     f'{self._target_path}/{symbol}/{date.year}/{date.strftime(DATE_FORMAT)}',
                                     compression='gzip')
-                            print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
-                                  f'has been processed.')
+                                symbol_directories[symbol].append(date.strftime(DATE_FORMAT))
+                    print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
+                          f'has been processed.')
 
     @staticmethod
     def resample_option_chain_data(data: pd.DataFrame, freq: str) -> pd.DataFrame:
