@@ -13,6 +13,7 @@ import numpy as np
 from scipy.stats.mstats import winsorize
 from dateutil.relativedelta import relativedelta
 import polars as pl
+import time
 
 DATE_FORMAT = '%Y-%m-%d'
 
@@ -61,7 +62,7 @@ class Reader:
             if isinstance(symbol, str):
                 symbol = [symbol]
             returns_df = returns_df[symbol]
-        returns_df.dropna(inplace=True)
+        # returns_df.dropna(inplace=True)
         """Winsorise returns"""
         if not raw:
             returns_df = returns_df.apply(lambda x: winsorize(x, (cutoff_low, cutoff_high)))
@@ -89,36 +90,32 @@ class OptionChainData:
     def __init__(self, target_path: str):
         self._target_path = target_path
 
-    def return_date(self, date: datetime) -> datetime:
-        return date
-
     def save_daily_option_chain(self, symbol: str, date: datetime, freq: str, underlying_price: pl.DataFrame) -> None:
         print(f'[PROCESSING]: Option chain data {symbol}USDT-{date.strftime(DATE_FORMAT)} is being processed...')
-        option_chain_data = pl.scan_csv(
-            f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
-            schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS+['open_interest']+INT_COLUMNS]),
-            ).filter(pl.col('symbol').str.contains(f'{symbol.replace("USDT", "")}')).collect().sort(['symbol',
-                                                                                                     'timestamp'])
+        option_chain_data = \
+            pl.scan_csv(
+                source=f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
+                schema_overrides=dict([(col, pl.Float64) for col in FLOAT_COLUMNS+['open_interest']+INT_COLUMNS] +
+                                      [(col, pl.String) for col in ['symbol', 'type']]),
+            ).select(['symbol', 'timestamp', 'type', 'strike_price', 'expiration', 'open_interest', 'last_price',
+                      'bid_price', 'bid_amount', 'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega',
+                      'theta', 'rho']).sort(['symbol', 'timestamp'])
+        option_chain_data = option_chain_data.filter(pl.col('symbol').str.contains(f'{symbol.replace("USDT", "")}'))
         option_chain_data = option_chain_data.with_columns([
-            (pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC')).alias('timestamp'),
-            (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')).alias('expiration'),
-            (pl.col('mark_iv') / 100).alias('mark_iv')
+            (pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC')),
+            (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')), (pl.col('mark_iv') / 100)
         ])
         option_chain_data = \
             (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
                                                 group_by='symbol', include_boundaries=False,
                                                 period=None).agg([pl.all().last()]).drop_nulls())
+        option_chain_data = option_chain_data.collect()
         option_chain_data = \
-            option_chain_data.join(
-                underlying_price.with_columns(
-                    pl.col('timestamp').cast(pl.Datetime('ms', 'UTC')).alias('timestamp')),
-                on='timestamp', how='left')
+            option_chain_data.join(underlying_price.with_columns(pl.col('timestamp').cast(pl.Datetime('ms', 'UTC')),
+                                                                 (pl.col(f'{symbol}USDT')).alias('underlying_price')),
+                                   on='timestamp', how='left')
         option_chain_data = option_chain_data.with_columns([
             (pl.col('underlying_price') / pl.col('strike_price')).log().alias('moneyness')])
-        option_chain_data = option_chain_data.drop([f'{symbol}USDT', 'local_timestamp', 'exchange'])
-        option_chain_data.write_parquet(
-            f'{self._target_path}/{symbol.replace("USDT", "")}/{date.year}/{date.strftime(DATE_FORMAT)}',
-            compression='gzip')
         os.makedirs(f'{self._target_path}/{symbol.replace("USDT", "")}', exist_ok=True)
         os.makedirs(f'{self._target_path}/{symbol.replace("USDT", "")}/{date.year}', exist_ok=True)
         option_chain_data.write_parquet(
@@ -135,25 +132,22 @@ class OptionChainData:
             [(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC')).alias('underlying_price')])
         if isinstance(universe, str):
             universe = [universe]
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            futures = [executor.submit(self.return_date, date) for date in dates[::3]]
-            for future in concurrent.futures.as_completed(futures):
-                tmp_start_date = future.result().strftime(DATE_FORMAT)
-                tmp_end_date = (future.result() + relativedelta(days=3)).strftime(DATE_FORMAT)
-                print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
-                # datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
-                #                   to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
-                #                   concurrency=7, download_dir=self._target_path)
-                print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} has been fetched.')
-                week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='left', freq='1D'))
-                for date in week:
-                    for symbol in universe:
-                        self.save_daily_option_chain(symbol, date, freq,
-                                                     underlying_prices.select([f'{symbol}USDT', 'timestamp']))
-                    print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
-                          f'has been processed.')
-                    os.remove(f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz')
-                    pdb.set_trace()
+        for tmp_start_date in dates[::7]:
+            tmp_end_date = (tmp_start_date + relativedelta(days=7)).strftime(DATE_FORMAT)
+            tmp_start_date = tmp_start_date.strftime(DATE_FORMAT)
+            print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
+            datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
+                              to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
+                              concurrency=7, download_dir=self._target_path)
+            print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} has been fetched.')
+            week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='both', freq='1D'))
+            for date in week:
+                for symbol in universe:
+                    self.save_daily_option_chain(symbol, date, freq,
+                                                 underlying_prices.select([f'{symbol}USDT', 'timestamp']))
+                print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} '
+                      f'has been processed.')
+                os.remove(f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz')
 
 
 if __name__ == '__main__':
