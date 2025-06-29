@@ -111,8 +111,8 @@ class OptionChainData:
                                                 period=None).agg([pl.all().last()]).drop_nulls())
         option_chain_data = option_chain_data.collect()
         option_chain_data = \
-            option_chain_data.join(underlying_price.with_columns(pl.col('timestamp').cast(pl.Datetime('ms', 'UTC')),
-                                                                 (pl.col(f'{symbol}USDT')).alias('underlying_price')),
+            option_chain_data.join(underlying_price.with_columns([(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC')),
+                                                                 (pl.col(f'{symbol}USDT')).alias('underlying_price')]),
                                    on='timestamp', how='left')
         option_chain_data = option_chain_data.with_columns([
             (pl.col('underlying_price') / pl.col('strike_price')).log().alias('moneyness')])
@@ -129,16 +129,16 @@ class OptionChainData:
         universe = universe.split('-')
         underlying_prices = \
             pl.from_dataframe(self._reader_obj.prices_read().resample('5min').last()).with_columns(
-            [(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC'))])
+                [(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC'))])
         if isinstance(universe, str):
             universe = [universe]
         for tmp_start_date in dates[::7]:
             tmp_end_date = (tmp_start_date + relativedelta(days=7)).strftime(DATE_FORMAT)
             tmp_start_date = tmp_start_date.strftime(DATE_FORMAT)
             print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
-            datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
-                              to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
-                              concurrency=7, download_dir=self._target_path)
+            # datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
+            #                   to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
+            #                   concurrency=7, download_dir=self._target_path)
             print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} has been fetched.')
             week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='both', freq='1D'))
             for date in week:
