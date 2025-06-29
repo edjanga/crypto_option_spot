@@ -129,7 +129,7 @@ class OptionChainData:
         universe = universe.split('-')
         underlying_prices = \
             pl.from_dataframe(self._reader_obj.prices_read().resample('5min').last()).with_columns(
-            [(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC')).alias('underlying_price')])
+            [(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC'))])
         if isinstance(universe, str):
             universe = [universe]
         for tmp_start_date in dates[::7]:
