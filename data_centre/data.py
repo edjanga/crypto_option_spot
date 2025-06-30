@@ -141,14 +141,10 @@ class OptionChainData:
 
     def save_daily_option_chain(self, date: datetime, freq: str) -> None:
         print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
-        start_time = time.time()
         with Pool(processes=2) as pool:
             results = \
                 pool.starmap(self.save_daily_option_chain_per_symbol, [[symbol, date, freq] for symbol in SYMBOLS])
         print(f'[END PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
-        end_time = time.time()
-        print(end_time-start_time)
-        pdb.set_trace()
         return
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str) -> None:
