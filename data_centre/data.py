@@ -88,28 +88,34 @@ class OptionChainData:
 
     _reader_obj = Reader()
     _underlying_prices = _reader_obj.prices_read().resample('5min').last()
-    # _underlying_prices = underlying_prices.unstack().reset_index().rename(
-    #     columns={'level_0': 'underlying_name', 0: 'underlying_price'})
     _underlying_prices = \
         pl.from_dataframe(_underlying_prices).with_columns([(pl.col('timestamp')).cast(pl.Datetime('ms', 'UTC'))])
 
     def __init__(self, target_path: str):
         self._target_path = target_path
 
-    def save_daily_option_chain_per_symbol(self, symbol: str, date: datetime, freq: str) -> None:
-        print(f'[PROCESSING]: Option chain data {symbol}_{date.strftime(DATE_FORMAT)} is being processed...')
+    def save_daily_option_chain(self, date: datetime, freq: str) -> None:
+        underlying_price = OptionChainData._underlying_prices.filter(pl.col('timestamp').dt.date() == date)
+        underlying_price = underlying_price.to_pandas().set_index('timestamp')
+        underlying_price = \
+            pd.melt(underlying_price, value_name='underlying_price', var_name='underlying_name', ignore_index=False)
+        underlying_price.reset_index(inplace=True)
+        underlying_price = pl.from_dataframe(underlying_price).lazy()
+        print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
         option_chain_data = \
             pl.scan_csv(
                 source=f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
-                schema_overrides=dict([(col, pl.Float64) for col in FLOAT_COLUMNS + ['open_interest'] + INT_COLUMNS] +
+                schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest']] +
+                                      [(col, pl.Int64) for col in INT_COLUMNS] +
                                       [(col, pl.String) for col in ['symbol', 'type']]),
+                low_memory=True
             ).select(
                 ['symbol', 'timestamp', 'type', 'strike_price', 'expiration', 'open_interest', 'last_price',
                  'bid_price', 'bid_amount', 'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega',
                  'theta', 'rho']
             ).with_columns(
                 (pl.col('symbol').str.split('-').list.get(0) + 'USDT').alias('underlying_name')
-            ).filter(pl.col('underlying_name') == symbol).sort(['symbol', 'timestamp'])
+            ).sort(['symbol', 'timestamp'])
         option_chain_data = option_chain_data.with_columns([
             (pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC')),
             (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')), (pl.col('mark_iv') / 100),
@@ -118,55 +124,40 @@ class OptionChainData:
             (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
                                                 group_by='symbol', include_boundaries=False,
                                                 period=None).agg([pl.all().last()]).drop_nulls())
-        option_chain_data = option_chain_data.collect()
-        underlying_price = \
-            OptionChainData._underlying_prices.select(
-                pl.col(symbol), pl.col('timestamp')).filter(pl.col('timestamp').dt.date() == date)
-        underlying_price = underlying_price.with_columns([pl.lit(symbol).alias('underlying_name'),
-                                                          pl.col(symbol).alias('underlying_price')]).drop(symbol)
         option_chain_data = option_chain_data.join(underlying_price, on=['underlying_name', 'timestamp'], how='left')
         option_chain_data = option_chain_data.with_columns([
             (pl.col('underlying_price') / pl.col('strike_price')).log().alias('moneyness'),
-            (pl.col('ask_price') * pl.col('underlying_price')), (pl.col('bid_price') * pl.col('underlying_price')),
-            (pl.col('last_price') * pl.col('underlying_price')),
+            (pl.col('ask_price') * pl.col('underlying_price')).alias('ask_price'),
+            (pl.col('bid_price') * pl.col('underlying_price')).alias('bid_price'),
+            (pl.col('last_price') * pl.col('underlying_price')).alias('last_price'),
         ])
         option_chain_data = option_chain_data.drop_nulls()
         os.makedirs(f'{self._target_path}/{date.year}', exist_ok=True)
-        option_chain_data = option_chain_data.to_pandas()
-        option_chain_data.to_parquet(
-            path=f'{self._target_path}/{date.year}/{date.strftime(DATE_FORMAT)}', engine='fastparquet',
-            append=os.path.exists(f'{self._target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
-        )
-        print(f'[PROCESSING]: Option chain data {symbol}_{date.strftime(DATE_FORMAT)} has been processed.')
-
-    def save_daily_option_chain(self, date: datetime, freq: str) -> None:
-        print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
-        with Pool(processes=2) as pool:
-            results = \
-                pool.starmap(self.save_daily_option_chain_per_symbol, [[symbol, date, freq] for symbol in SYMBOLS])
-        print(f'[END PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
+        option_chain_data.sink_parquet(path=f'{self._target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
+        print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
         return
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str) -> None:
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
-        for tmp_start_date in dates[::7]:
-            tmp_end_date = (tmp_start_date + relativedelta(days=7)).strftime(DATE_FORMAT)
-            tmp_start_date = tmp_start_date.strftime(DATE_FORMAT)
-            print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} is being fetched....')
-            # datasets.download(exchange='deribit', data_types=['options_chain'], from_date=tmp_start_date,
-            #                   to_date=tmp_end_date, symbols=['OPTIONS'], api_key=API_KEY, format='csv',
-            #                   concurrency=7, download_dir=self._target_path)
-            print(f'[FETCHING]: Option chain data between {tmp_start_date} and {tmp_end_date} has been fetched.')
-            week = list(pd.date_range(start=tmp_start_date, end=tmp_end_date, inclusive='both', freq='1D'))
+        for tmp_start_date in dates[::6]:
+            print(f'[FETCHING]: Option chain data between {tmp_start_date.strftime(DATE_FORMAT)} and '
+                  f'{(tmp_start_date + relativedelta(days=6)).strftime(DATE_FORMAT)} is being fetched....')
+            datasets.download(exchange='deribit', data_types=['options_chain'],
+                              from_date=tmp_start_date.strftime(DATE_FORMAT),
+                              to_date=(tmp_start_date + relativedelta(days=7)).strftime(DATE_FORMAT),
+                              symbols=['OPTIONS'], api_key=API_KEY,
+                              format='csv', concurrency=os.cpu_count(), download_dir=self._target_path)
+            print(f'[FETCHING]: Option chain data between {tmp_start_date.strftime(DATE_FORMAT)} and '
+                  f'{(tmp_start_date + relativedelta(days=6)).strftime(DATE_FORMAT)} has been fetched.')
+            week = list(pd.date_range(start=tmp_start_date, end=(tmp_start_date + relativedelta(days=6)),
+                                      inclusive='both', freq='1D'))
             for date in week:
                 self.save_daily_option_chain(date, freq)
-                print(f'[END PROCESSING]: Option chain data for {date.strftime(DATE_FORMAT)} has been processed.')
                 os.remove(f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script handling data fetching from Tardis.')
-    # parser.add_argument('--universe', type=str, help='Symbols to fetch data for.', default='ETH-BTC-BNB-SOL-XRP')
     parser.add_argument('--target_path', type=str, help='Target directory to store data.', default='../data_centre')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date (excluded).', default='2023-07-01')
