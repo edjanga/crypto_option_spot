@@ -83,6 +83,49 @@ class Reader:
         rv_df = rv_df.fillna(rv_df.ewm(span=12, min_periods=1).mean())
         return rv_df
 
+def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> datetime:
+    underlying_price = OptionChainData._underlying_prices.filter(pl.col('timestamp').dt.date() == date)
+    underlying_price = underlying_price.to_pandas().set_index('timestamp')
+    underlying_price = \
+        pd.melt(underlying_price, value_name='underlying_price', var_name='underlying_name', ignore_index=False)
+    underlying_price.reset_index(inplace=True)
+    underlying_price = pl.from_dataframe(underlying_price).lazy()
+    print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
+    option_chain_data = \
+        pl.scan_csv(
+            source=f'{target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
+            schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest']] +
+                                  [(col, pl.Int64) for col in INT_COLUMNS] +
+                                  [(col, pl.String) for col in ['symbol', 'type']]),
+            low_memory=True
+        ).select(
+            ['symbol', 'timestamp', 'type', 'strike_price', 'expiration', 'open_interest', 'last_price',
+             'bid_price', 'bid_amount', 'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega',
+             'theta', 'rho']
+        ).with_columns(
+            (pl.col('symbol').str.split('-').list.get(0) + 'USDT').alias('underlying_name')
+        ).sort(['symbol', 'timestamp'])
+    option_chain_data = option_chain_data.with_columns([
+        (pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC')),
+        (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')), (pl.col('mark_iv') / 100),
+    ])
+    option_chain_data = \
+        (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
+                                            group_by='symbol', include_boundaries=False,
+                                            period=None).agg([pl.all().last()]).drop_nulls())
+    option_chain_data = option_chain_data.join(underlying_price, on=['underlying_name', 'timestamp'], how='left')
+    option_chain_data = option_chain_data.with_columns([
+        (pl.col('underlying_price') / pl.col('strike_price')).log().alias('moneyness'),
+        (pl.col('ask_price') * pl.col('underlying_price')).alias('ask_price'),
+        (pl.col('bid_price') * pl.col('underlying_price')).alias('bid_price'),
+        (pl.col('last_price') * pl.col('underlying_price')).alias('last_price'),
+    ])
+    option_chain_data = option_chain_data.drop_nulls()
+    os.makedirs(f'{target_path}/{date.year}', exist_ok=True)
+    option_chain_data.sink_parquet(path=f'{target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
+    print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
+    return date
+
 
 class OptionChainData:
 
@@ -93,49 +136,6 @@ class OptionChainData:
 
     def __init__(self, target_path: str):
         self._target_path = target_path
-
-    def save_daily_option_chain(self, date: datetime, freq: str) -> None:
-        underlying_price = OptionChainData._underlying_prices.filter(pl.col('timestamp').dt.date() == date)
-        underlying_price = underlying_price.to_pandas().set_index('timestamp')
-        underlying_price = \
-            pd.melt(underlying_price, value_name='underlying_price', var_name='underlying_name', ignore_index=False)
-        underlying_price.reset_index(inplace=True)
-        underlying_price = pl.from_dataframe(underlying_price).lazy()
-        print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} is being processed...')
-        option_chain_data = \
-            pl.scan_csv(
-                source=f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
-                schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest']] +
-                                      [(col, pl.Int64) for col in INT_COLUMNS] +
-                                      [(col, pl.String) for col in ['symbol', 'type']]),
-                low_memory=True
-            ).select(
-                ['symbol', 'timestamp', 'type', 'strike_price', 'expiration', 'open_interest', 'last_price',
-                 'bid_price', 'bid_amount', 'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega',
-                 'theta', 'rho']
-            ).with_columns(
-                (pl.col('symbol').str.split('-').list.get(0) + 'USDT').alias('underlying_name')
-            ).sort(['symbol', 'timestamp'])
-        option_chain_data = option_chain_data.with_columns([
-            (pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC')),
-            (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')), (pl.col('mark_iv') / 100),
-        ])
-        option_chain_data = \
-            (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
-                                                group_by='symbol', include_boundaries=False,
-                                                period=None).agg([pl.all().last()]).drop_nulls())
-        option_chain_data = option_chain_data.join(underlying_price, on=['underlying_name', 'timestamp'], how='left')
-        option_chain_data = option_chain_data.with_columns([
-            (pl.col('underlying_price') / pl.col('strike_price')).log().alias('moneyness'),
-            (pl.col('ask_price') * pl.col('underlying_price')).alias('ask_price'),
-            (pl.col('bid_price') * pl.col('underlying_price')).alias('bid_price'),
-            (pl.col('last_price') * pl.col('underlying_price')).alias('last_price'),
-        ])
-        option_chain_data = option_chain_data.drop_nulls()
-        os.makedirs(f'{self._target_path}/{date.year}', exist_ok=True)
-        option_chain_data.sink_parquet(path=f'{self._target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
-        print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
-        return
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str) -> None:
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
@@ -152,8 +152,13 @@ class OptionChainData:
             week = list(pd.date_range(start=tmp_start_date, end=(tmp_start_date + relativedelta(days=6)),
                                       inclusive='both', freq='1D'))
             for date in week:
-                self.save_daily_option_chain(date, freq)
+                _ = save_daily_option_chain(self._target_path, date, freq)
                 os.remove(f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz')
+            # with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
+            #     futures = [executor.submit(save_daily_option_chain, self._target_path, date, freq) for date in week]
+            #     for future in concurrent.futures.as_completed(futures):
+            #         date = future.result()
+            #         os.remove(f'{self._target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz')
 
 
 if __name__ == '__main__':
