@@ -96,7 +96,7 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
         pl.scan_csv(
             source=f'{target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
             schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest', 'strike_price']] +
-                                  [(col, pl.Int64) for col in INT_COLUMNS.remove('strike_price')] +
+                                  [(col, pl.Int64) for col in INT_COLUMNS[1:]] +
                                   [(col, pl.String) for col in ['symbol', 'type']]),
             low_memory=True
         ).select(
