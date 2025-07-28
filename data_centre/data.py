@@ -83,6 +83,7 @@ class Reader:
         rv_df = rv_df.fillna(rv_df.ewm(span=12, min_periods=1).mean())
         return rv_df
 
+
 def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> datetime:
     underlying_price = OptionChainData._underlying_prices.filter(pl.col('timestamp').dt.date() == date)
     underlying_price = underlying_price.to_pandas().set_index('timestamp')
@@ -94,8 +95,8 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
     option_chain_data = \
         pl.scan_csv(
             source=f'{target_path}/deribit_options_chain_{date.strftime(DATE_FORMAT)}_OPTIONS.csv.gz',
-            schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest']] +
-                                  [(col, pl.Int64) for col in INT_COLUMNS] +
+            schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest', 'strike_price']] +
+                                  [(col, pl.Int64) for col in INT_COLUMNS.remove('strike_price')] +
                                   [(col, pl.String) for col in ['symbol', 'type']]),
             low_memory=True
         ).select(
@@ -105,21 +106,23 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
         ).with_columns(
             (pl.col('symbol').str.split('-').list.get(0) + 'USDT').alias('underlying_name')
         ).sort(['symbol', 'timestamp'])
-    option_chain_data = option_chain_data.with_columns([
-        (pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC')),
-        (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')), (pl.col('mark_iv') / 100),
-    ])
+    option_chain_data = option_chain_data.with_columns([(pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC'))])
     option_chain_data = \
         (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
                                             group_by='symbol', include_boundaries=False,
                                             period=None).agg([pl.all().last()]).drop_nulls())
     option_chain_data = option_chain_data.join(underlying_price, on=['underlying_name', 'timestamp'], how='left')
     option_chain_data = option_chain_data.with_columns([
+        (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')).alias('expiration'), (pl.col('mark_iv') / 100),
         (pl.col('underlying_price') / pl.col('strike_price')).log().alias('moneyness'),
         (pl.col('ask_price') * pl.col('underlying_price')).alias('ask_price'),
         (pl.col('bid_price') * pl.col('underlying_price')).alias('bid_price'),
-        (pl.col('last_price') * pl.col('underlying_price')).alias('last_price'),
+        (pl.col('last_price') * pl.col('underlying_price')).alias('last_price')
     ])
+    option_chain_data = option_chain_data.with_columns([
+        (.5 * (pl.col('bid_price') + pl.col('ask_price'))).alias('mid_price'),
+        (pl.col('ask_price') - pl.col('bid_price')).alias('spread')
+    ]).drop(['bid_price', 'ask_price'])
     option_chain_data = option_chain_data.drop_nulls()
     os.makedirs(f'{target_path}/{date.year}', exist_ok=True)
     option_chain_data.sink_parquet(path=f'{target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
@@ -139,7 +142,7 @@ class OptionChainData:
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str) -> None:
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
-        for tmp_start_date in dates[::6]:
+        for tmp_start_date in dates[::7]:
             print(f'[FETCHING]: Option chain data between {tmp_start_date.strftime(DATE_FORMAT)} and '
                   f'{(tmp_start_date + relativedelta(days=6)).strftime(DATE_FORMAT)} is being fetched....')
             datasets.download(exchange='deribit', data_types=['options_chain'],
