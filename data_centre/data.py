@@ -123,7 +123,7 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
         (.5 * (pl.col('bid_price') + pl.col('ask_price'))).alias('mid_price'),
         (pl.col('ask_price') - pl.col('bid_price')).alias('spread')
     ]).drop(['bid_price', 'ask_price'])
-    option_chain_data = option_chain_data.drop_nulls()
+    # option_chain_data = option_chain_data.drop_nulls()
     os.makedirs(f'{target_path}/{date.year}', exist_ok=True)
     option_chain_data.sink_parquet(path=f'{target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
     print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
@@ -142,17 +142,20 @@ class OptionChainData:
 
     def download_option_chain_data(self, start_date: str, end_date: str, freq: str) -> None:
         dates = list(pd.date_range(start=start_date, end=end_date, inclusive='left', freq='1D'))
-        for tmp_start_date in dates[::7]:
+        for tmp_start_date in dates[::min(7, len(dates))]:
             print(f'[FETCHING]: Option chain data between {tmp_start_date.strftime(DATE_FORMAT)} and '
-                  f'{(tmp_start_date + relativedelta(days=6)).strftime(DATE_FORMAT)} is being fetched....')
+                  f'{(tmp_start_date + relativedelta(days=min(6, len(dates)))).strftime(DATE_FORMAT)} '
+                  f'is being fetched....')
             datasets.download(exchange='deribit', data_types=['options_chain'],
                               from_date=tmp_start_date.strftime(DATE_FORMAT),
-                              to_date=(tmp_start_date + relativedelta(days=7)).strftime(DATE_FORMAT),
+                              to_date=(tmp_start_date + relativedelta(days=min(7, len(dates)))).strftime(DATE_FORMAT),
                               symbols=['OPTIONS'], api_key=API_KEY,
                               format='csv', concurrency=os.cpu_count(), download_dir=self._target_path)
             print(f'[FETCHING]: Option chain data between {tmp_start_date.strftime(DATE_FORMAT)} and '
-                  f'{(tmp_start_date + relativedelta(days=6)).strftime(DATE_FORMAT)} has been fetched.')
-            week = list(pd.date_range(start=tmp_start_date, end=(tmp_start_date + relativedelta(days=6)),
+                  f'{(tmp_start_date + relativedelta(days=min(6, len(dates)))).strftime(DATE_FORMAT)} '
+                  f'has been fetched.')
+            week = list(pd.date_range(start=tmp_start_date,
+                                      end=(tmp_start_date + relativedelta(days=min(6, len(dates)))),
                                       inclusive='both', freq='1D'))
             for date in week:
                 _ = save_daily_option_chain(self._target_path, date, freq)
@@ -173,3 +176,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     option_chain_data_obj = OptionChainData(target_path=args.target_path)
     option_chain_data_obj.download_option_chain_data(start_date=args.start_date, end_date=args.end_date, freq=args.freq)
+    pdb.set_trace()
