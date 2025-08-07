@@ -98,19 +98,20 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
             schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest', 'strike_price']] +
                                   [(col, pl.Int64) for col in INT_COLUMNS[1:]] +
                                   [(col, pl.String) for col in ['symbol', 'type']]),
-            low_memory=True
+            low_memory=True, n_rows=500_000
         ).select(
             ['symbol', 'timestamp', 'type', 'strike_price', 'expiration', 'open_interest', 'last_price',
              'bid_price', 'bid_amount', 'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega',
              'theta', 'rho']
         ).with_columns(
-            (pl.col('symbol').str.split('-').list.get(0) + 'USDT').alias('underlying_name')
+            (pl.col('symbol').str.replace('_', '-').str.split('-').list.get(0) + 'USDT').alias('underlying_name')
         ).sort(['symbol', 'timestamp'])
     option_chain_data = option_chain_data.with_columns([(pl.col('timestamp') // 1_000).cast(pl.Datetime('ms', 'UTC'))])
     option_chain_data = \
         (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
                                             group_by='symbol', include_boundaries=False,
-                                            period=None).agg([pl.all().last()]).drop_nulls())
+                                            period=None).agg([pl.all().last()]))
+    option_chain_data = option_chain_data.with_columns(pl.col('underlying_name').str.replace('MATICUSDT', 'XRPUSDT'))
     option_chain_data = option_chain_data.join(underlying_price, on=['underlying_name', 'timestamp'], how='left')
     option_chain_data = option_chain_data.with_columns([
         (pl.col('expiration') // 1_000).cast(pl.Datetime('ms', 'UTC')).alias('expiration'), (pl.col('mark_iv') / 100),
@@ -123,7 +124,6 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
         (.5 * (pl.col('bid_price') + pl.col('ask_price'))).alias('mid_price'),
         (pl.col('ask_price') - pl.col('bid_price')).alias('spread')
     ]).drop(['bid_price', 'ask_price'])
-    # option_chain_data = option_chain_data.drop_nulls()
     os.makedirs(f'{target_path}/{date.year}', exist_ok=True)
     option_chain_data.sink_parquet(path=f'{target_path}/{date.year}/{date.strftime(DATE_FORMAT)}')
     print(f'[PROCESSING]: Option chain data {date.strftime(DATE_FORMAT)} has been processed.')
