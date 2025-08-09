@@ -1,8 +1,10 @@
 import concurrent.futures
+import pdb
+import typing
 from constants import *
 import pandas as pd
 import torch
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import Lasso, ElasticNet
 from sklearn.metrics import mean_squared_error
 from typing import List, Union
 import itertools
@@ -20,7 +22,6 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
-import pdb
 
 DEVICE = 'cpu'
 if torch.backends.mps.is_available():
@@ -40,96 +41,121 @@ class FeatureBuilder:
     def __init__(self):
         pass
 
-    @staticmethod
-    def iv_mat_moneyness(tags: List[List[str]], data: pd.DataFrame) -> pd.DataFrame:
-        features = pd.DataFrame()
-        for idx, tag in enumerate(tags):
-            tag_mark_iv = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}" & level_3 == "gex"')
-            tag_mark_iv = tag_mark_iv.drop(['tau', 'moneyness', 'level_3'], axis=1).set_index('timestamp')
-            tag_mark_iv = tag_mark_iv.rename(columns={'mark_iv': f'mark_iv_{tag[0]}_{tag[1]}'})
-            features = \
-                features.join(tag_mark_iv, how={True: 'left', False: 'right'}[features.shape[0] > tag_mark_iv.shape[0]])
-        features.ffill(inplace=True)
-        return features
+    # @staticmethod
+    # def iv_mat_moneyness(tags: List[List[str]], data: pd.DataFrame) -> pd.DataFrame:
+    #     features = pd.DataFrame()
+    #     for idx, tag in enumerate(tags):
+    #         tag_mark_iv = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}" & level_3 == "gex"')
+    #         tag_mark_iv = tag_mark_iv.drop(['tau', 'moneyness', 'level_3'], axis=1).set_index('timestamp')
+    #         tag_mark_iv = tag_mark_iv.rename(columns={'mark_iv': f'mark_iv_{tag[0]}_{tag[1]}'})
+    #         features = \
+    #             features.join(tag_mark_iv, how={True: 'left', False: 'right'}[features.shape[0] > tag_mark_iv.shape[0]])
+    #     features.ffill(inplace=True)
+    #     return features
+
+    # @staticmethod
+    # def dealer_exposure(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    #     features = pd.DataFrame()
+    #     if 'market_participants' in data.columns:
+    #         tags = data[['market_participants']].values.tolist()
+    #         tags.sort()
+    #         tags = list(tag for tag, _ in itertools.groupby(tags))
+    #         for idx, tag in enumerate(tags):
+    #             tag_exp = data.query(f'market_participants == "{tag[0]}"')[['exp', 'timestamp']]
+    #             tag_exp = tag_exp.groupby(by=pd.Grouper(key='timestamp')).mean()
+    #             tag_exp = tag_exp.rename(columns={'exp': f'exp_{tag[0]}'})
+    #             features = pd.concat([features, tag_exp], axis=1)
+    #     else:
+    #         tags = kwargs['tags']
+    #         for idx, tag in enumerate(tags):
+    #             tag_exp = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}"')
+    #             tag_exp['tag'] = \
+    #                 [f'{row["level_3"]}_{row["tau"]}_{row["moneyness"]}' for _, row in
+    #                  tag_exp[['level_3', 'tau', 'moneyness']].iterrows()]
+    #             tag_exp.drop(['tau', 'moneyness', 'level_3'], axis=1, inplace=True)
+    #             tag_exp = tag_exp.groupby(by=[pd.Grouper(key='tag'), pd.Grouper(key='timestamp')]).mean().reset_index()
+    #             tag_exp = pd.pivot_table(data=tag_exp, columns='tag', values='exp', index='timestamp')
+    #             features = \
+    #                 features.join(tag_exp, how={True: 'left', False: 'right'}[features.shape[0] > tag_exp.shape[0]])
+    #         features.ffill(inplace=True)
+    #     return features
+    #
+    # @staticmethod
+    # def option_imbalance(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    #     features = pd.DataFrame()
+    #     if 'market_participants' in data.columns:
+    #         tags = data[['market_participants']].values.tolist()
+    #         tags.sort()
+    #         tags = list(tag for tag, _ in itertools.groupby(tags))
+    #         for idx, tag in enumerate(tags):
+    #             tag_volume = data.query(f'market_participants == "{tag[0]}"')[['volume', 'timestamp']]
+    #             tag_volume = tag_volume.groupby(by=pd.Grouper(key='timestamp')).sum()
+    #             tag_volume = tag_volume.rename(columns={'volume': f'volume_{tag[0]}'})
+    #             features = pd.concat([features, tag_volume], axis=1)
+    #     else:
+    #         tags = kwargs['tags']
+    #         for idx, tag in enumerate(tags):
+    #             tag_volume = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}" & level_3 == "gex"')
+    #             tag_volume = tag_volume.drop(['tau', 'moneyness', 'level_3'], axis=1).set_index('timestamp')
+    #             tag_volume = tag_volume.rename(columns={'volume': f'volume_{tag[0]}_{tag[1]}'})
+    #             features = \
+    #                 features.join(tag_volume,
+    #                               how={True: 'left', False: 'right'}[features.shape[0] > tag_volume.shape[0]])
+    #     features.ffill(inplace=True)
+    #     return features
 
     @staticmethod
-    def dealer_exposure(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
-        features = pd.DataFrame()
-        if 'market_participants' in data.columns:
-            tags = data[['market_participants']].values.tolist()
-            tags.sort()
-            tags = list(tag for tag, _ in itertools.groupby(tags))
-            for idx, tag in enumerate(tags):
-                tag_exp = data.query(f'market_participants == "{tag[0]}"')[['exp', 'timestamp']]
-                tag_exp = tag_exp.groupby(by=pd.Grouper(key='timestamp')).mean()
-                tag_exp = tag_exp.rename(columns={'exp': f'exp_{tag[0]}'})
-                features = pd.concat([features, tag_exp], axis=1)
-        else:
-            tags = kwargs['tags']
-            for idx, tag in enumerate(tags):
-                tag_exp = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}"')
-                tag_exp['tag'] = \
-                    [f'{row["level_3"]}_{row["tau"]}_{row["moneyness"]}' for _, row in
-                     tag_exp[['level_3', 'tau', 'moneyness']].iterrows()]
-                tag_exp.drop(['tau', 'moneyness', 'level_3'], axis=1, inplace=True)
-                tag_exp = tag_exp.groupby(by=[pd.Grouper(key='tag'), pd.Grouper(key='timestamp')]).mean().reset_index()
-                tag_exp = pd.pivot_table(data=tag_exp, columns='tag', values='exp', index='timestamp')
-                features = \
-                    features.join(tag_exp, how={True: 'left', False: 'right'}[features.shape[0] > tag_exp.shape[0]])
-            features.ffill(inplace=True)
-        return features
-
-    @staticmethod
-    def option_imbalance(data: pd.DataFrame, **kwargs) -> pd.DataFrame:
-        features = pd.DataFrame()
-        if 'market_participants' in data.columns:
-            tags = data[['market_participants']].values.tolist()
-            tags.sort()
-            tags = list(tag for tag, _ in itertools.groupby(tags))
-            for idx, tag in enumerate(tags):
-                tag_volume = data.query(f'market_participants == "{tag[0]}"')[['volume', 'timestamp']]
-                tag_volume = tag_volume.groupby(by=pd.Grouper(key='timestamp')).sum()
-                tag_volume = tag_volume.rename(columns={'volume': f'volume_{tag[0]}'})
-                features = pd.concat([features, tag_volume], axis=1)
-        else:
-            tags = kwargs['tags']
-            for idx, tag in enumerate(tags):
-                tag_volume = data.query(f'tau == "{tag[0]}" & moneyness == "{tag[1]}" & level_3 == "gex"')
-                tag_volume = tag_volume.drop(['tau', 'moneyness', 'level_3'], axis=1).set_index('timestamp')
-                tag_volume = tag_volume.rename(columns={'volume': f'volume_{tag[0]}_{tag[1]}'})
-                features = \
-                    features.join(tag_volume,
-                                  how={True: 'left', False: 'right'}[features.shape[0] > tag_volume.shape[0]])
-        features.ffill(inplace=True)
-        return features
-
-    @staticmethod
-    def returns_moments(data: pd.DataFrame, freq: str, lowerbound: int = 2, upperbound: int = 6) -> pd.DataFrame:
+    def returns_moments(data: pd.DataFrame, freq: str, upperbound: int = 6) -> pd.DataFrame:
         """
         :param lowerbound:  lowerbound (inclusive)
         :param upperbound:  upperbound (inclusive)
         """
-        symbol = data.columns[0]
         returns = (np.log(data.div(data.shift())))
-        rv = (returns**2).resample(freq).sum().rename(columns={symbol: 'RV'})
-        returns = returns.resample(freq).sum().rename(columns={symbol: 'returns'})
-        ret_orders = pd.DataFrame()
+        rv = (returns**2).resample(freq).sum()
+        returns = returns.resample(freq).sum()
+        ret_orders = pd.concat([pd.DataFrame(returns.unstack()).rename(columns={0: 'returns'}),
+                                pd.DataFrame(rv.unstack()).rename(columns={0: 'm2'})], axis=1)
         K = pd.to_timedelta('1D')//pd.to_timedelta(freq)
-        for moment_mth in range({True: lowerbound + 1, False: lowerbound}[lowerbound == 2], upperbound+1):
+        for moment_mth in range(3, upperbound+1):
             tmp_ret_order = (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum()
             tmp_ret_order = tmp_ret_order.div(np.sqrt(rv**moment_mth).values).mul(K ** ((moment_mth-2)/2))
-            ret_orders = pd.concat([ret_orders, tmp_ret_order], axis=1)
-        ret_orders.columns = [f'm{moment_mth}' for moment_mth in range(lowerbound + 1, upperbound+1)]
-        ret_orders = pd.concat([ret_orders, rv, returns], axis=1) if lowerbound == 2 else ret_orders
+            ret_orders = \
+                pd.concat([ret_orders, pd.DataFrame(tmp_ret_order.unstack()).rename(columns={0: f'm{moment_mth}'})],
+                          axis=1)
         return ret_orders
 
     @staticmethod
-    def define_market_participants(data: pd.DataFrame) -> pd.DataFrame:
-        tmp = data.copy()
-        tmp.loc[:, 'market_participants'] = 'retail'
-        tmp.loc[data.moneyness == 'OTM', 'market_participants'] = 'institutions'
-        tmp.loc[data.moneyness.isin(['ATM', 'ITM', 'DITM']), 'market_participants'] = 'informed_traders'
+    def rv_lags(data: pd.DataFrame, freq: str, D: str) -> pd.DataFrame:
+        lags = INTRADAY_LAGS+INTERDAY_LAGS
+        lags = lags[lags.index(freq): lags.index(D)+1]
+        symbol_group = data.stack().reset_index(1).rename(columns={'level_1': 'symbol', 0: 'RV'})
+        tmp = symbol_group.copy().set_index('symbol', append=True).swaplevel(0, 1).sort_index(level=0)
+        symbol_group = symbol_group.groupby(by=pd.Grouper(key='symbol'), group_keys=True)
+        for lag in lags:
+            if lag in INTRADAY_LAGS:
+                rv_lag = \
+                    symbol_group.apply(lambda x, y:\
+                                       x['RV'].rolling(window=(pd.to_timedelta(y)//pd.to_timedelta('5min'))+1).mean(),
+                                       y=lag)
+                rv_lag = rv_lag.rename(f'RV_{lag}').sort_index(level=0)
+            else:
+                rv_lag = \
+                    symbol_group.apply(lambda x, y: x.resample(f'{DAYS_CONVERTER[y]}D').mean().shift(),
+                                       y=lag).reset_index(0)
+                rv_lag = rv_lag.rename(columns={'RV': f'RV_{lag}'})
+                rv_lag = rv_lag.set_index('symbol', append=True).swaplevel(0, 1).sort_index(level=0)
+                rv_lag = rv_lag.reindex(tmp.index).ffill()
+            tmp = pd.concat([tmp, rv_lag], axis=1)
+        tmp.dropna(inplace=True)
+        tmp.reset_index(0, inplace=True)
         return tmp
+
+    @staticmethod
+    def define_market_participants(data: pd.DataFrame) -> pd.DataFrame:
+        data.loc[:, 'market_participants'] = 'retail'
+        data.loc[data.moneyness_label == 'OTM', 'market_participants'] = 'institutions'
+        data.loc[data.moneyness_label.isin(['ATM', 'ITM', 'DITM']), 'market_participants'] = 'informed_traders'
+        return data
 
     @staticmethod
     def compute_exposure(data: pd.DataFrame) -> pd.DataFrame:
@@ -149,29 +175,27 @@ class FeatureBuilder:
         return data
 
     @staticmethod
-    def put_call_ratio(data: pd.DataFrame) -> pd.Series:
+    def put_call_ratio(data: pd.DataFrame, freq: str) -> pd.Series:
         put_call_ratio = \
-            data.groupby(by=[pd.Grouper(key='type'), pd.Grouper(level='timestamp')])[['volume']].sum()
-        put_call_ratio.reset_index(level=0, inplace=True)
-        put_call_ratio = \
-            put_call_ratio.query('type == "put"').volume.div(put_call_ratio.query('type == "call"').volume)
-        put_call_ratio.name = 'put_call_ratio'
-        return put_call_ratio
+            data.groupby(by=[pd.Grouper(key='underlying_name'),
+                             pd.Grouper(key='type'),
+                             pd.Grouper(level='timestamp', freq=freq, sort=True)])[['volume']].sum()
+        calls, puts = put_call_ratio.xs('call', axis=0, level=1), put_call_ratio.xs('put', axis=0, level=1)
+        return puts.div(calls).rename(columns={'volume': 'put_call_ratio'})
 
     @staticmethod
     def avg_volatility(data: pd.DataFrame, moneyness_label: str, freq: str) -> pd.Series:
-        vol = data.query(f'moneyness == "{moneyness_label}"').drop('moneyness', axis=1)
+        vol = data.query(f'moneyness_label == "{moneyness_label}"').drop('moneyness_label', axis=1)
         vol['weighted_mark_iv'] = vol['mark_iv'].mul(vol['volume'])
         vol_weighted_mark_iv = \
-            vol.groupby([pd.Grouper(key='type'),
+            vol.groupby([pd.Grouper(key='underlying_name'),
+                         pd.Grouper(key='type'),
                          pd.Grouper(level='timestamp', sort=True, freq=freq)])['weighted_mark_iv'].sum()
         vol_volume = \
-            vol.groupby([pd.Grouper(key='type'), pd.Grouper(level='timestamp', sort=True, freq=freq)])['volume'].sum()
-        vol = vol_weighted_mark_iv.div(vol_volume).reset_index()
-        vol = \
-            pd.concat([vol.query(f'type == "call"').pivot(index='timestamp', columns='type', values=0),
-                       vol.query(f'type == "put"').pivot(index='timestamp', columns='type', values=0)], axis=1)
-        return vol
+            vol.groupby(([pd.Grouper(key='underlying_name'),
+                         pd.Grouper(key='type'),
+                         pd.Grouper(level='timestamp', sort=True, freq=freq)]))['volume'].sum()
+        return vol_weighted_mark_iv.div(vol_volume).unstack(level=1)
 
     @staticmethod
     def volatility_skew(data: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -185,30 +209,27 @@ class FeatureBuilder:
         return pd.concat(volatility_skew, axis=1)
 
     @staticmethod
-    def mkt_participants_pivot_table(group: pd.Grouper) -> pd.DataFrame:
-        data = group.agg(mkt_participants_resampling).reset_index('type')
-        data = \
-            pd.concat([data.query(f'type == "{option_type}"').drop('type', axis=1).rename(
-                columns={col: f'{col}_{option_type}' for col in ['volume', 'mark_iv']}) for
-                option_type in ['call', 'put']], axis=1).reset_index('market_participants')
-        data = \
-            pd.concat([data.query(f'market_participants == "{mkt_participants}"').drop(
-                'market_participants', axis=1).rename(columns={col: f'{mkt_participants}_{col}' for
-                                                               col in data.columns}) for
-                       mkt_participants in MKT_PARTICIPANTS], axis=1)
-        return data
+    def label_market_participants(data: pd.DataFrame, freq: str) -> pd.DataFrame:
+        mkt_participants = data.groupby([pd.Grouper(key='underlying_name'),
+                                         pd.Grouper(key='type'),
+                                         pd.Grouper(level='timestamp', sort=True, freq=freq)])['market_participants']
+        mkt_participants = mkt_participants.apply(lambda x: x.mode().iloc[0])
+        return pd.get_dummies(mkt_participants.unstack(1)).astype(int)
 
     @staticmethod
     def lags(data: pd.DataFrame, min_lag: str, max_lag: str):
+        if isinstance(data.index, pd.core.indexes.multi.MultiIndex):
+            data = data.droplevel(0)
         lags_features = INTRADAY_LAGS+INTERDAY_LAGS
         lags_features = lags_features[lags_features.index(min_lag):lags_features.index(max_lag)]
-        tmp = data.drop(['symbol', 'RV', 'returns'], axis=1)
+        tmp = data.loc[:, ~data.columns.str.contains('|'.join(['symbol', 'RV', 'returns']), regex=True)]
         for lag in lags_features:
             if lag in INTRADAY_LAGS:
                 data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
             else:
-                data = data.join(tmp.rolling(pd.to_timedelta(DAYS_CONVERTER[lag], unit='D')).mean(), how='left',
+                data = data.join(tmp.resample(lag).mean().reindex(data.index), how='left',
                                  rsuffix=f'_{lag}')
+        data.ffill(inplace=True)
         return data.filter(regex='RV|returns|symbol|_([0-9]|[1-9][0-9])([a-zA-Z])')
 
 
@@ -225,7 +246,7 @@ class Regressor:
                     target: Union[pd.DataFrame, np.ndarray], study_name: str):
         study = optuna.create_study(direction='minimize', study_name=study_name, sampler=RandomSampler(123))
         objective = partial(self.objective, train_X=features, train_y=target)
-        study.optimize(objective, n_trials=N_TRIALS, callbacks=[self.callback], show_progress_bar=True,
+        study.optimize(objective, n_trials=N_TRIALS // 2, callbacks=[self.callback], show_progress_bar=True,
                        n_jobs=N_JOBS)
         return study
 
@@ -265,6 +286,14 @@ class Regressor:
                          warm_start=True, selection='random') if len(trial.study.user_attrs) == 0 else \
                 Lasso(**trial.study.user_attrs['best_estimator'].get_params())
             rres.fit(train_X, train_y.values.reshape(-1, 1))
+        elif 'elastic' in trial.study.study_name:
+            param = {'alpha': trial.suggest_float('alpha', 1e-1, 3e-1, log=False),
+                     'l1_ratio': trial.suggest_float('l1_ratio', 1e-1, 5e-1, log=False)
+                     }
+            rres = ElasticNet(alpha=param['alpha'], l1_ratio=param['l1_ratio'], random_state=123, max_iter=MAX_ITER,
+                              warm_start=True, selection='random') if len(trial.study.user_attrs) == 0 else \
+                ElasticNet(**trial.study.user_attrs['best_estimator'].get_params())
+            rres.fit(train_X, train_y.values.reshape(-1, 1))
         elif ('lightgbm' in trial.study.study_name) | ('booster' in trial.study.study_name):
             train_loader, valid_loader = lgb.Dataset(train_X, label=train_y), lgb.Dataset(valid_X, label=valid_y)
             param = {
@@ -295,6 +324,12 @@ class LassoRegressor(Regressor):
 
     def __init__(self, name: str = 'lasso'):
         super(LassoRegressor, self).__init__(name=name)
+
+
+class ElasticRegressor(Regressor):
+
+    def __init__(self, name: str = 'elastic'):
+        super(ElasticRegressor, self).__init__(name=name)
 
 
 class BoostingRegressor(Regressor):
@@ -361,7 +396,7 @@ class LSTMRegressor(Regressor):
         for name, param in model.named_parameters():
             if name not in ['fc.weight', 'fc.bias']:
                 param.requires_grad = False
-                print(f'Network in {name} layer has been frozen')
+                print(f'Weights in {name} layer has been frozen')
         train_fine_tune_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_fine_tune_X.iloc[:, :-2])
         train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
         best_train_loss = float('inf')
@@ -451,7 +486,7 @@ class PermutationFeatureImportance:
                             torch.from_numpy(shuffled_test.values.reshape((shuffled_test.shape[0], 1,
                                                                            shuffled_test.shape[1])).astype(np.float32))
                     self._test_y.iloc[:, 1] = self._model.predict(shuffled_test) \
-                        if isinstance(self._model, (Lasso, lgb.basic.Booster)) else \
+                        if isinstance(self._model, (Lasso, lgb.basic.Booster, ElasticNet)) else \
                         self._model(shuffled_test).detach().numpy()
                     feature_importance[feature].append(
                         self.mase_score(y_true=self._test_y.iloc[:, 0].droplevel(axis=0, level=0).values,
