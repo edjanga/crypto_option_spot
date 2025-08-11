@@ -60,9 +60,8 @@ if __name__ == '__main__':
     ####################################################################################################################
     overall_spot_dynamics = \
         feature_builder.returns_moments(data=underlying_price, freq=args.freq) if args.target == 'returns' else \
-            feature_builder.rv_lags(data=reader_obj.rv_read(), freq=args.freq, D=args.D)
-    overall_spot_dynamics.set_index('symbol', append=True, inplace=True)
-    overall_spot_dynamics = overall_spot_dynamics.swaplevel(1, 0)
+            feature_builder.rv_lags(data=reader_obj.rv_read(), freq=args.freq,
+                                    D=args.D).set_index('symbol', append=True).swaplevel(1, 0)
     ####################################################################################################################
     ## Options
     ####################################################################################################################
@@ -143,7 +142,7 @@ if __name__ == '__main__':
     features_lags = \
         features.loc[:, ~features.columns.str.contains('|'.join(INTERDAY_LAGS+INTRADAY_LAGS), regex=True)].groupby(
             by=pd.Grouper(level='symbol'), group_keys=True).apply(lambda x: feature_builder.lags(x, args.freq, args.D))
-    features = pd.concat([target_lags, features_lags], axis=1).reset_index(0)
+    features = pd.concat([target_lags, features_lags], axis=1).reset_index(0)#.dropna()
     # features[cols_to_cast] = features[cols_to_cast].astype(bool)
     # features.dropna(inplace=True)
     ####################################################################################################################
@@ -152,9 +151,8 @@ if __name__ == '__main__':
     features =  \
         pd.concat([features, pd.get_dummies(features['symbol'], prefix='is', prefix_sep='_').astype(int)], axis=1)
     binary_pattern = ['retail', 'informed', 'institutions', 'is_']
-    cols_ignore_in_scaling = [col for col in features.columns if any(pat in col for pat in binary_pattern)]
     features = features.set_index('symbol', append=True).swaplevel(0, 1).sort_index()
-    features = features.apply(lambda x: x.ffill()).dropna()
+    features = features.apply(lambda x: x.ffill())
     dates = list(np.unique(features.index.get_level_values(1).date))
     ####################################################################################################################
     ## Modelling
@@ -167,8 +165,9 @@ if __name__ == '__main__':
     for idx, date in enumerate(dates[start_idx::DAYS_CONVERTER[args.L]]):
         start_date = date-relativedelta(days=DAYS_CONVERTER[args.L])
         train_X = features.loc[(features.index.get_level_values(1).date >= start_date) &
-                               (features.index.get_level_values(1).date < date), :]
+                               (features.index.get_level_values(1).date < date), :].dropna()
         train_y = train_X.pop(args.target)
+        cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in binary_pattern)]
         if args.regression in ['lasso', 'elastic', 'lstm']:
             for symbol in train_X.index.get_level_values(0).unique():
                 train_X.loc[train_X.index.get_level_values(0) == symbol,
@@ -177,7 +176,8 @@ if __name__ == '__main__':
                                                         ~train_X.columns.isin(cols_ignore_in_scaling)])
         study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime("%Y-%m-%d")}'
         if model.name in ['lasso', 'elastic', 'lightgbm']:
-            rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
+            rres_study = model.model_train(features=train_X.dropna(),
+                                           target=train_y.loc[train_X.index], study_name=study_name)
             models.loc[date] = rres_study.user_attrs['best_estimator']
         else:
             train_dates = list(np.unique(train_X.index.get_level_values(1)))
@@ -187,13 +187,13 @@ if __name__ == '__main__':
                 train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
             train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
                 train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
-            for symbol in SYMBOLS:
-                valid_X.loc[train_X.index.get_level_values(0) == symbol,
-                ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
-                    minmax_scaler[symbol].transform(valid_X.xs(symbol, drop_level=False).loc[:,
-                                                    :~valid_X.columns.isin(cols_ignore_in_scaling)])
+            # for symbol in train_X.index.get_level_values(0).unique():
+            #     valid_X.loc[valid_X.index.get_level_values(0) == symbol,
+            #     ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
+            #         minmax_scaler[symbol].transform(valid_X.xs(symbol, drop_level=False).loc[:,
+            #                                         ~valid_X.columns.isin(cols_ignore_in_scaling)])
             model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y, n_trials=1,
-                              max_epochs=EPOCH*5)
+                              max_epochs=EPOCH*5, cols_ignore_in_scaling=cols_ignore_in_scaling)
             models.loc[date] = model
     models.ffill(inplace=True)
     models.dropna(inplace=True)
@@ -210,6 +210,33 @@ if __name__ == '__main__':
             test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
                                   (features.index.get_level_values(1).date < end_date_forecast), :]
             test_y = test_X.pop(args.target)
+            fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
+                if model.name in ['lasso', 'elastic', 'lightgbm'] else \
+                models.loc[models.index.date == start_date_forecast].iloc[0].model
+            # if model.name == 'lstm':
+            #     test_X.iloc[:, ~test_X.columns.isin(cols_ignore_in_scaling)] = \
+            #         models.loc[models.index.date ==
+            #                    start_date_forecast].iloc[0].maxabsscaler.transform(
+            #             test_X.iloc[:, :~test_X.columns.isin(cols_ignore_in_scaling)])
+            ############################################################################################################
+            ## Fine-tuning
+            ############################################################################################################
+            train_fine_tune_X = \
+                features.loc[features.index.get_level_values(1).date == date-relativedelta(days=1), :].dropna()
+            train_fine_tune_y = train_fine_tune_X.pop(args.target)
+            if model.name in ['lasso', 'elastic', 'lstm']:
+                for symbol in train_fine_tune_X.index.get_level_values(0).unique():
+                    train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
+                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
+                        minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
+                                                        ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
+            fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
+                                                     train_fine_tune_y=train_fine_tune_y,
+                                                     model=fine_tuned_model, max_epochs=EPOCH, date=date,
+                                                     L=args.L, target=args.target)
+            test_X = test_X.loc[test_X.index.get_level_values(0).isin(
+                train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
+            test_y = test_y.loc[test_X.index]
             if model.name in ['lasso', 'elastic', 'lstm']:
                 for symbol in test_X.index.get_level_values(0).unique():
                     test_X.loc[test_X.index.get_level_values(0) == symbol,
@@ -220,25 +247,6 @@ if __name__ == '__main__':
                     test_X_tensor = \
                         torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
                                                                 test_X.shape[1])).astype(np.float32))
-            fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
-                if model.name in ['lasso', 'elastic', 'lightgbm'] else \
-                models.loc[models.index.date == start_date_forecast].iloc[0].model
-
-            # if model.name == 'lstm':
-            #     test_X.iloc[:, ~test_X.columns.isin(cols_ignore_in_scaling)] = \
-            #         models.loc[models.index.date ==
-            #                    start_date_forecast].iloc[0].maxabsscaler.transform(
-            #             test_X.iloc[:, :~test_X.columns.isin(cols_ignore_in_scaling)])
-            ############################################################################################################
-            ## Fine-tuning
-            ############################################################################################################
-            train_fine_tune_X = \
-                features.loc[features.index.get_level_values(1).date == date-relativedelta(days=1), :]
-            train_fine_tune_y = train_fine_tune_X.pop(args.target)
-            fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
-                                                     train_fine_tune_y=train_fine_tune_y,
-                                                     model=fine_tuned_model, max_epochs=EPOCH, date=date,
-                                                     L=args.L, target=args.target)
             y_hat = fine_tuned_model(test_X_tensor).detach().numpy() if \
                 model.name == 'lstm' else fine_tuned_model.user_attrs['best_estimator'].predict(test_X)
             ############################################################################################################
