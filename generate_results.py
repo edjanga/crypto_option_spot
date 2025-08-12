@@ -47,6 +47,7 @@ if __name__ == '__main__':
     parser.add_argument('--D', type=str, help='Number of days ahead to forecast values for', default='1D')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
+    parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
     args = parser.parse_args()
     print(args)
     feature_builder = FeatureBuilder()
@@ -292,13 +293,19 @@ if __name__ == '__main__':
         features_importance.assign(regression=args.regression, D=args.D, freq=args.freq, market=args.options,
                                    target=args.target)
     ####################################################################################################################
-    ## Database insertion
+    ## Database insertion or exporting to .csv files
     ####################################################################################################################
-    db_connect = sqlite3.connect(database=f'{args.target_path}/database.db', check_same_thread=False)
-    forecasts.to_sql(con=db_connect, if_exists='append', name='forecasts')
-    metric.to_sql(con=db_connect, if_exists='append', name='metric')
-    features_importance.to_sql(con=db_connect, if_exists='append', name='feature_importance')
-    print(f'[Data Insertion]: Results for {args} have been inserted into the database.')
+    if args.to_csv == 0:
+        db_connect = sqlite3.connect(database=f'{args.target_path}/database.db', check_same_thread=False)
+        forecasts.to_sql(con=db_connect, if_exists='append', name='forecasts')
+        metric.to_sql(con=db_connect, if_exists='append', name='metric')
+        features_importance.to_sql(con=db_connect, if_exists='append', name='feature_importance')
+        print(f'[Data Insertion]: Results for {args} have been inserted into the database.')
+    else:
+        forecasts.to_csv(path=f'{args.target_path}/forecasts.csv', mode='a')
+        metric.to_csv(path=f'{args.target_path}/metric.csv', mode='a')
+        features_importance.to_csv(path=f'{args.target_path}/features_importance.csv', mode='a')
+        print(f'[Data Export]: Results for {args} have been exported into csv files.')
 
 
 
