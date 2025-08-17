@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from sklearn.linear_model import Lasso, ElasticNet
 from sklearn.metrics import mean_squared_error
-from typing import List, Union
+from typing import List, Union, Dict
 import itertools
 import optuna
 from optuna.samplers import RandomSampler
@@ -115,13 +115,18 @@ class FeatureBuilder:
         returns = returns.resample(freq).sum()
         ret_orders = pd.concat([pd.DataFrame(returns.unstack()).rename(columns={0: 'returns'}),
                                 pd.DataFrame(rv.unstack()).rename(columns={0: 'm2'})], axis=1)
+        ret_orders.index = ret_orders.index.set_names('symbol', level=0)
         K = pd.to_timedelta('1D')//pd.to_timedelta(freq)
-        for moment_mth in range(3, upperbound+1):
-            tmp_ret_order = (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum()
-            tmp_ret_order = tmp_ret_order.div(np.sqrt(rv**moment_mth).values).mul(K ** ((moment_mth-2)/2))
-            ret_orders = \
-                pd.concat([ret_orders, pd.DataFrame(tmp_ret_order.unstack()).rename(columns={0: f'm{moment_mth}'})],
-                          axis=1)
+        try:
+            for moment_mth in range(3, upperbound+1):
+                tmp_ret_order = (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum()
+                tmp_ret_order = tmp_ret_order.div(np.sqrt(rv**moment_mth).values).mul(K ** ((moment_mth-2)/2))
+                tmp_ret_order = tmp_ret_order.unstack()
+                tmp_ret_order.index = tmp_ret_order.index.set_names('symbol', level=0)
+                ret_orders = pd.concat([ret_orders, pd.DataFrame(tmp_ret_order).rename(columns={0: f'm{moment_mth}'})],
+                                       axis=1)
+        except Exception:
+            pdb.set_trace()
         return ret_orders
 
     @staticmethod
@@ -225,7 +230,10 @@ class FeatureBuilder:
         tmp = data.loc[:, ~data.columns.str.contains('|'.join(['symbol', 'RV', 'returns']), regex=True)]
         for lag in lags_features:
             if lag in INTRADAY_LAGS:
-                data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
+                try:
+                    data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
+                except Exception:
+                    pdb.set_trace()
             else:
                 data = data.join(tmp.resample(lag).mean().reindex(data.index), how='left',
                                  rsuffix=f'_{lag}')
@@ -343,10 +351,10 @@ class LSTMRegressor(Regressor):
         super(LSTMRegressor, self).__init__(name=name)
         if len(kwargs) > 0:
             self._model = LSTMModel(**kwargs)
-        self._maxabsscaler = MaxAbsScaler()
+        self._maxabsscaler = dict()
 
     @property
-    def maxabsscaler(self) -> MaxAbsScaler:
+    def maxabsscaler(self) -> Dict[(str, MaxAbsScaler)]:
         return self._maxabsscaler
 
     @property
@@ -358,11 +366,23 @@ class LSTMRegressor(Regressor):
         self._model = model
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-                    n_trials: int = N_TRIALS, max_epochs: int = EPOCH) -> None:
-        train_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_X.iloc[:, :-2])
-        valid_X.iloc[:, :-2] = self._maxabsscaler.transform(X=valid_X.iloc[:, :-2])
+                    cols_ignore_in_scaling: List[str], n_trials: int = N_TRIALS, max_epochs: int = EPOCH) -> None:
+        for symbol in train_X.index.get_level_values(0).unique():
+            self._maxabsscaler[symbol] = MaxAbsScaler().set_output(transform='pandas')
+            train_X.loc[
+                train_X.index.get_level_values(0) == symbol, ~train_X.columns.isin(cols_ignore_in_scaling)] = \
+                self._maxabsscaler[symbol].fit_transform(X=train_X.loc[train_X.index.get_level_values(0) == symbol,
+                ~train_X.columns.isin(cols_ignore_in_scaling)])
+            valid_X.loc[
+                valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
+                self._maxabsscaler[symbol].transform(
+                    X=valid_X.loc[
+                        valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)])
+        pdb.set_trace()
         train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
         valid_dataset = TimeSeriesDataset(valid_X.values, valid_y.values)
+        train_loader = DataLoader(train_dataset, batch_size=1, num_workers=7, persistent_workers=True)
+        valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=7, persistent_workers=True)
         best_valid_loss = float('inf')
         best_params = None
         best_model = None
@@ -370,8 +390,6 @@ class LSTMRegressor(Regressor):
         for trial, params in enumerate(params_list):
             print(f'\nTrial {trial + 1}/{n_trials}')
             print(f'Parameters: {params}')
-            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=7, persistent_workers=True)
-            valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=7, persistent_workers=True)
             model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
                               num_layers=params['num_layers'], learning_rate=params['learning_rate'],
                               feature_names=train_X.columns.tolist())
@@ -387,6 +405,7 @@ class LSTMRegressor(Regressor):
             print(f'Trial {trial + 1} completed. Validation loss: {valid_loss:.4f}')
         print('\nBest parameters:', best_params)
         print(f'Best validation loss: {best_valid_loss:.2f}')
+        pdb.set_trace()
         self._model = best_model
 
     def model_fine_tune(self, train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
