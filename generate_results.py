@@ -302,9 +302,9 @@ if __name__ == '__main__':
         features_importance.to_sql(con=db_connect, if_exists='append', name='feature_importance')
         print(f'[Data Insertion]: Results for {args} have been inserted into the database.')
     else:
-        forecasts.to_csv(path=f'{args.target_path}/forecasts.csv', mode='a')
-        metric.to_csv(path=f'{args.target_path}/metric.csv', mode='a')
-        features_importance.to_csv(path=f'{args.target_path}/features_importance.csv', mode='a')
+        forecasts.to_csv(f'{args.target_path}/forecasts.csv', mode='a')
+        metric.to_csv(f'{args.target_path}/metric.csv', mode='a')
+        features_importance.to_csv(f'{args.target_path}/features_importance.csv', mode='a')
         print(f'[Data Export]: Results for {args} have been exported into csv files.')
 
 
