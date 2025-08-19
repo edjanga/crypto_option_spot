@@ -98,7 +98,7 @@ def save_daily_option_chain(target_path: str, date: datetime, freq: str) -> date
             schema_overrides=dict([(col, pl.Float32) for col in FLOAT_COLUMNS + ['open_interest', 'strike_price']] +
                                   [(col, pl.Int64) for col in INT_COLUMNS[1:]] +
                                   [(col, pl.String) for col in ['symbol', 'type']]),
-            low_memory=True, n_rows=500_000
+            low_memory=True
         ).select(
             ['symbol', 'timestamp', 'type', 'strike_price', 'expiration', 'open_interest', 'last_price',
              'bid_price', 'bid_amount', 'ask_price', 'ask_amount', 'mark_iv', 'delta', 'gamma', 'vega',
