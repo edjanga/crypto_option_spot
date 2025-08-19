@@ -143,9 +143,7 @@ if __name__ == '__main__':
     features_lags = \
         features.loc[:, ~features.columns.str.contains('|'.join(INTERDAY_LAGS+INTRADAY_LAGS), regex=True)].groupby(
             by=pd.Grouper(level='symbol'), group_keys=True).apply(lambda x: feature_builder.lags(x, args.freq, args.D))
-    features = pd.concat([target_lags, features_lags], axis=1).reset_index(0)#.dropna()
-    # features[cols_to_cast] = features[cols_to_cast].astype(bool)
-    # features.dropna(inplace=True)
+    features = pd.concat([target_lags, features_lags], axis=1).reset_index(0)
     ####################################################################################################################
     ## One hot label encoding
     ####################################################################################################################
@@ -188,11 +186,6 @@ if __name__ == '__main__':
                 train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
             train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
                 train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
-            # for symbol in train_X.index.get_level_values(0).unique():
-            #     valid_X.loc[valid_X.index.get_level_values(0) == symbol,
-            #     ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
-            #         minmax_scaler[symbol].transform(valid_X.xs(symbol, drop_level=False).loc[:,
-            #                                         ~valid_X.columns.isin(cols_ignore_in_scaling)])
             model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y, n_trials=1,
                               max_epochs=EPOCH*5, cols_ignore_in_scaling=cols_ignore_in_scaling)
             models.loc[date] = model
@@ -214,11 +207,6 @@ if __name__ == '__main__':
             fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
                 if model.name in ['lasso', 'elastic', 'lightgbm'] else \
                 models.loc[models.index.date == start_date_forecast].iloc[0].model
-            # if model.name == 'lstm':
-            #     test_X.iloc[:, ~test_X.columns.isin(cols_ignore_in_scaling)] = \
-            #         models.loc[models.index.date ==
-            #                    start_date_forecast].iloc[0].maxabsscaler.transform(
-            #             test_X.iloc[:, :~test_X.columns.isin(cols_ignore_in_scaling)])
             ############################################################################################################
             ## Fine-tuning
             ############################################################################################################
@@ -302,9 +290,12 @@ if __name__ == '__main__':
         features_importance.to_sql(con=db_connect, if_exists='append', name='feature_importance')
         print(f'[Data Insertion]: Results for {args} have been inserted into the database.')
     else:
-        forecasts.to_csv(f'{args.target_path}/forecasts.csv', mode='a')
-        metric.to_csv(f'{args.target_path}/metric.csv', mode='a')
-        features_importance.to_csv(f'{args.target_path}/features_importance.csv', mode='a')
+        forecasts.to_csv(f'{args.target_path}/forecasts.csv', mode='a',
+                         header=not os.path.exists(f'{args.target_path}/forecasts.csv'))
+        metric.to_csv(f'{args.target_path}/metric.csv', mode='a',
+                      header=not os.path.exists(f'{args.target_path}/metric.csv'))
+        features_importance.to_csv(f'{args.target_path}/features_importance.csv', mode='a',
+                                   header=not os.path.exists(f'{args.target_path}/features_importance.csv'))
         print(f'[Data Export]: Results for {args} have been exported into csv files.')
 
 
