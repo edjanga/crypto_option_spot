@@ -445,13 +445,14 @@ class LSTMRegressor(Regressor):
 class PermutationFeatureImportance:
     def __init__(self, test: Union[pd.DataFrame, np.ndarray, DataLoader] = None,
                  model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor] = None,
-                 test_y: pd.Series = None, train_y: pd.Series = None):
+                 test_y: pd.Series = None, train_y: pd.Series = None,  freq: str = None):
         self._model = model
         self._test = test
         self._test_y = test_y
         self._train_y = train_y
         self.score = dict()
         self.mase_score = MeanAbsoluteScaledError()
+        self._freq = freq
 
     @property
     def model(self) -> Union[LassoRegressor, BoostingRegressor, LSTMRegressor]:
@@ -507,6 +508,8 @@ class PermutationFeatureImportance:
                     self._test_y.iloc[:, 1] = self._model.predict(shuffled_test) \
                         if isinstance(self._model, (Lasso, lgb.basic.Booster, ElasticNet)) else \
                         self._model(shuffled_test).detach().numpy()
+                    self._test_y = self._test_y.groupby(by=[pd.Grouper(level='symbol'),
+                                      pd.Grouper(level='timestamp', sort=True, freq=self._freq)]).sum()
                     feature_importance[feature].append(
                         self.mase_score(y_true=self._test_y.iloc[:, 0].droplevel(axis=0, level=0).values,
                                         y_pred=self._test_y.iloc[:, 1].droplevel(axis=0, level=0).values,

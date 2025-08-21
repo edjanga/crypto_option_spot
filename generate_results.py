@@ -197,7 +197,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     forecasts = list()
     mase = list()
-    permutation_feature_importance_obj = PermutationFeatureImportance()
+    permutation_feature_importance_obj = PermutationFeatureImportance(freq=args.freq)
     for start_date_forecast in dates[start_idx::pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days]:
             end_date_forecast = \
                 (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days))
@@ -236,12 +236,22 @@ if __name__ == '__main__':
                     test_X_tensor = \
                         torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
                                                                 test_X.shape[1])).astype(np.float32))
-            y_hat = fine_tuned_model(test_X_tensor).detach().numpy() if \
-                model.name == 'lstm' else fine_tuned_model.user_attrs['best_estimator'].predict(test_X)
+            y_hat = pd.Series(index=test_y.index,
+                              data=fine_tuned_model(test_X_tensor).detach().numpy() if model.name == 'lstm'
+                              else fine_tuned_model.user_attrs['best_estimator'].predict(test_X))
+            ############################################################################################################
+            ## Resample to freq
+            ############################################################################################################
+            train_y = train_y.groupby(by=[pd.Grouper(level='symbol'),
+                                          pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
+            test_y = test_y.groupby(by=[pd.Grouper(level='symbol'),
+                                        pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
+            y_hat = y_hat.groupby(by=[pd.Grouper(level='symbol'),
+                                      pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
             ############################################################################################################
             ## Model assessement
             ############################################################################################################
-            mase.append([mase_score(y_true=test_y.values, y_pred=y_hat, y_train=train_y.values),
+            mase.append([mase_score(y_true=test_y.values, y_pred=y_hat.values, y_train=train_y.values),
                          start_date_forecast, model.name.lower(), args.target, args.D, args.options, args.freq])
             test_y = pd.concat([test_y, pd.Series(y_hat, index=test_y.index, name='forecast')], axis=1)
             forecasts.append(test_y.rename(columns={args.target: 'values'}))
