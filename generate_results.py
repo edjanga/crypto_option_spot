@@ -55,13 +55,17 @@ if __name__ == '__main__':
     permutation_feature_importance_obj = PermutationFeatureImportance()
     reader_obj = Reader()
     underlying_price = reader_obj.prices_read(symbol=SYMBOLS)
-    underlying_price = underlying_price.dropna(how='all', axis=1)
+    underlying_price = underlying_price.loc[(underlying_price.index.date >= pd.to_datetime(args.start_date).date()) &
+                                            (underlying_price.index.date < pd.to_datetime(args.end_date).date()), :]
+    underlying_rv = reader_obj.rv_read(symbol=SYMBOLS)
+    underlying_rv = underlying_rv.loc[(underlying_rv.index.date >= pd.to_datetime(args.start_date).date()) &
+                                      (underlying_rv.index.date < pd.to_datetime(args.end_date).date()), :]
     ####################################################################################################################
     ## Spot
     ####################################################################################################################
     overall_spot_dynamics = \
         feature_builder.returns_moments(data=underlying_price, freq=args.freq) if args.target == 'returns' else \
-            feature_builder.rv_lags(data=reader_obj.rv_read(), freq=args.freq,
+            feature_builder.rv_lags(data=underlying_rv, freq=args.freq,
                                     D=args.D).set_index('symbol', append=True).swaplevel(1, 0)
     ####################################################################################################################
     ## Options
@@ -69,19 +73,14 @@ if __name__ == '__main__':
     if args.options == 1:
         overall_option_dynamics = list()
         for year in range(int(args.start_date[:4]), int(args.end_date[:4])+1):
-            with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
                 futures = \
-                    [executor.submit(return_filename, filename) for filename in glob.glob(f'../data_centre/{year}/*')]
+                    [executor.submit(return_filename, filename) for filename in glob.glob(f'../data_centre/{year}/*')
+                     if (pd.to_datetime(filename.split('/')[-1]).date() >= pd.to_datetime(args.start_date).date()) &
+                     (pd.to_datetime(filename.split('/')[-1]).date() < pd.to_datetime(args.end_date).date())]
                 for future in concurrent.futures.as_completed(futures):
                     filename = future.result()
                     daily_option_chain_data = pd.read_parquet(filename)
-                    # if 'mid_price' not in daily_option_chain_data.columns:
-                    #     daily_option_chain_data['mid_price'] = \
-                    #         .5*(daily_option_chain_data['bid_price'] + daily_option_chain_data['ask_price'])
-                    #     daily_option_chain_data['mid_price'] = \
-                    #         daily_option_chain_data['mid_price'] * daily_option_chain_data['underlying_price']
-                    #     daily_option_chain_data['spread'] = \
-                    #         .5 * (daily_option_chain_data['ask_price'] - daily_option_chain_data['bid_price'])
                     daily_option_chain_data['tau'] = \
                         (daily_option_chain_data.expiration - daily_option_chain_data.timestamp)
                     daily_option_chain_data['tau'] /= pd.to_timedelta('360D')
@@ -151,8 +150,9 @@ if __name__ == '__main__':
         pd.concat([features, pd.get_dummies(features['symbol'], prefix='is', prefix_sep='_').astype(int)], axis=1)
     binary_pattern = ['retail', 'informed', 'institutions', 'is_']
     features = features.set_index('symbol', append=True).swaplevel(0, 1).sort_index()
-    features = features.apply(lambda x: x.ffill())
-    dates = list(np.unique(features.index.get_level_values(1).date))
+    features = features.apply(lambda x: x.ffill()).dropna()
+    dates = list(pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left'))
+    dates = list(map(lambda date: date.date(), dates))
     ####################################################################################################################
     ## Modelling
     ####################################################################################################################
@@ -175,8 +175,7 @@ if __name__ == '__main__':
                                                         ~train_X.columns.isin(cols_ignore_in_scaling)])
         study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime("%Y-%m-%d")}'
         if model.name in ['lasso', 'elastic', 'lightgbm']:
-            rres_study = model.model_train(features=train_X.dropna(),
-                                           target=train_y.loc[train_X.index], study_name=study_name)
+            rres_study = model.model_train(features=train_X, target=train_y.loc[train_X.index], study_name=study_name)
             models.loc[date] = rres_study.user_attrs['best_estimator']
         else:
             train_dates = list(np.unique(train_X.index.get_level_values(1)))
@@ -187,7 +186,7 @@ if __name__ == '__main__':
             train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
                 train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
             model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y, n_trials=1,
-                              max_epochs=EPOCH*5, cols_ignore_in_scaling=cols_ignore_in_scaling)
+                              max_epochs=EPOCH//5, cols_ignore_in_scaling=cols_ignore_in_scaling)
             models.loc[date] = model
     models.ffill(inplace=True)
     models.dropna(inplace=True)
@@ -199,75 +198,77 @@ if __name__ == '__main__':
     mase = list()
     permutation_feature_importance_obj = PermutationFeatureImportance(freq=args.freq)
     for start_date_forecast in dates[start_idx::pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days]:
-            end_date_forecast = \
-                (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days))
-            test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
-                                  (features.index.get_level_values(1).date < end_date_forecast), :]
-            test_y = test_X.pop(args.target)
-            fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
-                if model.name in ['lasso', 'elastic', 'lightgbm'] else \
-                models.loc[models.index.date == start_date_forecast].iloc[0].model
-            ############################################################################################################
-            ## Fine-tuning
-            ############################################################################################################
-            train_fine_tune_X = \
-                features.loc[features.index.get_level_values(1).date == date-relativedelta(days=1), :].dropna()
-            train_fine_tune_y = train_fine_tune_X.pop(args.target)
-            if model.name in ['lasso', 'elastic', 'lstm']:
-                for symbol in train_fine_tune_X.index.get_level_values(0).unique():
-                    train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
-                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
-                        minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
-                                                        ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
-            fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
-                                                     train_fine_tune_y=train_fine_tune_y,
-                                                     model=fine_tuned_model, max_epochs=EPOCH, date=date,
-                                                     L=args.L, target=args.target)
-            test_X = test_X.loc[test_X.index.get_level_values(0).isin(
-                train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
-            test_y = test_y.loc[test_X.index]
-            if model.name in ['lasso', 'elastic', 'lstm']:
-                for symbol in test_X.index.get_level_values(0).unique():
-                    test_X.loc[test_X.index.get_level_values(0) == symbol,
-                    ~test_X.columns.isin(cols_ignore_in_scaling)] = \
-                        minmax_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
-                                                        ~test_X.columns.isin(cols_ignore_in_scaling)])
-                if model.name == 'lstm':
-                    test_X_tensor = \
-                        torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
-                                                                test_X.shape[1])).astype(np.float32))
-            y_hat = pd.Series(index=test_y.index,
-                              data=fine_tuned_model(test_X_tensor).detach().numpy() if model.name == 'lstm'
-                              else fine_tuned_model.user_attrs['best_estimator'].predict(test_X))
-            ############################################################################################################
-            ## Resample to freq
-            ############################################################################################################
-            train_y = train_y.groupby(by=[pd.Grouper(level='symbol'),
-                                          pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
-            test_y = test_y.groupby(by=[pd.Grouper(level='symbol'),
-                                        pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
-            y_hat = y_hat.groupby(by=[pd.Grouper(level='symbol'),
+        end_date_forecast = \
+            (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days))
+        test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
+                              (features.index.get_level_values(1).date < end_date_forecast), :]
+        test_y = test_X.pop(args.target)
+        fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
+            if model.name in ['lasso', 'elastic', 'lightgbm'] else \
+            models.loc[models.index.date == start_date_forecast].iloc[0].model
+        ############################################################################################################
+        ## Fine-tuning
+        ############################################################################################################
+        train_fine_tune_X = \
+            features.loc[features.index.get_level_values(1).date == date-relativedelta(days=1), :].dropna()
+        train_fine_tune_y = train_fine_tune_X.pop(args.target)
+        if model.name in ['lasso', 'elastic', 'lstm']:
+            for symbol in train_fine_tune_X.index.get_level_values(0).unique():
+                train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
+                ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
+                    minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
+                                                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
+        fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
+                                                 train_fine_tune_y=train_fine_tune_y,
+                                                 model=fine_tuned_model, max_epochs=EPOCH//5, date=date,
+                                                 L=args.L, target=args.target)
+        test_X = test_X.loc[test_X.index.get_level_values(0).isin(
+            train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
+        test_y = test_y.loc[test_X.index]
+        if model.name in ['lasso', 'elastic', 'lstm']:
+            for symbol in test_X.index.get_level_values(0).unique():
+                test_X.loc[test_X.index.get_level_values(0) == symbol,
+                ~test_X.columns.isin(cols_ignore_in_scaling)] = \
+                    minmax_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
+                                                    ~test_X.columns.isin(cols_ignore_in_scaling)])
+            if model.name == 'lstm':
+                test_X_tensor = \
+                    torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
+                                                            test_X.shape[1])).astype(np.float32))
+        y_hat = pd.Series(index=test_y.index,
+                          data=fine_tuned_model(test_X_tensor).detach().numpy() if model.name == 'lstm'
+                          else fine_tuned_model.user_attrs['best_estimator'].predict(test_X))
+        ############################################################################################################
+        ## Resample to freq
+        ############################################################################################################
+        train_y = train_y.groupby(by=[pd.Grouper(level='symbol'),
                                       pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
-            ############################################################################################################
-            ## Model assessement
-            ############################################################################################################
-            mase.append([mase_score(y_true=test_y.values, y_pred=y_hat.values, y_train=train_y.values),
-                         start_date_forecast, model.name.lower(), args.target, args.D, args.options, args.freq])
-            test_y = pd.concat([test_y, pd.Series(y_hat, index=test_y.index, name='forecast')], axis=1)
-            forecasts.append(test_y.rename(columns={args.target: 'values'}))
-            ############################################################################################################
-            ## Feature importance
-            ############################################################################################################
-            permutation_feature_importance_obj.mase_benchmark = mase[-1][0]
-            if isinstance(fine_tuned_model, optuna.study.study.Study):
-                permutation_feature_importance_obj.model = fine_tuned_model.user_attrs['best_estimator']
-            else:
-                permutation_feature_importance_obj.model = fine_tuned_model
-            permutation_feature_importance_obj.test = test_X
-            permutation_feature_importance_obj.test_y = test_y
-            permutation_feature_importance_obj.train_y = train_y
-            permutation_feature_importance_obj.score[start_date_forecast] = \
-                permutation_feature_importance_obj.compute_score()
+        test_y = test_y.groupby(by=[pd.Grouper(level='symbol'),
+                                    pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
+        y_hat = y_hat.groupby(by=[pd.Grouper(level='symbol'),
+                                  pd.Grouper(level='timestamp', sort=True, freq=args.freq)]).sum()
+        ############################################################################################################
+        ## Model assessement
+        ############################################################################################################
+        test_y = pd.concat([test_y.rename('values'), pd.Series(y_hat, index=test_y.index, name='forecast')], axis=1)
+        test_y = test_y.replace(0, np.nan).dropna()
+        forecasts.append(test_y)
+        mase.append([mase_score(y_true=test_y.iloc[:, 0].values, y_pred=test_y.iloc[:, 1].values,
+                                y_train=train_y.values), start_date_forecast, model.name.lower(), args.target, args.D,
+                     args.options, args.freq])
+        ############################################################################################################
+        ## Feature importance
+        ############################################################################################################
+        permutation_feature_importance_obj.mase_benchmark = mase[-1][0]
+        if isinstance(fine_tuned_model, optuna.study.study.Study):
+            permutation_feature_importance_obj.model = fine_tuned_model.user_attrs['best_estimator']
+        else:
+            permutation_feature_importance_obj.model = fine_tuned_model
+        permutation_feature_importance_obj.test = test_X
+        permutation_feature_importance_obj.test_y = test_y
+        permutation_feature_importance_obj.train_y = train_y
+        permutation_feature_importance_obj.score[start_date_forecast] = \
+            permutation_feature_importance_obj.compute_score()
     features_importance = pd.DataFrame(permutation_feature_importance_obj.score).transpose()
     features_importance.index = pd.to_datetime(features_importance.index, utc=True)
     metric = \

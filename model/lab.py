@@ -117,16 +117,13 @@ class FeatureBuilder:
                                 pd.DataFrame(rv.unstack()).rename(columns={0: 'm2'})], axis=1)
         ret_orders.index = ret_orders.index.set_names('symbol', level=0)
         K = pd.to_timedelta('1D')//pd.to_timedelta(freq)
-        try:
-            for moment_mth in range(3, upperbound+1):
-                tmp_ret_order = (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum()
-                tmp_ret_order = tmp_ret_order.div(np.sqrt(rv**moment_mth).values).mul(K ** ((moment_mth-2)/2))
-                tmp_ret_order = tmp_ret_order.unstack()
-                tmp_ret_order.index = tmp_ret_order.index.set_names('symbol', level=0)
-                ret_orders = pd.concat([ret_orders, pd.DataFrame(tmp_ret_order).rename(columns={0: f'm{moment_mth}'})],
-                                       axis=1)
-        except Exception:
-            pdb.set_trace()
+        for moment_mth in range(3, upperbound+1):
+            tmp_ret_order = (np.log(data.div(data.shift())) ** moment_mth).resample(freq).sum()
+            tmp_ret_order = tmp_ret_order.div(np.sqrt(rv**moment_mth).values).mul(K ** ((moment_mth-2)/2))
+            tmp_ret_order = tmp_ret_order.unstack()
+            tmp_ret_order.index = tmp_ret_order.index.set_names('symbol', level=0)
+            ret_orders = pd.concat([ret_orders, pd.DataFrame(tmp_ret_order).rename(columns={0: f'm{moment_mth}'})],
+                                   axis=1)
         return ret_orders
 
     @staticmethod
@@ -135,21 +132,22 @@ class FeatureBuilder:
         lags = lags[lags.index(freq): lags.index(D)+1]
         symbol_group = data.stack().reset_index(1).rename(columns={'level_1': 'symbol', 0: 'RV'})
         tmp = symbol_group.copy().set_index('symbol', append=True).swaplevel(0, 1).sort_index(level=0)
-        symbol_group = symbol_group.groupby(by=pd.Grouper(key='symbol'), group_keys=True)
         for lag in lags:
             if lag in INTRADAY_LAGS:
+                symbol_group = tmp.copy().groupby(by=pd.Grouper(level='symbol'), group_keys=False)
                 rv_lag = \
                     symbol_group.apply(lambda x, y:\
-                                       x['RV'].rolling(window=(pd.to_timedelta(y)//pd.to_timedelta('5min'))+1).mean(),
-                                       y=lag)
+                                       x['RV'].rolling(
+                                           window=(pd.to_timedelta(y)//pd.to_timedelta('5min'))+1).mean(), y=lag)
                 rv_lag = rv_lag.rename(f'RV_{lag}').sort_index(level=0)
             else:
-                rv_lag = \
-                    symbol_group.apply(lambda x, y: x.resample(f'{DAYS_CONVERTER[y]}D').mean().shift(),
-                                       y=lag).reset_index(0)
+                symbol_group = \
+                    tmp[['RV']].copy().groupby(by=[pd.Grouper(level='symbol'),
+                                                   pd.Grouper(level='timestamp', freq=lag)], group_keys=False).mean()
+                rv_lag = symbol_group.apply(lambda x: x.shift())
                 rv_lag = rv_lag.rename(columns={'RV': f'RV_{lag}'})
-                rv_lag = rv_lag.set_index('symbol', append=True).swaplevel(0, 1).sort_index(level=0)
                 rv_lag = rv_lag.reindex(tmp.index).ffill()
+                rv_lag.reindex(tmp.index)
             tmp = pd.concat([tmp, rv_lag], axis=1)
         tmp.dropna(inplace=True)
         tmp.reset_index(0, inplace=True)
@@ -254,7 +252,7 @@ class Regressor:
                     target: Union[pd.DataFrame, np.ndarray], study_name: str):
         study = optuna.create_study(direction='minimize', study_name=study_name, sampler=RandomSampler(123))
         objective = partial(self.objective, train_X=features, train_y=target)
-        study.optimize(objective, n_trials=N_TRIALS // 2, callbacks=[self.callback], show_progress_bar=True,
+        study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[self.callback], show_progress_bar=True,
                        n_jobs=N_JOBS)
         return study
 
@@ -378,7 +376,6 @@ class LSTMRegressor(Regressor):
                 self._maxabsscaler[symbol].transform(
                     X=valid_X.loc[
                         valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)])
-        pdb.set_trace()
         train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
         valid_dataset = TimeSeriesDataset(valid_X.values, valid_y.values)
         train_loader = DataLoader(train_dataset, batch_size=1, num_workers=7, persistent_workers=True)
@@ -386,7 +383,10 @@ class LSTMRegressor(Regressor):
         best_valid_loss = float('inf')
         best_params = None
         best_model = None
-        params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
+        try:
+            params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
+        except ValueError:
+            pdb.set_trace()
         for trial, params in enumerate(params_list):
             print(f'\nTrial {trial + 1}/{n_trials}')
             print(f'Parameters: {params}')
@@ -405,7 +405,6 @@ class LSTMRegressor(Regressor):
             print(f'Trial {trial + 1} completed. Validation loss: {valid_loss:.4f}')
         print('\nBest parameters:', best_params)
         print(f'Best validation loss: {best_valid_loss:.2f}')
-        pdb.set_trace()
         self._model = best_model
 
     def model_fine_tune(self, train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
@@ -416,7 +415,12 @@ class LSTMRegressor(Regressor):
             if name not in ['fc.weight', 'fc.bias']:
                 param.requires_grad = False
                 print(f'Weights in {name} layer has been frozen')
-        train_fine_tune_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_fine_tune_X.iloc[:, :-2])
+        # for symbol in train_fine_tune_X.index.get_level_values(0).unique():
+        #     train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
+        #     ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
+        #         self._maxabsscaler[symbol].fit_transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
+        #                                             ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
+        # train_fine_tune_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_fine_tune_X.iloc[:, :-2])
         train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
         best_train_loss = float('inf')
         best_params = None
@@ -425,7 +429,7 @@ class LSTMRegressor(Regressor):
         for trial, params in enumerate(params_list):
             print(f"\nTrial {trial + 1}/{n_trials}")
             print(f"Parameters: {params}")
-            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=7, persistent_workers=True)
+            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=7, persistent_workers=True)
             trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
                                  logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
                                  enable_progress_bar=True)
@@ -505,11 +509,12 @@ class PermutationFeatureImportance:
                         shuffled_test = \
                             torch.from_numpy(shuffled_test.values.reshape((shuffled_test.shape[0], 1,
                                                                            shuffled_test.shape[1])).astype(np.float32))
-                    self._test_y.iloc[:, 1] = self._model.predict(shuffled_test) \
+                    y_hat = pd.Series(self._model.predict(shuffled_test), index=shuffled_test.index) \
                         if isinstance(self._model, (Lasso, lgb.basic.Booster, ElasticNet)) else \
-                        self._model(shuffled_test).detach().numpy()
-                    self._test_y = self._test_y.groupby(by=[pd.Grouper(level='symbol'),
-                                      pd.Grouper(level='timestamp', sort=True, freq=self._freq)]).sum()
+                        pd.Series(self._model(shuffled_test).detach().numpy(), index=shuffled_test.index)
+                    y_hat = y_hat.groupby(by=[pd.Grouper(level='symbol'),
+                                              pd.Grouper(level='timestamp', sort=True, freq=self._freq)]).sum()
+                    self._test_y.iloc[:, 1] = y_hat.values
                     feature_importance[feature].append(
                         self.mase_score(y_true=self._test_y.iloc[:, 0].droplevel(axis=0, level=0).values,
                                         y_pred=self._test_y.iloc[:, 1].droplevel(axis=0, level=0).values,
