@@ -176,4 +176,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
     option_chain_data_obj = OptionChainData(target_path=args.target_path)
     option_chain_data_obj.download_option_chain_data(start_date=args.start_date, end_date=args.end_date, freq=args.freq)
-    pdb.set_trace()
