@@ -228,10 +228,7 @@ class FeatureBuilder:
         tmp = data.loc[:, ~data.columns.str.contains('|'.join(['symbol', 'RV', 'returns']), regex=True)]
         for lag in lags_features:
             if lag in INTRADAY_LAGS:
-                try:
-                    data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
-                except Exception:
-                    pdb.set_trace()
+                data = data.join(tmp.shift(periods=1, freq=lag), how='left', rsuffix=f'_{lag}')
             else:
                 data = data.join(tmp.resample(lag).mean().reindex(data.index), how='left',
                                  rsuffix=f'_{lag}')
@@ -252,7 +249,7 @@ class Regressor:
                     target: Union[pd.DataFrame, np.ndarray], study_name: str):
         study = optuna.create_study(direction='minimize', study_name=study_name, sampler=RandomSampler(123))
         objective = partial(self.objective, train_X=features, train_y=target)
-        study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[self.callback], show_progress_bar=True,
+        study.optimize(objective, n_trials=N_TRIALS // 5, callbacks=[self.callback], show_progress_bar=True,
                        n_jobs=N_JOBS)
         return study
 
@@ -383,10 +380,7 @@ class LSTMRegressor(Regressor):
         best_valid_loss = float('inf')
         best_params = None
         best_model = None
-        try:
-            params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
-        except ValueError:
-            pdb.set_trace()
+        params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
         for trial, params in enumerate(params_list):
             print(f'\nTrial {trial + 1}/{n_trials}')
             print(f'Parameters: {params}')
@@ -415,12 +409,6 @@ class LSTMRegressor(Regressor):
             if name not in ['fc.weight', 'fc.bias']:
                 param.requires_grad = False
                 print(f'Weights in {name} layer has been frozen')
-        # for symbol in train_fine_tune_X.index.get_level_values(0).unique():
-        #     train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
-        #     ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
-        #         self._maxabsscaler[symbol].fit_transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
-        #                                             ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
-        # train_fine_tune_X.iloc[:, :-2] = self._maxabsscaler.fit_transform(X=train_fine_tune_X.iloc[:, :-2])
         train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
         best_train_loss = float('inf')
         best_params = None
@@ -493,9 +481,16 @@ class PermutationFeatureImportance:
         self._train_y = train_y
 
     def shuffle_single_feature(self, feature: str) -> pd.DataFrame:
+        np.random.seed(123)
         if isinstance(self._test, pd.DataFrame):
             shuffled_test = self._test.copy()
-        shuffled_test[feature] = np.random.permutation(shuffled_test[feature].values)
+        # feature_value = np.array(shuffled_test.groupby(pd.Grouper(level='symbol')).apply(lambda x,
+        #                                     name: np.random.permutation(x[name].values), name=feature).values.tolist())
+        # feature_value = feature_value.reshape(np.cumprod(feature_value.shape)[-1])
+        # shuffled_test[feature] = feature_value
+        for symbol in shuffled_test.index.get_level_values(0).unique():
+            feature_value = np.random.permutation(shuffled_test.xs(symbol, axis=0, level=0)[feature].values)
+            shuffled_test.loc[shuffled_test.index.get_level_values(0) == symbol, feature] = feature_value
         return shuffled_test
 
     def compute_score(self) -> pd.Series:
@@ -506,20 +501,24 @@ class PermutationFeatureImportance:
                 for _ in concurrent.futures.as_completed(futures):
                     shuffled_test = self.shuffle_single_feature(feature)
                     if isinstance(self._model, LSTMModel):
+                        idxs = shuffled_test.index
                         shuffled_test = \
                             torch.from_numpy(shuffled_test.values.reshape((shuffled_test.shape[0], 1,
                                                                            shuffled_test.shape[1])).astype(np.float32))
                     y_hat = pd.Series(self._model.predict(shuffled_test), index=shuffled_test.index) \
                         if isinstance(self._model, (Lasso, lgb.basic.Booster, ElasticNet)) else \
-                        pd.Series(self._model(shuffled_test).detach().numpy(), index=shuffled_test.index)
+                        pd.Series(self._model(shuffled_test).detach().numpy().reshape(shuffled_test.shape[0]),
+                                  index=idxs)
                     y_hat = y_hat.groupby(by=[pd.Grouper(level='symbol'),
                                               pd.Grouper(level='timestamp', sort=True, freq=self._freq)]).sum()
-                    self._test_y.iloc[:, 1] = y_hat.values
-                    feature_importance[feature].append(
-                        self.mase_score(y_true=self._test_y.iloc[:, 0].droplevel(axis=0, level=0).values,
-                                        y_pred=self._test_y.iloc[:, 1].droplevel(axis=0, level=0).values,
-                                        y_train=self._train_y.droplevel(axis=0, level=0).values)
-                    )
+                    mase_metric = list()
+                    for symbol in self._test_y.index.get_level_values(0).unique():
+                        symbol_y_true, symbol_y_pred, symbol_y_train = self._test_y.xs(symbol, 0, 0).iloc[:, 0],\
+                                y_hat.xs(symbol, 0, 0).loc[self._test_y.xs(symbol, 0, 0).index],\
+                                self._train_y.xs(symbol, 0, 0)
+                        mase_metric.append(self.mase_score(y_true=symbol_y_true.values, y_pred=symbol_y_pred.values,
+                                                           y_train=symbol_y_train.values))
+                    feature_importance[feature].append(sum(mase_metric)/len(mase_metric))
         return pd.DataFrame(feature_importance).mean()
 
 

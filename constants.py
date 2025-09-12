@@ -32,15 +32,15 @@ RESAMPLING.update({feature: 'sum' for feature in ['volume']+EXPOSURE})
 FEES_SPOT = .0003
 FEES_OPTIONS = .125
 # Core lags
-INTRADAY_LAGS = ['15min', '30min', '1h', '1D'] #, '3h', '6h', '12h', '1D
+INTRADAY_LAGS = ['15min', '30min', '1h', '1D']
 INTERDAY_LAGS = ['1W', '1M']
 # Volatility regimes
 VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for LSTM
-PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 8)], 'num_layers': list(range(1, 5)),
-               'learning_rate': [0.001, 0.005, 0.01]}
+PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 6)], 'num_layers': list(range(1, 5)),
+               'learning_rate': [0.0001, 0.0005, 0.001]}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 OPTION_CHAIN_DATA_COLUMNS = ['option_tag', 'type', 'bid_price', 'ask_price', 'moneyness', 'mark_iv', 'expiration',
                              'bid_amount', 'ask_amount', 'strike_price']

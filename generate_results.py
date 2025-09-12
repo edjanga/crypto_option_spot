@@ -206,24 +206,25 @@ if __name__ == '__main__':
         fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0] \
             if model.name in ['lasso', 'elastic', 'lightgbm'] else \
             models.loc[models.index.date == start_date_forecast].iloc[0].model
-        ############################################################################################################
-        ## Fine-tuning
-        ############################################################################################################
-        train_fine_tune_X = \
-            features.loc[features.index.get_level_values(1).date == date-relativedelta(days=1), :].dropna()
-        train_fine_tune_y = train_fine_tune_X.pop(args.target)
-        if model.name in ['lasso', 'elastic', 'lstm']:
-            for symbol in train_fine_tune_X.index.get_level_values(0).unique():
-                train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
-                ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
-                    minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
-                                                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
-        fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
-                                                 train_fine_tune_y=train_fine_tune_y,
-                                                 model=fine_tuned_model, max_epochs=EPOCH//5, date=date,
-                                                 L=args.L, target=args.target)
-        test_X = test_X.loc[test_X.index.get_level_values(0).isin(
-            train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
+        if args.D != '1D':
+            ############################################################################################################
+            ## Fine-tuning
+            ############################################################################################################
+            train_fine_tune_X = \
+                features.loc[features.index.get_level_values(1).date == date-relativedelta(days=1), :].dropna()
+            train_fine_tune_y = train_fine_tune_X.pop(args.target)
+            if model.name in ['lasso', 'elastic', 'lstm']:
+                for symbol in train_fine_tune_X.index.get_level_values(0).unique():
+                    train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
+                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
+                        minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
+                                                        ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
+            fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=N_TRIALS//20,
+                                                     train_fine_tune_y=train_fine_tune_y,
+                                                     model=fine_tuned_model, max_epochs=EPOCH//10, date=date,
+                                                     L=args.L, target=args.target)
+            test_X = test_X.loc[test_X.index.get_level_values(0).isin(
+                train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
         test_y = test_y.loc[test_X.index]
         if model.name in ['lasso', 'elastic', 'lstm']:
             for symbol in test_X.index.get_level_values(0).unique():
@@ -235,9 +236,11 @@ if __name__ == '__main__':
                 test_X_tensor = \
                     torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
                                                             test_X.shape[1])).astype(np.float32))
-        y_hat = pd.Series(index=test_y.index,
-                          data=fine_tuned_model(test_X_tensor).detach().numpy() if model.name == 'lstm'
-                          else fine_tuned_model.user_attrs['best_estimator'].predict(test_X))
+        y_hat = \
+            pd.Series(index=test_y.index,
+                      data=fine_tuned_model(test_X_tensor).detach().numpy().reshape(test_X_tensor.shape[0]) if
+                      model.name == 'lstm' else {True: fine_tuned_model,
+                                False: fine_tuned_model.user_attrs['best_estimator']}[args.D == '1D'].predict(test_X))
         ############################################################################################################
         ## Resample to freq
         ############################################################################################################
@@ -253,9 +256,23 @@ if __name__ == '__main__':
         test_y = pd.concat([test_y.rename('values'), pd.Series(y_hat, index=test_y.index, name='forecast')], axis=1)
         test_y = test_y.replace(0, np.nan).dropna()
         forecasts.append(test_y)
-        mase.append([mase_score(y_true=test_y.iloc[:, 0].values, y_pred=test_y.iloc[:, 1].values,
-                                y_train=train_y.values), start_date_forecast, model.name.lower(), args.target, args.D,
-                     args.options, args.freq])
+        mase_metric = list()
+        for symbol in test_y.index.get_level_values(0).unique():
+            symbol_test_y, symbol_train_y = test_y.xs(symbol, axis=0, level=0), train_y.xs(symbol, axis=0, level=0)
+            mase_metric.append(mase_score(y_true=symbol_test_y.iloc[:, 0].values,
+                                          y_pred=symbol_test_y.iloc[:, 1].values,
+                                          y_train=symbol_train_y.values))
+        # tmp_y = pd.concat([test_y, train_y], axis=1)
+        # try:
+        #     mase_metric = \
+        #         tmp_y.groupby(pd.Grouper(level='symbol')).apply(
+        #             lambda x: mase_score(y_true=x.iloc[:, 0].dropna().values,
+        #                                  y_pred=x.iloc[:, 1].dropna().values,
+        #                                  y_train=x.iloc[:, 2].dropna().values))
+        # except ValueError:
+        #     pdb.set_trace()
+        mase.append([sum(mase_metric)/len(mase_metric),
+                     start_date_forecast, model.name.lower(), args.target, args.D, args.options, args.freq])
         ############################################################################################################
         ## Feature importance
         ############################################################################################################
