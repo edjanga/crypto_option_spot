@@ -17,17 +17,8 @@ MONEYNESS_BINS[1:-1] = list(map(lambda x: np.log(x), MONEYNESS_BINS[1:-1]))
 LABELS = ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM']
 SUPERSCRIPT = {1: 'st', 2: 'nd', 3: 'rd'}
 EXPOSURE = ['gex', 'vax', 'vex', 'vox']
-COLUMNS = ['symbol', 'type', 'strike_price', 'open_interest', 'last_price', 'bid_price', 'bid_amount', 'bid_iv',
-           'ask_price', 'ask_amount', 'ask_iv', 'mark_price', 'mark_iv', 'delta', 'gamma', 'vega',
-           'theta', 'rho', 'expiration']
-GREEKS = ['gamma', 'vega', 'theta', 'rho']
-MKT_PARTICIPANTS = ['informed_traders', 'retail', 'institutions']
 GREEKS_EXPOSURE = {exp: greek for exp, greek in zip(['gex'], ['gamma'])}
 GREEKS_EXPOSURE.update({exp: None for exp in EXPOSURE[1:]})
-RESAMPLING = {feature: 'last' for feature in ['strike_price', 'expiration', 'last_price', 'bid_price',
-                                              'bid_amount', 'bid_iv', 'ask_price', 'ask_amount', 'ask_iv',
-                                              'mark_price', 'mark_iv', 'moneyness']+GREEKS}
-RESAMPLING.update({feature: 'sum' for feature in ['volume']+EXPOSURE})
 # Transaction costs
 FEES_SPOT = .0003
 FEES_OPTIONS = .125
@@ -39,12 +30,9 @@ VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for LSTM
-PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 6)], 'num_layers': list(range(1, 5)),
-               'learning_rate': [0.0001, 0.0005, 0.001]}
+PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 4)], 'num_layers': list(range(1, 3)),
+               'learning_rate': [0.001, 0.005, 0.01], 'beta': list(np.linspace(0, 1, 11))}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
-OPTION_CHAIN_DATA_COLUMNS = ['option_tag', 'type', 'bid_price', 'ask_price', 'moneyness', 'mark_iv', 'expiration',
-                             'bid_amount', 'ask_amount', 'strike_price']
-YEARS = [2021, 2022, 2023]
 # Font sizes for plots
 TITLE_FONT_SIZE = 40
 LABEL_AXIS_FONT_SIZE = 30
@@ -56,3 +44,4 @@ LOW_ATM_MONEYNESS = .85
 HIGH_ATM_MONEYNESS = 1.15
 ATM_MONEYNESSES = \
     np.log(np.linspace(LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, int(100*(HIGH_ATM_MONEYNESS-LOW_ATM_MONEYNESS)+1)))
+BINARY_PATTERN = ['retail', 'informed', 'institutions', 'is_']
