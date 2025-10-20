@@ -65,8 +65,8 @@ if __name__ == '__main__':
     ## Spot
     ####################################################################################################################
     underlying_prices = \
-        pl.scan_parquet('./data_centre/*/spot/*').with_columns([pl.col('symbol').alias('underlying_name'),
-                                                                pl.col('timestamp'), pl.col('mid.price[0]')])
+        pl.scan_parquet(f'{args.target_path}/*/spot/*').with_columns([pl.col('symbol').alias('underlying_name'),
+                                                                      pl.col('timestamp'), pl.col('mid.price[0]')])
     underlying_prices = underlying_prices.sort(by=['underlying_name', 'timestamp']).group_by_dynamic(
         index_column='timestamp', every='1m', by='underlying_name').agg(pl.col('mid.price[0]').last())
     underlying_prices = underlying_prices.collect(engine=ENGINE)
