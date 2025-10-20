@@ -16,7 +16,8 @@ from .lstm_room import TimeSeriesDataset, LSTMModel
 from sklearn.preprocessing import MinMaxScaler
 from datetime import datetime
 from sklearn.model_selection import ParameterSampler
-import pytorch_lightning as pl
+import polars as pl
+import pytorch_lightning as p_light
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -44,77 +45,113 @@ class FeatureBuilder:
         pass
 
     @staticmethod
-    def returns_moments(data: pd.DataFrame, freq: str, upperbound: int = 6) -> pd.DataFrame:
-        """
-        :param lowerbound:  lowerbound (inclusive)
-        :param upperbound:  upperbound (inclusive)
-        """
-        rv = (data.copy() ** 2).groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=freq)]).sum()
-        returns = data.groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=freq)]).sum()
-        ret_orders = pd.concat([returns, rv.rename(columns={'returns': 'm2'})], axis=1)
-        K = pd.to_timedelta('1D')//pd.to_timedelta(freq)
-        for moment_mth in range(3, upperbound+1):
-            tmp_ret_order = \
-                (returns ** moment_mth).groupby(by=[pd.Grouper(level='symbol'), pd.Grouper(level='timestamp',
-                                                                                           freq=freq)]).sum()
-            tmp_ret_order = tmp_ret_order * (K / (rv ** moment_mth)) ** (1 / 2)
-            ret_orders = pd.concat([ret_orders, tmp_ret_order.rename(columns={'returns': f'm{moment_mth}'})], axis=1)
-        return ret_orders
+    def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 6) -> pl.DataFrame:
+        if isinstance(data, pl.DataFrame):
+            data = data.lazy()
+        moments = \
+            data.sort(by=[pl.col('symbol'), pl.col('timestamp')]).group_by_dynamic(index_column='timestamp',
+                                                                                   every=freq, by='symbol').sum()
+        K = (pd.to_timedelta('1D') // pd.to_timedelta(freq))
+        for m in range(2, upperbound + 1):
+            if m > 2:
+                tmp = data.sort(by=[pl.col('symbol'), pl.col('timestamp')]).group_by_dynamic(
+                    index_column='timestamp', every=freq, by='symbol').agg([(pl.col('returns') ** 2).sum().alias(f'm2'),
+                                                                            (pl.col('returns') ** m).sum().alias(
+                                                                                f'm{m}')])
+                tmp = tmp.with_columns((((K / pl.col(f'm2')) ** m) ** .5).alias(f'm{m}')).drop('m2')
+            else:
+                tmp = data.sort(by=[pl.col('symbol'), pl.col('timestamp')]).group_by_dynamic(
+                    index_column='timestamp', every=freq,
+                    by='symbol').agg([(pl.col('returns') ** m).sum().alias(f'm{m}')])
+            moments = moments.join(tmp, on=['symbol', 'timestamp'])
+        moments = \
+            moments.with_columns([
+                pl.when(pl.col(m) == float("inf")).then(np.finfo(np.float32).max).when(
+                    pl.col(m) == -float("inf")).then(np.finfo(np.float32).min).otherwise(pl.col(m)).alias(m) for m in
+                ['returns']+[f'm{m}' for m in range(2, upperbound + 1)]])
+        return moments.collect(engine=ENGINE)
 
     @staticmethod
-    def rv_lags(data: pd.DataFrame, freq: str, D: str) -> pd.DataFrame:
+    def rv_lags(data: pl.DataFrame, freq: str, D: str):
         all_lags = INTRADAY_LAGS + INTERDAY_LAGS
-        lags = all_lags[all_lags.index(freq):all_lags.index(D) + 1]
-        symbol_group = data.stack().rename('RV').droplevel(axis=0, level=2).to_frame()
-        tmp = symbol_group.copy()
-        lag_dfs = [tmp.copy()]
-        symbol_grouped = tmp.groupby(level='symbol', group_keys=False)
+        start_idx = all_lags.index(freq)
+        end_idx = all_lags.index(D) + 1
+        lags = all_lags[start_idx:end_idx]
+        intraday_lags_exprs = [pl.col('RV')]
         for lag in lags:
             if lag in INTRADAY_LAGS:
-                window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5min')) + 1
-                rv_lag = \
-                    symbol_grouped['RV'].transform(lambda x: x.rolling(window=window_size).mean()).rename(f'RV_{lag}')
-            else:
-                grouped = \
-                    tmp.groupby([pd.Grouper(level='symbol'), pd.Grouper(level='timestamp', freq=lag)],
-                                group_keys=False)['RV'].mean()
-                rv_lag = (grouped.groupby(level='symbol').shift().reindex(tmp.index).ffill().rename(f'RV_{lag}'))
-            lag_dfs.append(rv_lag.to_frame())
-        result = pd.concat(lag_dfs, axis=1)
-        return result
+                window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
+                intraday_lags_exprs.append(pl.col('RV').rolling_mean(window_size).over('symbol').alias(f'RV_{lag}'))
+            elif lag in INTERDAY_LAGS:
+                pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
+                if 'rv_lags' not in vars():
+                    rv_lags = data.with_columns(intraday_lags_exprs)
+                rv_interday_lag = (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(), by='symbol')
+                                   .agg(pl.col('RV').mean().alias(f'RV_mean'))
+                                   .with_columns(pl.col('RV_mean').shift(1).over('symbol').alias(f'RV_{lag}'))
+                                   .drop('RV_mean'))
+                rv_lags = rv_lags.join(rv_interday_lag, on=['symbol', 'timestamp'], how='left')
+        rv_lags = \
+            rv_lags.with_columns([pl.col(f'RV_{lag}').fill_null(strategy='forward').over('symbol') for lag in lags])
+        return rv_lags
 
     @staticmethod
-    def define_market_participants(data: pd.DataFrame) -> pd.DataFrame:
-        data.loc[:, 'market_participants'] = 'retail'
-        data.loc[data.moneyness_label == 'OTM', 'market_participants'] = 'institutions'
-        data.loc[data.moneyness_label.isin(['ATM', 'ITM', 'DITM']), 'market_participants'] = 'informed_traders'
+    def define_market_participants(data: pl.DataFrame) -> pd.DataFrame:
+        data = data.with_columns(
+            pl.when(pl.col('moneyness_label').is_in(['ATM', 'ITM', 'DITM']))
+            .then(pl.lit('informed_traders')).when(pl.col('moneyness_label') == 'OTM')
+            .then(pl.lit('institutions')).otherwise(pl.lit('retail')).alias('market_participants'))
         return data
 
     @staticmethod
-    def compute_exposure(data: pd.DataFrame) -> pd.DataFrame:
+    def compute_exposure(data: pl.DataFrame, freq: str) -> pd.DataFrame:
+        exposure = data
         for exp, greek in GREEKS_EXPOSURE.items():
             if exp == 'dex':
-                data[exp] = data['netDealerExposure'].mul(data[GREEKS_EXPOSURE[exp]]).mul(data['underlying_price'])
+                expr = (pl.col('netDealerExposure') * pl.col(greek) * pl.col('underlying_price'))
             elif exp == 'gex':
-                data[exp] = data['netDealerExposure'].mul(data[GREEKS_EXPOSURE[exp]]).mul(data['underlying_price'] ** 2)
-            elif exp == 'vex':
-                data[exp] = data['gex'].mul(data['tau']).mul(data['mark_iv'] ** 2)
-            elif exp == 'vax':
-                data[exp] = data['gex'].mul(np.log(data['strike_price'].div(data['underlying_price'])) +
-                                            .5 * (data['tau'].mul(data['mark_iv'] ** 2)))
-            elif exp == 'vox':
-                data[exp] = data['vax'].mul(-np.log(data['strike_price'].div(data['underlying_price'])) -
-                                            .5 * (data['tau'].mul(data['mark_iv'] ** 2)))
-        return data
+                expr = (pl.col('netDealerExposure') * pl.col(greek) * (pl.col('underlying_price') ** 2))
+            elif exp == "vex":
+                expr = (pl.col('gex') * pl.col('tau') * (pl.col('mark_iv') ** 2))
+            elif exp == "vax":
+                expr = (pl.col('gex') * (pl.col('moneyness') + 0.5 * pl.col('tau') * (pl.col('mark_iv') ** 2)))
+            elif exp == "vox":
+                expr = (pl.col('vax') * (-pl.col('moneyness') - 0.5 * pl.col('tau') * (pl.col('mark_iv') ** 2)))
+            exposure = exposure.with_columns(expr.alias(exp))
+        if 'min' in freq:
+            pl_freq = freq.replace('min', 'm')
+        exposure = exposure.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by='underlying_name').agg([pl.col(exp).sum() for exp in
+                                                                                ['gex', 'vax', 'vex', 'vox']])
+        return exposure.collect(engine=ENGINE)
 
     @staticmethod
-    def put_call_ratio(data: pd.DataFrame, freq: str) -> pd.Series:
-        put_call_ratio = \
-            data.groupby(by=[pd.Grouper(key='underlying_name'),
-                             pd.Grouper(key='type'),
-                             pd.Grouper(level='timestamp', freq=freq, sort=True)])[['volume']].sum()
-        calls, puts = put_call_ratio.xs('call', axis=0, level=1), put_call_ratio.xs('put', axis=0, level=1)
-        return puts.div(calls).rename(columns={'volume': 'pcr'})
+    def put_call_ratio(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+        if 'min' in freq:
+            pl_freq = freq.replace('min', 'm')
+        data.filter(pl.col('type') == 'put')
+        pcr = data.filter(pl.col('type') == 'put').sort(by=[pl.col('underlying_name'), pl.col('type'),
+                                                                       pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('volume').sum())
+        call = data.filter(pl.col('type') == 'call').sort(by=[pl.col('underlying_name'), pl.col('type'),
+                                                              pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('volume').sum())
+        pcr = pcr.join(call, on=['underlying_name', 'timestamp'], how='left', suffix='_call')
+        pcr = pcr.with_columns((pl.col('volume')/pl.col('volume_call')).alias('pcr')).drop(
+            ['type', 'volume', 'volume_call', 'type_call']).collect(engine=ENGINE)
+        return pcr
+
+    @staticmethod
+    def spread(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+        if 'min' in freq:
+            pl_freq = freq.replace('min', 'm')
+        spread = data.collect(engine=ENGINE).select(['underlying_name', 'timestamp', 'type', 'spread'])
+        spread = spread.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('spread').mean())
+        spread_put = spread.filter(pl.col('type') == 'put').rename({'spread': 'spread_put'}).drop('type')
+        spread = spread.filter(pl.col('type') == 'call').rename({'spread': 'spread_call'}).drop('type')
+        spread = spread.join(spread_put, on=['underlying_name', 'timestamp'])
+        return spread
 
     @staticmethod
     def avg_volatility(data: pd.DataFrame, moneyness_label: str, freq: str) -> pd.Series:
@@ -131,21 +168,60 @@ class FeatureBuilder:
         return vol_weighted_mark_iv.div(vol_volume).unstack(level=1)
 
     @staticmethod
-    def volatility_skew(data: pd.DataFrame, freq: str) -> pd.DataFrame:
-        moneyness_data = data.copy()
-        volatility_skew = list()
-        dotm = FeatureBuilder.avg_volatility(data=moneyness_data, moneyness_label='DOTM', freq=freq)
+    def volatility_skew(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+        skew = data
+        if 'min' in freq:
+            pl_freq = freq.replace('min', 'm')
+        dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
+        dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean())
         for idx, label in enumerate(LABELS[1:]):
-            tmp = FeatureBuilder.avg_volatility(data=moneyness_data, moneyness_label=label, freq=freq)
-            tmp = dotm.subtract(tmp).rename(columns={option: f'{option}_{label}' for option in tmp.columns})
-            volatility_skew.append(tmp)
-        return pd.concat(volatility_skew, axis=1)
+            tmp = data.filter(pl.col('moneyness_label') == label)
+            tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
+                index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean())
+            tmp = tmp.join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left', suffix=f'_DOTM')
+            tmp = tmp.with_columns((pl.col('mark_iv') - pl.col('mark_iv_DOTM')).alias(f'{label}')).select(
+                ['underlying_name', 'timestamp', f'{label}', 'type'])
+            skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
+        skew = skew.select(['timestamp', 'underlying_name', 'type', 'OTM', 'ATM', 'ITM', 'DITM'])
+        skew = skew.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']
+        ).agg([pl.col(f'{label}').mean() for label in ['OTM', 'ATM', 'ITM', 'DITM']])
+        skew_call = skew.filter(pl.col('type') == 'call').drop('type').rename({col: f'call_{col}' for col in
+                                                                               ['OTM', 'ATM', 'ITM', 'DITM']})
+        skew_put = skew.filter(pl.col('type') == 'put').drop('type').rename({col: f'put_{col}' for col in
+                                                                             ['OTM', 'ATM', 'ITM', 'DITM']})
+        skew = skew_call.join(skew_put, on=['underlying_name', 'timestamp'])
+        return skew.collect(engine=ENGINE)
 
     @staticmethod
-    def label_market_participants(data: pd.DataFrame, freq: str) -> pd.DataFrame:
-        mkt_participants = data.rename(columns={'underlying_name': 'symbol'}).groupby(
-            [pd.Grouper(key='symbol'), pd.Grouper(level='timestamp', sort=True, freq=freq)]
-        )['market_participants'].apply(lambda x: x.mode().iloc[0])
+    def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+        if 'min' in freq:
+            pl_freq = freq.replace('min', 'm')
+        mkt_participants = data.sort(by=[pl.col('underlying_name'), pl.col('type'),
+                                         pl.col('timestamp')]).group_by_dynamic(
+            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(
+            pl.col('moneyness_label').mode())
+        mkt_participants = mkt_participants.collect(engine=ENGINE).to_pandas()
+        mkt_participants.moneyness_label = [participants[0] for participants in mkt_participants.moneyness_label]
+        mkt_participants = pl.from_dataframe(mkt_participants)
+        mkt_participants_call = mkt_participants.filter(pl.col('type') == 'call').drop('type')
+        mkt_participants_put = mkt_participants.filter(pl.col('type') == 'put').drop('type')
+        mkt_participants = \
+            mkt_participants_call.with_columns(pl.when(pl.col("moneyness_label").is_in(['ATM', 'ITM']))
+                                               .then(pl.lit('informed_traders_call'))
+                                               .when(pl.col('moneyness_label') == 'OTM')
+                                               .then(pl.lit('institutional_call'))
+                                               .otherwise(pl.lit('retail_call')).alias('market_participants_call'))
+        mkt_participants = mkt_participants.drop('moneyness_label')
+        mkt_participants_put = \
+            mkt_participants_put.with_columns(pl.when(pl.col("moneyness_label").is_in(['ATM', 'ITM']))
+                                              .then(pl.lit('informed_traders_put'))
+                                              .when(pl.col('moneyness_label') == 'OTM')
+                                              .then(pl.lit('institutional_call'))
+                                              .otherwise(pl.lit('retail_call')).alias('market_participants_put'))
+        mkt_participants_put = mkt_participants_put.drop('moneyness_label')
+        mkt_participants = mkt_participants.join(mkt_participants_put, on=['underlying_name', 'timestamp'])
         return mkt_participants
 
     @staticmethod
@@ -302,9 +378,10 @@ class LSTMRegressor(Regressor):
             model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
                               num_layers=params['num_layers'], learning_rate=params['learning_rate'],
                               beta=params['beta'], feature_names=train_X.columns.tolist(), positiveness=positiveness)
-            trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
-                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
-                                 enable_progress_bar=True, num_sanity_val_steps=0)
+            trainer = \
+                p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
+                                logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
+                                enable_progress_bar=True, num_sanity_val_steps=0)
             trainer.fit(model, train_loader, valid_loader)
             valid_loss = trainer.callback_metrics.get('valid_loss', float('inf'))
             if valid_loss < best_valid_loss:
@@ -334,10 +411,12 @@ class LSTMRegressor(Regressor):
         for trial, params in enumerate(params_list):
             print(f"\nTrial {trial + 1}/{n_trials}")
             print(f"Parameters: {params}")
-            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=7, persistent_workers=True)
-            trainer = pl.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
-                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
-                                 enable_progress_bar=True)
+            train_loader = \
+                DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=7, persistent_workers=True)
+            trainer = \
+                p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
+                                logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
+                                enable_progress_bar=True)
             trainer.fit(model, train_loader)
             train_loss = trainer.callback_metrics.get('train_loss', float('inf'))
             if train_loss < best_train_loss:
@@ -431,6 +510,14 @@ class PermutationFeatureImportance:
         for symbol in mase.keys():
             mase[symbol] = pd.DataFrame(mase[symbol])
         return pd.concat(mase).droplevel(axis=0, level=1)
+
+
+class PnLExplained:
+
+    def __init__(self, data: pd.DataFrame, ):
+        pass
+
+
 
 
 

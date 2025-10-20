@@ -7,12 +7,16 @@ alembic==1.13.3
 astunparse==1.6.3
 attrs==24.2.0
 certifi==2025.1.31
+cffi==1.17.1
 charset-normalizer==3.4.1
+click==8.2.1
 cloudpickle==3.1.0
 colorlog==6.9.0
 contourpy==1.3.0
 cramjam==2.9.0
+cryptography==45.0.4
 cycler==0.12.1
+duckdb==1.3.1
 fastparquet==2024.5.0
 filelock==3.16.1
 flatbuffers==25.2.10
@@ -24,6 +28,8 @@ google-pasta==0.2.0
 grpcio==1.70.0
 h5py==3.12.1
 idna==3.10
+imbalanced-learn==0.13.0
+imblearn==0.0
 Jinja2==3.1.4
 joblib==1.4.2
 keras==3.8.0
@@ -32,6 +38,7 @@ libclang==18.1.1
 lightgbm==4.5.0
 lightning-utilities==0.12.0
 llvmlite==0.43.0
+lxml==5.4.0
 Mako==1.3.6
 Markdown==3.7
 markdown-it-py==3.0.0
@@ -43,6 +50,7 @@ mpmath==1.3.0
 multidict==6.1.0
 namex==0.0.8
 networkx==3.4.2
+nltk==3.9.1
 numba==0.60.0
 numpy==2.0.2
 opt_einsum==3.4.0
@@ -53,16 +61,20 @@ pandas==2.2.3
 patsy==1.0.1
 pillow==11.0.0
 plotly==5.24.1
+polars-lts-cpu==1.33.1
 propcache==0.2.0
 protobuf==5.29.3
 pyarrow==18.0.0
+pycparser==2.22
 Pygments==2.19.1
 pyparsing==3.2.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
+python-pptx==1.0.2
 pytorch-lightning==2.5.0.post0
 pytz==2024.2
 PyYAML==6.0.2
+regex==2024.11.6
 requests==2.32.3
 rich==13.9.4
 scikit-base==0.12.0
@@ -71,6 +83,7 @@ scipy==1.14.1
 seaborn==0.13.2
 shap==0.46.0
 six==1.16.0
+sklearn-compat==0.1.3
 sktime==0.36.0
 slicer==0.0.8
 sortedcontainers==2.4.0
@@ -94,5 +107,6 @@ tzdata==2024.2
 urllib3==2.3.0
 Werkzeug==3.1.3
 wrapt==1.17.2
+xlsxwriter==3.2.5
 xr==1.0.5
 yarl==1.17.1

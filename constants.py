@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 NUM_BOOST_ROUND = 1_000
 STOPPING_ROUNDS = 3
 MAX_ITER = 250
@@ -11,8 +12,10 @@ DAYS_CONVERTER = {'1D': 1, '1W': 7, '1M': 30, '3M': 90, '6M': 180, '1Y': 360}
 FREQUENCY_CONVERTER = {'1D': 360, '1W': 52}
 # Maturity tags
 zeroDTE, SHORT, MID = 1/360, 7/360, 30/360
+MATURITY_BINS = [-np.inf, zeroDTE, SHORT, MID, np.inf]
+MATURITY_LABELS = ['0DTE', 'Short', 'Mid', 'Long']
 DOTM, OTM, ITM, DITM = .85, .95, 1.05, 1.15
-MONEYNESS_BINS = [-np.inf, DOTM, OTM, ITM, DITM, np.inf]
+MONEYNESS_BINS = [DOTM, OTM, ITM, DITM] #np.finfo(np.float64).min, ,np.finfo(np.float64).max
 MONEYNESS_BINS[1:-1] = list(map(lambda x: np.log(x), MONEYNESS_BINS[1:-1]))
 LABELS = ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM']
 SUPERSCRIPT = {1: 'st', 2: 'nd', 3: 'rd'}
@@ -30,7 +33,7 @@ VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for LSTM
-PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 4)], 'num_layers': list(range(1, 3)),
+PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 3)], 'num_layers': list(range(1, 2)),
                'learning_rate': [0.001, 0.005, 0.01], 'beta': list(np.linspace(0, 1, 11))}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 # Font sizes for plots
@@ -45,3 +48,4 @@ HIGH_ATM_MONEYNESS = 1.15
 ATM_MONEYNESSES = \
     np.log(np.linspace(LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, int(100*(HIGH_ATM_MONEYNESS-LOW_ATM_MONEYNESS)+1)))
 BINARY_PATTERN = ['retail', 'informed', 'institutions', 'is_']
+ENGINE = 'cuda' if torch.cuda.is_available() else 'cpu'

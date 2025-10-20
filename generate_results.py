@@ -1,17 +1,16 @@
 import argparse
 import os
 import pdb
-import torch
 import pytz
 import sqlite3
 from constants import *
-from data_centre.data import Reader
 import pandas as pd
 from model.lab import FeatureBuilder, LassoRegressor, BoostingRegressor, LSTMRegressor, PermutationFeatureImportance, \
     ElasticRegressor
 from dateutil.relativedelta import relativedelta
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
 from sklearn.preprocessing import MinMaxScaler
+import polars as pl
 
 
 def return_filename(filename: str):
@@ -42,9 +41,8 @@ if __name__ == '__main__':
     print(args)
     dates = list(pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left'))
     dates = list(map(lambda date: date.date(), dates))
-    reader_obj = Reader()
     feature_builder = FeatureBuilder()
-    db_connect = sqlite3.connect(database=f'{args.target_path}/database.db', check_same_thread=False)
+    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
     if args.options == 1:
         LAGS = LAGS[LAGS.index(args.freq):LAGS.index(args.D) + 1]
         SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
@@ -66,25 +64,34 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Spot
     ####################################################################################################################
-    underlying_rv = reader_obj.rv_read(symbol=SYMBOLS)
-    underlying_rv = underlying_rv.loc[(underlying_rv.index.date >= pd.to_datetime(args.start_date).date()) &
-                                      (underlying_rv.index.date < pd.to_datetime(args.end_date).date()), :]
+    underlying_prices = \
+        pl.scan_parquet('./data_centre/*/spot/*').with_columns([pl.col('symbol').alias('underlying_name'),
+                                                                pl.col('timestamp'), pl.col('mid.price[0]')])
+    underlying_prices = underlying_prices.sort(by=['underlying_name', 'timestamp']).group_by_dynamic(
+        index_column='timestamp', every='1m', by='underlying_name').agg(pl.col('mid.price[0]').last())
+    underlying_prices = underlying_prices.collect(engine=ENGINE)
+    underlying_prices = underlying_prices.pivot(index='timestamp', columns='underyling_name', values='mid.price[0]')
+    target = underlying_prices.select([pl.log(pl.col(c) / pl.col(c).shift(1)) for c in underlying_prices.columns])
+    underlying_rv = target ** 2
+    target = target.sort(by='timestamp').group_by_dynamic(
+        index_column='timestamp', every='5m').agg([pl.col(symbol).sum() for symbol in underlying_prices.columns])
+    underlying_rv = underlying_rv.sort(by='timestamp').group_by_dynamic(
+        index_column='timestamp', every='5m').agg([pl.col(symbol).sum() for symbol in underlying_prices.columns])
+    underlying_rv = underlying_rv.filter((pl.col('timestamp') >= pl.lit(args.start_date).cast(pl.Date)) &
+                                         (pl.col('timestamp') <= pl.lit(args.end_date).cast(pl.Date)))
     if args.target == 'returns':
-        target = reader_obj.returns_read(symbol=SYMBOLS)
-        target = target.loc[(target.index.date >= pd.to_datetime(args.start_date).date()) &
-                            (target.index.date < pd.to_datetime(args.end_date).date())]
+        target = target.filter((pl.col('timestamp') >= pl.lit(args.start_date).cast(pl.Date)) &
+                               (pl.col('timestamp') <= pl.lit(args.end_date).cast(pl.Date)))
     else:
-        target = underlying_rv.copy()
-    target.columns.name = 'symbol'
-    target = target.stack().swaplevel(0, 1)
-    target.name = args.target
-    target = pd.DataFrame(target)
+        target = underlying_rv
+    target = target.melt(id_vars='timestamp', value_vars=SYMBOLS, variable_name='symbol', value_name=args.target)
     ####################################################################################################################
     ## Lags
     ####################################################################################################################
     target_lags = feature_builder.rv_lags(data=target, freq=args.freq, D=args.D) if args.target == 'RV' else \
         feature_builder.returns_moments(data=target, freq=args.freq)
-    features = features.join(target_lags, how='inner') if args.options == 1 else target_lags.copy()
+    features = features.join(target_lags, how='inner') if args.options == 1 else target_lags
+    features = features.to_pandas().set_index(['symbol', 'timestamp'])
     target = features.pop(args.target)
     features_lags = \
         features.loc[:, ~features.columns.str.contains('|'.join(INTRADAY_LAGS+INTERDAY_LAGS+BINARY_PATTERN),
@@ -96,7 +103,6 @@ if __name__ == '__main__':
     features = features.apply(lambda x: x.ffill()).dropna()
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
-    reader_obj = Reader()
     ####################################################################################################################
     ## One hot label encoding
     ####################################################################################################################
@@ -141,8 +147,8 @@ if __name__ == '__main__':
                               n_trials=N_TRIALS//20, max_epochs=EPOCH//5, positiveness=args.target == 'RV',
                               cols_ignore_in_scaling=cols_ignore_in_scaling)
             models.loc[date] = model
-    models.ffill(inplace=True)
-    models.dropna(inplace=True)
+    models = models.ffill()
+    models = models.dropna().apply(lambda x: x.model) if args.regression == 'lstm' else models.dropna()
     models.index = pd.to_datetime(models.index, utc=pytz.UTC)
     ####################################################################################################################
     ## Performance evaluation
@@ -161,7 +167,10 @@ if __name__ == '__main__':
             ## Fine-tuning
             ############################################################################################################
             if model.name == 'lstm':
-                fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0].model
+                try:
+                    fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0]
+                except AttributeError:
+                    pdb.set_trace()
                 train_fine_tune_X = \
                     features.loc[features.index.get_level_values(1).date == date - relativedelta(days=1), :].dropna()
                 train_fine_tune_y = train_fine_tune_X.pop(args.target)
@@ -225,6 +234,7 @@ if __name__ == '__main__':
                                                                   D=args.D, market=args.options, freq=args.freq)
     metric.index = pd.to_datetime(metric.index, utc=True)
     metric.index.name = 'timestamp'
+    pdb.set_trace()
     volatility_regime = reader_obj.rv_read(symbol=SYMBOLS).resample('1D').sum()
     volatility_regime = \
         volatility_regime.loc[(volatility_regime.index.date >= dates[start_idx]) &
