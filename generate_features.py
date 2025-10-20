@@ -1,4 +1,5 @@
 import argparse
+import pdb
 import sqlite3
 import pytz
 from constants import *
@@ -26,7 +27,7 @@ if __name__ == '__main__':
                         default='../data_centre')
     args = parser.parse_args()
     print(f'[Generation]: Features {args} generation process has started..............................................')
-    db_connect = sqlite3.connect(database=f'{args.target_path}/database.db', check_same_thread=False)
+    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
     feature_builder = FeatureBuilder()
     ####################################################################################################################
     ## Options Market based features
@@ -34,7 +35,8 @@ if __name__ == '__main__':
     for year in range(int(args.start_date[:4]), int(args.end_date[:4])+1):
         with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
             futures = \
-                [executor.submit(return_filename, filename) for filename in glob.glob(f'{args.target_path}/{year}/*')
+                [executor.submit(return_filename, filename) for filename in
+                 glob.glob(f'{args.target_path}/{year}/options/*')
                  if (pd.to_datetime(filename.split('/')[-1]).date() >= pd.to_datetime(args.start_date).date()) &
                  (pd.to_datetime(filename.split('/')[-1]).date() < pd.to_datetime(args.end_date).date())]
             for future in concurrent.futures.as_completed(futures):
@@ -60,12 +62,12 @@ if __name__ == '__main__':
                                             .then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
                                             .otherwise(None)
                                             .alias('moneyness_label')
-                )
+                ).drop_nulls()
                 daily_option_chain_data = daily_option_chain_data.filter(pl.col('trades').is_not_null())
-                daily_option_chain_data = daily_option_chain_data.with_columns((pl.when(pl.col('trades') == 1)
-                                                                                .then(pl.col('ask_amount'))
-                                                                                .otherwise(pl.col('bid_amount'))
-                                                                                * pl.col('mid_price')).alias('volume'))
+                # daily_option_chain_data = daily_option_chain_data.with_columns((pl.when(pl.col('trades') == 1)
+                #                                                                 .then(pl.col('ask_amount'))
+                #                                                                 .otherwise(pl.col('bid_amount'))
+                #                                                                 * pl.col('mid_price')).alias('volume'))
                 daily_option_chain_data = \
                     daily_option_chain_data.with_columns(
                         -(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
@@ -93,5 +95,6 @@ if __name__ == '__main__':
                     pd.melt(frame=agg_daily_option_chain_data, value_name='values', var_name='features',
                             ignore_index=False)
                 agg_daily_option_chain_data.to_sql(name='features', if_exists='append', con=db_connect)
+                pdb.set_trace()
                 print(f'[Insertion]: '
                       f'Features {filename.split("/")[-1]} have been inserted into the database.')
