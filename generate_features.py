@@ -34,7 +34,7 @@ if __name__ == '__main__':
     for year in range(int(args.start_date[:4]), int(args.end_date[:4])+1):
         with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
             futures = \
-                [executor.submit(return_filename, filename) for filename in glob.glob(f'../data_centre/{year}/*')
+                [executor.submit(return_filename, filename) for filename in glob.glob(f'{args.target_path}/{year}/*')
                  if (pd.to_datetime(filename.split('/')[-1]).date() >= pd.to_datetime(args.start_date).date()) &
                  (pd.to_datetime(filename.split('/')[-1]).date() < pd.to_datetime(args.end_date).date())]
             for future in concurrent.futures.as_completed(futures):
