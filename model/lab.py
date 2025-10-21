@@ -4,7 +4,7 @@ from constants import *
 import pandas as pd
 import torch
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.linear_model import Lasso, ElasticNet, LassoCV, ElasticNetCV
+from sklearn.linear_model import LassoCV, ElasticNetCV
 from sklearn.metrics import mean_squared_error
 from typing import List, Union, Dict, Tuple
 import optuna
@@ -81,18 +81,21 @@ class FeatureBuilder:
         for lag in lags:
             if lag in INTRADAY_LAGS:
                 window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
-                intraday_lags_exprs.append(pl.col('RV').rolling_mean(window_size).over('symbol').alias(f'RV_{lag}'))
+                intraday_lags_exprs.append(pl.col('RV').rolling_mean(window_size).over
+                                           ('underlying_name').alias(f'RV_{lag}'))
             elif lag in INTERDAY_LAGS:
                 pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
                 if 'rv_lags' not in vars():
                     rv_lags = data.with_columns(intraday_lags_exprs)
-                rv_interday_lag = (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(), by='symbol')
+                rv_interday_lag = (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),
+                                                         by='underlying_name')
                                    .agg(pl.col('RV').mean().alias(f'RV_mean'))
-                                   .with_columns(pl.col('RV_mean').shift(1).over('symbol').alias(f'RV_{lag}'))
+                                   .with_columns(pl.col('RV_mean').shift(1).over('underlying_name').alias(f'RV_{lag}'))
                                    .drop('RV_mean'))
-                rv_lags = rv_lags.join(rv_interday_lag, on=['symbol', 'timestamp'], how='left')
+                rv_lags = rv_lags.join(rv_interday_lag, on=['underlying_name', 'timestamp'], how='left')
         rv_lags = \
-            rv_lags.with_columns([pl.col(f'RV_{lag}').fill_null(strategy='forward').over('symbol') for lag in lags])
+            rv_lags.with_columns(
+                [pl.col(f'RV_{lag}').fill_null(strategy='forward').over('underlying_name') for lag in lags])
         return rv_lags
 
     @staticmethod
@@ -208,7 +211,7 @@ class FeatureBuilder:
         mkt_participants_call = mkt_participants.filter(pl.col('type') == 'call').drop('type')
         mkt_participants_put = mkt_participants.filter(pl.col('type') == 'put').drop('type')
         mkt_participants = \
-            mkt_participants_call.with_columns(pl.when(pl.col("moneyness_label").is_in(['ATM', 'ITM']))
+            mkt_participants_call.with_columns(pl.when(pl.col('moneyness_label').is_in(['ATM', 'ITM']))
                                                .then(pl.lit('informed_traders_call'))
                                                .when(pl.col('moneyness_label') == 'OTM')
                                                .then(pl.lit('institutional_call'))
@@ -218,8 +221,8 @@ class FeatureBuilder:
             mkt_participants_put.with_columns(pl.when(pl.col("moneyness_label").is_in(['ATM', 'ITM']))
                                               .then(pl.lit('informed_traders_put'))
                                               .when(pl.col('moneyness_label') == 'OTM')
-                                              .then(pl.lit('institutional_call'))
-                                              .otherwise(pl.lit('retail_call')).alias('market_participants_put'))
+                                              .then(pl.lit('institutional_put'))
+                                              .otherwise(pl.lit('retail_put')).alias('market_participants_put'))
         mkt_participants_put = mkt_participants_put.drop('moneyness_label')
         mkt_participants = mkt_participants.join(mkt_participants_put, on=['underlying_name', 'timestamp'])
         return mkt_participants
