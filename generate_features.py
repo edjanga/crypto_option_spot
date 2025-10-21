@@ -95,6 +95,5 @@ if __name__ == '__main__':
                     pd.melt(frame=agg_daily_option_chain_data, value_name='values', var_name='features',
                             ignore_index=False)
                 agg_daily_option_chain_data.to_sql(name='features', if_exists='append', con=db_connect)
-                pdb.set_trace()
                 print(f'[Insertion]: '
                       f'Features {filename.split("/")[-1]} have been inserted into the database.')
