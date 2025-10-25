@@ -30,7 +30,30 @@ if __name__ == '__main__':
     db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
     feature_builder = FeatureBuilder()
     ####################################################################################################################
-    ## Options Market based features
+    ## Spot market based features
+    ####################################################################################################################
+    spot = \
+        pl.scan_parquet(f'{args.target_path}/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
+                                                                    pl.col('timestamp'), pl.col('mid_price[0]')])
+    spot = spot.sort(by=[pl.col('underlying_name'), pl.col('timestamp')])
+    spot = spot.group_by_dynamic(index_column='timestamp', every='5m', group_by='underlying_name').agg(
+        (pl.col('mid_price[0]')/pl.col('mid_price[0]').shift()).log().sum().alias('returns'),
+        ((pl.col('mid_price[0]') / pl.col('mid_price[0]').shift()).log()**2).sum().alias('RV'),
+    )
+    spot = feature_builder.returns_moments(data=spot, freq='5min')
+    spot = feature_builder.rv_lags(data=spot, freq='15min', D='1M')
+    features_spot = \
+        spot.drop(['returns', 'RV']).unpivot(index=['underlying_name', 'timestamp'],
+                                             variable_name='features', value_name='features_values').with_columns(
+        (pl.when(pl.col('features').str.contains('RV')).then(pl.lit('RV')).otherwise(pl.lit('returns')).alias('target'))
+    )
+    spot = spot.select(['returns', 'RV', 'timestamp', 'underlying_name']).unpivot(
+        index=['underlying_name', 'timestamp'], variable_name='target', value_name='target_values')
+    spot = spot.join(features_spot, on=['target', 'underlying_name', 'timestamp']).to_pandas()
+    spot.to_sql(name='spot_features', con=db_connect)
+    print(f'[Insertion]: Spot features have been inserted into the database.')
+    ####################################################################################################################
+    ## Options market based features
     ####################################################################################################################
     for year in range(int(args.start_date[:4]), int(args.end_date[:4])+1):
         with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
@@ -64,10 +87,6 @@ if __name__ == '__main__':
                                             .alias('moneyness_label')
                 ).drop_nulls()
                 daily_option_chain_data = daily_option_chain_data.filter(pl.col('trades').is_not_null())
-                # daily_option_chain_data = daily_option_chain_data.with_columns((pl.when(pl.col('trades') == 1)
-                #                                                                 .then(pl.col('ask_amount'))
-                #                                                                 .otherwise(pl.col('bid_amount'))
-                #                                                                 * pl.col('mid_price')).alias('volume'))
                 daily_option_chain_data = \
                     daily_option_chain_data.with_columns(
                         -(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
@@ -92,8 +111,7 @@ if __name__ == '__main__':
                 agg_daily_option_chain_data = \
                     agg_daily_option_chain_data.to_pandas().set_index(['underlying_name', 'timestamp'])
                 agg_daily_option_chain_data = \
-                    pd.melt(frame=agg_daily_option_chain_data, value_name='values', var_name='features',
+                    pd.melt(frame=agg_daily_option_chain_data, value_name='features_values', var_name='features',
                             ignore_index=False)
-                agg_daily_option_chain_data.to_sql(name='features', if_exists='append', con=db_connect)
-                print(f'[Insertion]: '
-                      f'Features {filename.split("/")[-1]} have been inserted into the database.')
+                agg_daily_option_chain_data.to_sql(name='option_features', if_exists='append', con=db_connect)
+                print(f'[Insertion]: Option features {filename.split("/")[-1]} have been inserted into the database.')
