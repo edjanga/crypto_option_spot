@@ -62,7 +62,7 @@ if __name__ == '__main__':
     ## Options market based features
     ####################################################################################################################
     else:
-        options = pl.scan_parquet(f'{args.target_path}/*/options/*-*-*', n_rows=1_000_000)
+        options = pl.scan_parquet(f'{args.target_path}/*/options/*-*-*')
         options = \
             options.with_columns(((pl.col('expiration') - pl.col('timestamp')) / pl.duration(days=360)).alias('tau'))
         options = options.with_columns(pl.when(pl.col('last_price') > pl.col('mid_price'))
