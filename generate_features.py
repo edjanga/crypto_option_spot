@@ -8,7 +8,9 @@ import pandas as pd
 import glob
 import concurrent.futures
 from model.lab import FeatureBuilder
+from itertools import product
 
+LAGS = INTRADAY_LAGS+INTERDAY_LAGS
 
 def return_filename(filename: str):
     return filename
@@ -52,6 +54,8 @@ if __name__ == '__main__':
         spot = spot.select(['returns', 'RV', 'timestamp', 'underlying_name']).unpivot(
             index=['underlying_name', 'timestamp'], variable_name='target', value_name='target_values')
         spot = spot.join(features_spot, on=['target', 'underlying_name', 'timestamp']).to_pandas()
+        spot['lag'] = [feature[-1] if feature[-1] in LAGS else 'contemporaneous' for feature in
+                       spot.features.str.split('_')]
         spot.to_sql(name='spot_features', con=db_connect, index=False)
         print(f'[Insertion]: Spot features have been inserted into the database.')
     ####################################################################################################################
@@ -74,6 +78,8 @@ if __name__ == '__main__':
         exposure = feature_builder.compute_exposure(data=options, freq=args.freq)
         daily_option_chain_data = options.drop(['trades', 'netDealerExposure'])
         pcr = feature_builder.put_call_ratio(data=options, freq=args.freq)
+        pcr = feature_builder.lags(pcr, ['pcr'])
+        exposure = feature_builder.lags(exposure, ['gex', 'vax', 'vex', 'vox'])
         ####################################################################################################
         ## First aggregation in USDT and level terms
         ####################################################################################################
@@ -82,7 +88,12 @@ if __name__ == '__main__':
         ## Aggregation per contract type: call or put
         ####################################################################################################
         spread = feature_builder.spread(data=options, freq=args.freq)
+        spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
         skew = feature_builder.volatility_skew(data=options, freq=args.freq)
+        skew_columns = list(product(['call', 'put'], ['OTM', 'ATM', 'ITM', 'DITM']))
+        skew_columns = \
+            [f'{option_type_moneyness[0]}_{option_type_moneyness[1]}' for option_type_moneyness in skew_columns]
+        skew = feature_builder.lags(skew, skew_columns)
         mkt_participants = feature_builder.label_market_participants(freq=args.freq, data=daily_option_chain_data)
         agg_option_chain_data = \
             agg_option_chain_data.join(skew, on=['underlying_name', 'timestamp']).join(
@@ -92,5 +103,8 @@ if __name__ == '__main__':
         agg_option_chain_data = agg_option_chain_data.to_pandas().set_index(['underlying_name', 'timestamp'])
         agg_option_chain_data = pd.melt(frame=agg_option_chain_data, value_name='features_values', var_name='features',
                                         ignore_index=False)
+        agg_option_chain_data['lag'] = \
+            [feature[-1] if feature[-1] in LAGS else 'contemporaneous' for feature in
+             agg_option_chain_data.features.str.split('_')]
         agg_option_chain_data.to_sql(name='option_features', if_exists='append', con=db_connect, index=True)
         print(f'[Insertion]: Option features have been inserted into the database.')

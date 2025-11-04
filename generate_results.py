@@ -42,6 +42,8 @@ if __name__ == '__main__':
     dates = list(pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left'))
     dates = list(map(lambda date: date.date(), dates))
     feature_builder = FeatureBuilder()
+    LAGS = LAGS[LAGS.index(args.freq):LAGS.index(args.D)+1]
+    LAGS = ','.join(["\"contemporaneous\""]+[f'\"{lag}\"' for lag in LAGS])
     db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
     ####################################################################################################################
     ## Spot
@@ -49,9 +51,10 @@ if __name__ == '__main__':
     SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
     SYMBOLS_QUERY = f'({",".join(SYMBOLS_QUERY)})'
     features_query = \
-        f'SELECT "underlying_name","timestamp","target","target_values", "features", "features_values" ' \
-        f'FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} AND "target" == "{args.target}";'
-    features = pd.read_sql(sql=features_query, con=db_connect).drop('target', axis=1)
+        f'SELECT "underlying_name","timestamp","target","target_values", "features", "features_values", "lag" ' \
+        f'FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} AND "target" = "{args.target}" ' \
+        f'AND "lag" IN ({LAGS});'
+    features = pd.read_sql(sql=features_query, con=db_connect).drop(['target', 'lag'], axis=1)
     features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
     features = features.set_index(['underlying_name', 'timestamp'])
     target = features.pop('target_values').rename(args.target)
@@ -62,11 +65,10 @@ if __name__ == '__main__':
     ## Options
     ####################################################################################################################
     if args.options == 1:
-        LAGS = LAGS[LAGS.index(args.freq):LAGS.index(args.D) + 1]
         options_features_query = \
-            f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
-            f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
-        options_features = pd.read_sql(sql=options_features_query, con=db_connect)
+            f'SELECT "features","features_values","underlying_name","timestamp", "lag" FROM option_features ' \
+            f'WHERE "underlying_name" IN {SYMBOLS_QUERY} AND "lag" IN ({LAGS});'
+        options_features = pd.read_sql(sql=options_features_query, con=db_connect).drop('lag', axis=1)
         options_features['timestamp'] = pd.to_datetime(options_features['timestamp'], utc=pytz.UTC)
         options_features = options_features.set_index(['underlying_name', 'timestamp', 'features'])
         options_features = options_features.loc[~options_features.index.duplicated(), :]
@@ -83,45 +85,6 @@ if __name__ == '__main__':
                                       prefix='is', prefix_sep='_').astype(np.int8)], axis=1).drop(
                 ['market_participants_call', 'market_participants_put'], axis=1)
         features = features.join(options_features, on=['underlying_name', 'timestamp'])
-    #
-    #
-    #
-    # underlying_prices = \
-    #     pl.scan_parquet(f'{args.target_path}/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
-    #                                                                 pl.col('timestamp'), pl.col('mid_price[0]')])
-    # underlying_prices = underlying_prices.collect(engine=ENGINE)
-    # underlying_prices = underlying_prices.pivot(index='timestamp', on='underlying_name', values='mid_price[0]')
-    # target = underlying_prices.select([pl.col('timestamp')] +
-    #                                   [(pl.col(c) / pl.col(c).shift(1)).log() for c in underlying_prices.columns[1:]])
-    # underlying_rv = target.sort(by='timestamp').group_by_dynamic(index_column='timestamp', every='5m').agg(
-    #         [(pl.col(symbol) ** 2).sum() for symbol in underlying_prices.columns[1:]])
-    # underlying_rv = underlying_rv.filter((pl.col('timestamp') >= pl.lit(args.start_date).cast(pl.Date)) &
-    #                                      (pl.col('timestamp') <= pl.lit(args.end_date).cast(pl.Date)))
-    # if args.target == 'returns':
-    #     target = target.sort(by='timestamp').group_by_dynamic(index_column='timestamp', every='5m').agg(
-    #         [pl.col(symbol).sum() for symbol in underlying_prices.columns[1:]])
-    #     target = target.filter((pl.col('timestamp') >= pl.lit(args.start_date).cast(pl.Date)) &
-    #                            (pl.col('timestamp') <= pl.lit(args.end_date).cast(pl.Date)))
-    # else:
-    #     target = underlying_rv
-    # underlying_rv = underlying_rv.to_pandas()
-    # target = target.unpivot(index='timestamp', value_name=args.target, variable_name='underlying_name')
-    # ####################################################################################################################
-    # ## Lags
-    # ####################################################################################################################
-    # target_lags = feature_builder.rv_lags(data=target, freq=args.freq, D=args.D) if args.target == 'RV' else \
-    #     feature_builder.returns_moments(data=target, freq=args.freq)
-    # features = features.join(target_lags.to_pandas().set_index(['underlying_name', 'timestamp'])) if args.options == 1 \
-    #     else target_lags.to_pandas().set_index(['underlying_name', 'timestamp'])
-    # target = features.pop(args.target)
-    # pdb.set_trace()
-    # features_lags = \
-    #     features.loc[:, ~features.columns.str.contains('|'.join(INTRADAY_LAGS+INTERDAY_LAGS+BINARY_PATTERN),
-    #                                                    regex=True)].groupby(
-    #         by=pd.Grouper(level='underlying_name'), group_keys=True).apply(
-    #         lambda x: feature_builder.lags(x, args.freq, args.D))
-    # features = pd.concat([target_lags.to_pandas().set_index(['underlying_name', 'timestamp']), features_lags], axis=1)
-    # features = features.filter(regex='|'.join(INTRADAY_LAGS+INTERDAY_LAGS+BINARY_PATTERN))
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     ####################################################################################################################
