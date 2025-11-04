@@ -80,9 +80,8 @@ class FeatureBuilder:
         return moments.collect(engine=ENGINE)
 
     @staticmethod
-    def lags(data: pl.DataFrame):
-        intraday_lags_exprs = [pl.col('RV')]+[pl.col(f'm{i}') for i in range(2, 7)]
-        features = ['RV']+[f'm{i}' for i in range(2, 7)]
+    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]):
+        intraday_lags_exprs = [pl.col(feature) for feature in features]
         for lag in INTRADAY_LAGS:
             window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
             for feature in features:
