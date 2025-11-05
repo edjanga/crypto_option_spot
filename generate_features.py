@@ -28,7 +28,7 @@ if __name__ == '__main__':
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
     parser.add_argument('--collect', type=int, help='Whether to have all data stored in memory or not',
-                        default=0)
+                        default=1)
     args = parser.parse_args()
     print(f'[Generation]: Features {args} generation process has started..............................................')
     db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
