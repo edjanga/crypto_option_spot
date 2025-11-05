@@ -66,65 +66,55 @@ if __name__ == '__main__':
     ####################################################################################################################
     else:
         options = pl.scan_parquet(f'{args.target_path}/*/options/*-*-*')
-        options = \
-            options.with_columns(((pl.col('expiration') - pl.col('timestamp')) / pl.duration(days=360)).alias('tau'))
-        options = options.with_columns(pl.when(pl.col('last_price') > pl.col('mid_price'))
-                                       .then(1).when(pl.col('last_price') < pl.col('mid_price'))
-                                       .then(-1).otherwise(None).alias('trades'))
-        is_put = pl.col('type') == "put"
-        is_call = ~is_put
-        options = options.with_columns(pl.when(is_put).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS))
-                                       .when(is_call).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
-                                       .otherwise(None).alias('moneyness_label'))
-        options = options.filter(pl.col('trades').is_not_null())
-        options = options.with_columns(-(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
-        exposure = feature_builder.compute_exposure(data=options, freq=args.freq, collect=collect)
-        daily_option_chain_data = options.drop(['trades', 'netDealerExposure'])
-        pcr = feature_builder.put_call_ratio(data=options, freq=args.freq, collect=collect)
-        pcr = feature_builder.lags(pcr, ['pcr'])
-        exposure = feature_builder.lags(exposure, ['gex', 'vax', 'vex', 'vox'])
-        ####################################################################################################
-        ## First aggregation in USDT and level terms
-        ####################################################################################################
-        agg_option_chain_data = exposure.join(pcr, on=['underlying_name', 'timestamp'])
-        ####################################################################################################
-        ## Aggregation per contract type: call or put
-        ####################################################################################################
-        spread = feature_builder.spread(data=options, freq=args.freq, collect=collect)
-        spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
-        skew = feature_builder.volatility_skew(data=options, freq=args.freq, collect=collect)
-        skew_columns = list(product(['call', 'put'], ['OTM', 'ATM', 'ITM', 'DITM']))
-        skew_columns = \
-            [f'{option_type_moneyness[0]}_{option_type_moneyness[1]}' for option_type_moneyness in skew_columns]
-        skew = feature_builder.lags(skew, skew_columns)
-        # mkt_participants = feature_builder.label_market_participants(freq=args.freq, data=daily_option_chain_data)
-        agg_option_chain_data = agg_option_chain_data.join(skew, on=['underlying_name', 'timestamp'])
-        # .join(
-        # mkt_participants, on=['underlying_name', 'timestamp']).join(spread,
-        #                                                             on=['underlying_name',
-        #                                                                 'timestamp'])
-        agg_option_chain_data = agg_option_chain_data.melt(id_vars=['underlying_name', 'timestamp'],
-                                                           variable_name='features',
-                                                           value_name='features_values')
+        for symbol in SYMBOLS:
+            print(f'[Insertion]: Process to generate option features for {symbol} has started.........................')
+            options = options.filter(pl.col('underlying_name') == symbol).drop_nulls()
+            options = \
+                options.with_columns(((pl.col('expiration') - pl.col('timestamp')) / pl.duration(days=360)).alias('tau'))
+            options = options.with_columns(pl.when(pl.col('last_price') > pl.col('mid_price'))
+                                           .then(1).when(pl.col('last_price') < pl.col('mid_price'))
+                                           .then(-1).otherwise(None).alias('trades'))
+            is_put = pl.col('type') == "put"
+            is_call = ~is_put
+            options = \
+                options.with_columns(pl.when(is_put).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS))
+                                     .when(is_call).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
+                                           .otherwise(None).alias('moneyness_label'))
+            options = options.filter(pl.col('trades').is_not_null())
+            options = options.with_columns(-(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
+            exposure = feature_builder.compute_exposure(data=options, freq=args.freq, collect=collect)
+            daily_option_chain_data = options.drop(['trades', 'netDealerExposure'])
+            pcr = feature_builder.put_call_ratio(data=options, freq=args.freq, collect=collect)
+            pcr = feature_builder.lags(pcr, ['pcr'])
+            exposure = feature_builder.lags(exposure, ['gex', 'vax', 'vex', 'vox'])
+            ####################################################################################################
+            ## First aggregation in USDT and level terms
+            ####################################################################################################
+            agg_option_chain_data = exposure.join(pcr, on=['underlying_name', 'timestamp'])
+            ####################################################################################################
+            ## Aggregation per contract type: call or put
+            ####################################################################################################
+            spread = feature_builder.spread(data=options, freq=args.freq, collect=collect)
+            spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
+            skew = feature_builder.volatility_skew(data=options, freq=args.freq, collect=collect)
+            skew_columns = list(product(['call', 'put'], ['OTM', 'ATM', 'ITM', 'DITM']))
+            skew_columns = \
+                [f'{option_type_moneyness[0]}_{option_type_moneyness[1]}' for option_type_moneyness in skew_columns]
+            skew = feature_builder.lags(skew, skew_columns)
+            mkt_participants = feature_builder.label_market_participants(freq=args.freq, data=daily_option_chain_data)
+            agg_option_chain_data = agg_option_chain_data.join(skew, on=['underlying_name', 'timestamp']).join(
+                mkt_participants, on=['underlying_name', 'timestamp']).join(spread, on=['underlying_name', 'timestamp'])
+            agg_option_chain_data = agg_option_chain_data.melt(id_vars=['underlying_name', 'timestamp'],
+                                                               variable_name='features',
+                                                               value_name='features_values')
 
-        agg_option_chain_data = agg_option_chain_data.with_columns(
-            pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
-            .then(pl.col('features').str.split('_').list.last())
-            .otherwise(pl.lit('contemporaneous'))
-            .alias('lag')
-        )
-        pdb.set_trace()
-        agg_option_chain_data.lazy().collect(streaming=True).to_pandas().to_sql(name='option_features', con=db_connect,
-                                                                                if_exists='append', index=False)
-        print(f'[Insertion]: Option features have been inserted into the database.')
-        #
-        #
-        #
-        # agg_option_chain_data = agg_option_chain_data.to_pandas().set_index(['underlying_name', 'timestamp'])
-        # agg_option_chain_data = pd.melt(frame=agg_option_chain_data, value_name='features_values', var_name='features',
-        #                                 ignore_index=False)
-        # agg_option_chain_data['lag'] = \
-        #     [feature[-1] if feature[-1] in LAGS else 'contemporaneous' for feature in
-        #      agg_option_chain_data.features.str.split('_')]
-        # agg_option_chain_data.to_sql(name='option_features', if_exists='append', con=db_connect, index=True)
-        # print(f'[Insertion]: Option features have been inserted into the database.')
+            agg_option_chain_data = agg_option_chain_data.with_columns(
+                pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
+                .then(pl.col('features').str.split('_').list.last())
+                .otherwise(pl.lit('contemporaneous'))
+                .alias('lag')
+            )
+            agg_option_chain_data.lazy().collect(streaming=True).to_pandas().to_sql(name='option_features',
+                                                                                    con=db_connect, if_exists='append',
+                                                                                    index=False)
+            print(f'[Insertion]: Option features for {symbol} have been inserted into the database.')
