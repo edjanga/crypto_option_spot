@@ -80,7 +80,7 @@ class FeatureBuilder:
         return moments.collect(engine=ENGINE)
 
     @staticmethod
-    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]):
+    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
         intraday_lags_exprs = [pl.col(feature) for feature in features]
         for lag in INTRADAY_LAGS:
             window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
@@ -140,7 +140,7 @@ class FeatureBuilder:
         return data
 
     @staticmethod
-    def compute_exposure(data: pl.DataFrame, freq: str) -> pd.DataFrame:
+    def compute_exposure(data: pl.DataFrame, freq: str, collect: bool = True) -> pd.DataFrame:
         exposure = data
         for exp, greek in GREEKS_EXPOSURE.items():
             if exp == 'dex':
@@ -159,10 +159,12 @@ class FeatureBuilder:
         exposure = exposure.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by='underlying_name').agg([pl.col(exp).sum() for exp in
                                                                                 ['gex', 'vax', 'vex', 'vox']])
-        return exposure.collect(engine=ENGINE)
+        if collect:
+            exposure = exposure.collect(engine=ENGINE)
+        return exposure
 
     @staticmethod
-    def put_call_ratio(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+    def put_call_ratio(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame|pl.LazyFrame:
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
         data.filter(pl.col('type') == 'put')
@@ -174,14 +176,19 @@ class FeatureBuilder:
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('volume').sum())
         pcr = pcr.join(call, on=['underlying_name', 'timestamp'], how='left', suffix='_call')
         pcr = pcr.with_columns((pl.col('volume')/pl.col('volume_call')).alias('pcr')).drop(
-            ['type', 'volume', 'volume_call', 'type_call']).collect(engine=ENGINE)
+            ['type', 'volume', 'volume_call', 'type_call'])
+        if collect:
+            pcr = pcr.collect(engine=ENGINE)
         return pcr
 
     @staticmethod
-    def spread(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+    def spread(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame:
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
-        spread = data.collect(engine=ENGINE).select(['underlying_name', 'timestamp', 'type', 'spread'])
+        spread = data
+        if collect:
+            spread = spread.collect(engine=ENGINE)
+        spread = spread.select(['underlying_name', 'timestamp', 'type', 'spread'])
         spread = spread.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('spread').mean())
         spread_put = spread.filter(pl.col('type') == 'put').rename({'spread': 'spread_put'}).drop('type')
@@ -204,7 +211,7 @@ class FeatureBuilder:
         return vol_weighted_mark_iv.div(vol_volume).unstack(level=1)
 
     @staticmethod
-    def volatility_skew(data: pl.DataFrame, freq: str) -> pl.DataFrame:
+    def volatility_skew(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame:
         skew = data
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
@@ -228,7 +235,9 @@ class FeatureBuilder:
         skew_put = skew.filter(pl.col('type') == 'put').drop('type').rename({col: f'put_{col}' for col in
                                                                              ['OTM', 'ATM', 'ITM', 'DITM']})
         skew = skew_call.join(skew_put, on=['underlying_name', 'timestamp'])
-        return skew.collect(engine=ENGINE)
+        if collect:
+            return skew.collect(engine=ENGINE)
+        return skew
 
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
