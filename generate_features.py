@@ -42,11 +42,12 @@ if __name__ == '__main__':
             pl.scan_parquet(f'{args.target_path}/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
                                                                         pl.col('timestamp'), pl.col('mid_price[0]')])
         spot = spot.sort(by=[pl.col('underlying_name'), pl.col('timestamp')])
-        spot = spot.group_by_dynamic(index_column='timestamp', every='5m', group_by='underlying_name').agg(
+        spot = spot.group_by_dynamic(index_column='timestamp', every=args.freq.replace('in', ''),
+                                     group_by='underlying_name').agg(
             (pl.col('mid_price[0]')/pl.col('mid_price[0]').shift()).log().sum().alias('returns'),
             ((pl.col('mid_price[0]') / pl.col('mid_price[0]').shift()).log()**2).sum().alias('RV'),
         )
-        spot = feature_builder.returns_moments(data=spot, freq='5min')
+        spot = feature_builder.returns_moments(data=spot, freq=args.freq)
         spot = feature_builder.lags(spot)
         features_spot = \
             spot.drop(['returns', 'RV']).unpivot(index=['underlying_name', 'timestamp'],
