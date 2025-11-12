@@ -79,7 +79,7 @@ if __name__ == '__main__':
             options = \
                 options.with_columns(pl.when(is_put).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS))
                                      .when(is_call).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
-                                           .otherwise(None).alias('moneyness_label'))
+                                     .otherwise(None).alias('moneyness_label'))
             options = options.filter(pl.col('trades').is_not_null())
             options = options.with_columns(-(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
             exposure = feature_builder.compute_exposure(data=options, freq=args.freq, collect=collect)
@@ -102,8 +102,8 @@ if __name__ == '__main__':
                 [f'{option_type_moneyness[0]}_{option_type_moneyness[1]}' for option_type_moneyness in skew_columns]
             skew = feature_builder.lags(skew, skew_columns)
             mkt_participants = feature_builder.label_market_participants(freq=args.freq, data=daily_option_chain_data)
-            agg_option_chain_data = agg_option_chain_data.join(skew, on=['underlying_name', 'timestamp']).join(
-                mkt_participants, on=['underlying_name', 'timestamp']).join(spread, on=['underlying_name', 'timestamp'])
+            # agg_option_chain_data = agg_option_chain_data.join(skew, on=['underlying_name', 'timestamp']).join(
+            #     mkt_participants, on=['underlying_name', 'timestamp']).join(spread, on=['underlying_name', 'timestamp'])
             agg_option_chain_data = agg_option_chain_data.melt(id_vars=['underlying_name', 'timestamp'],
                                                                variable_name='features',
                                                                value_name='features_values')
@@ -114,7 +114,11 @@ if __name__ == '__main__':
                 .otherwise(pl.lit('contemporaneous'))
                 .alias('lag')
             )
-            agg_option_chain_data.lazy().collect(streaming=True).to_pandas().to_sql(name='option_features',
-                                                                                    con=db_connect, if_exists='append',
-                                                                                    index=False)
+            agg_option_chain_data_stream = agg_option_chain_data.lazy().collect(streaming=True)
+
+            for batch in agg_option_chain_data_stream.iter_slices(100_000):
+                batch.to_pandas().to_sql(name='option_features', con=db_connect, if_exists='append', index=False)
+            # agg_option_chain_data.lazy().collect(streaming=True).to_pandas().to_sql(name='option_features',
+            #                                                                         con=db_connect, if_exists='append',
+            #                                                                         index=False)
             print(f'[Insertion]: Option features for {symbol} have been inserted into the database.')
