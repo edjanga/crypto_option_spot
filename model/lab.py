@@ -239,7 +239,6 @@ class FeatureBuilder:
         skew = monyness_label_frames[0]
         for tmp in monyness_label_frames[1:]:
             skew = skew.join(tmp, on='timestamp', how='left')
-        pdb.set_trace()
         if collect:
             return skew.collect(engine=ENGINE)
         return skew
