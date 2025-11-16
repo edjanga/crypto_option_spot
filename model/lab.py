@@ -190,7 +190,8 @@ class FeatureBuilder:
             pl_freq = freq.replace('min', 'm')
         dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
         dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
-            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean())
+            index_column='timestamp', every=pl_freq,
+            by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean().alias('DOTM'))
         label_frames = []
         for label in LABELS[1:]:
             tmp = (data.filter(pl.col('moneyness_label') == label).group_by_dynamic(index_column='timestamp',
