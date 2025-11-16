@@ -194,13 +194,13 @@ class FeatureBuilder:
             by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean().alias('DOTM'))
         label_frames = []
         for label in LABELS[1:]:
-            tmp = (data.filter(pl.col('moneyness_label') == label).group_by_dynamic(index_column='timestamp',
-                                                                                    every=pl_freq,
-                                                                                    by=['underlying_name', 'type'])
-                   .agg(pl.col('mark_iv').mean().alias(f'{label}'))
-                   .join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left')
-                   .with_columns((pl.col(f'{label}') - pl.col('DOTM')).alias(label))
-                   .select(["underlying_name", "timestamp", "type", label]))
+            tmp = (data.filter(pl.col('moneyness_label') == label))
+            tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')])
+            tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq, by=['underlying_name', 'type'])\
+                .agg(pl.col('mark_iv').mean().alias(f'{label}'))\
+                .join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left')\
+                .with_columns((pl.col(f'{label}') - pl.col('DOTM')).alias(label))\
+                .select(["underlying_name", "timestamp", "type", label])
             label_frames.append(tmp)
         skew = label_frames[0]
         for tmp in label_frames[1:]:
