@@ -108,8 +108,9 @@ if __name__ == '__main__':
                 spread = feature_builder.spread(data=tmp_options, freq=args.freq, collect=collect)
                 spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
                 skew_call, skew_put = feature_builder.volatility_skew(data=tmp_options, freq=args.freq, collect=collect)
-                skew_call, skew_put = feature_builder.lags(skew_call, skew_call.collect_schema().names()[2:]),\
-                    feature_builder.lags(skew_put, skew_put.collect_schema().names()[2:])
+                pdb.set_trace()
+                skew_call = feature_builder.lags(skew_call, skew_call.collect_schema().names()[2:])
+                skew_put = feature_builder.lags(skew_put, skew_put.collect_schema().names()[2:])
                 mkt_participants = \
                     daily_option_chain_data.select(
                         [pl.col('underlying_name'), pl.col('timestamp'),
