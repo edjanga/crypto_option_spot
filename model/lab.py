@@ -226,7 +226,6 @@ class FeatureBuilder:
         dotm = \
             dotm.sort(by=[pl.col('timestamp')]).group_by_dynamic(
                 index_column='timestamp', every=pl_freq).agg(pl.col('mark_iv').mean().alias('DOTM'))
-        pdb.set_trace()
         monyness_label_frames = []
         for monyness_label in LABELS[1:]:
             tmp = (data.filter(pl.col('moneyness_label') == monyness_label))
