@@ -223,14 +223,14 @@ class FeatureBuilder:
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
         dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
-        dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-            index_column='timestamp', every=pl_freq,
-            by='underlying_name').agg(pl.col('mark_iv').mean().alias('DOTM'))
+        dotm = \
+            dotm.sort(by=[pl.col('timestamp')]).group_by_dynamic(
+                index_column='timestamp', every=pl_freq).agg(pl.col('mark_iv').mean().alias('DOTM'))
         monyness_label_frames = []
         for monyness_label in LABELS[1:]:
             tmp = (data.filter(pl.col('moneyness_label') == monyness_label))
-            tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('timestamp')])
-            tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name') \
+            tmp = tmp.sort(by=pl.col('timestamp'))
+            tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq) \
                 .agg(pl.col('mark_iv').mean().alias(f'{monyness_label}')) \
                 .join(dotm, on='underlying_name', how='left') \
                 .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label)) \
