@@ -107,11 +107,9 @@ if __name__ == '__main__':
                 ########################################################################################################
                 spread = feature_builder.spread(data=tmp_options, freq=args.freq, collect=collect)
                 spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
-                skew = feature_builder.volatility_skew(data=tmp_options, freq=args.freq, collect=collect)
-                skew_columns = list(product(['call', 'put'], ['OTM', 'ATM', 'ITM', 'DITM']))
-                skew_columns = \
-                    [f'{option_type_moneyness[0]}_{option_type_moneyness[1]}' for option_type_moneyness in skew_columns]
-                skew = feature_builder.lags(skew, skew_columns)
+                skew_call, skew_put = feature_builder.volatility_skew(data=tmp_options, freq=args.freq, collect=collect)
+                skew_call, skew_put = feature_builder.lags(skew_call, skew_call.collect_schema().names()[2:]),\
+                    feature_builder.lags(skew_put, skew_put.collect_schema().names()[2:])
                 mkt_participants = \
                     daily_option_chain_data.select(
                         [pl.col('underlying_name'), pl.col('timestamp'),
@@ -134,13 +132,13 @@ if __name__ == '__main__':
                 agg_option_chain_data = \
                     agg_option_chain_data.unpivot(index=['underlying_name', 'timestamp'], variable_name='features',
                                                   value_name='features_values')
-                pdb.set_trace()
                 agg_option_chain_data = agg_option_chain_data.with_columns(
                     pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
                     .then(pl.col('features').str.split('_').list.last())
                     .otherwise(pl.lit('contemporaneous'))
                     .alias('lag')
                 )
+                pdb.set_trace()
                 agg_option_chain_data.sink_csv(f'{args.target_path}/tmp_{symbol}')
                 agg_option_chain_data = pd.read_csv(f'{args.target_path}/tmp_{symbol}', chunksize=100_000)
                 os.remove(f'{args.target_path}/tmp_{symbol}')
