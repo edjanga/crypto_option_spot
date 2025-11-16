@@ -185,7 +185,8 @@ class FeatureBuilder:
         return vol_weighted_mark_iv.div(vol_volume).unstack(level=1)
 
     @staticmethod
-    def volatility_skew(data: pl.LazyFrame, freq: str, collect: bool = True) -> pl.DataFrame:
+    def volatility_skew(data: pl.LazyFrame, freq: str,
+                        collect: bool = True) -> Union[Tuple[pl.DataFrame], Tuple[pl.LazyFrame]]:
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
         dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
@@ -209,7 +210,9 @@ class FeatureBuilder:
                      .rename({monyness_label: f'call_{monyness_label}' for monyness_label in LABELS[1:]}))
         skew_put = (skew.filter(pl.col('type') == 'put').drop('type')
                     .rename({monyness_label: f'put{monyness_label}' for monyness_label in LABELS[1:]}))
-        pdb.set_trace()
+        if collect:
+            return skew_call.collect(engine=ENGINE), skew_put.collect(engine=ENGINE)
+        return skew_call, skew_put
 
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
