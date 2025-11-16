@@ -75,7 +75,7 @@ if __name__ == '__main__':
                 tmp_start, tmp_end = date, date_interval[idx+2]
                 tmp_options = \
                     options.filter((pl.col('timestamp') >= pl.lit(tmp_start.date())) &
-                                   (pl.col('timestamp') <= pl.lit(tmp_end.date())))
+                                   (pl.col('timestamp') < pl.lit(tmp_end.date()))).drop_nulls()
                 tmp_options = \
                     tmp_options.with_columns(
                         ((pl.col('expiration') - pl.col('timestamp')) / pl.duration(days=360)).alias('tau'))
@@ -96,71 +96,67 @@ if __name__ == '__main__':
                 exposure = feature_builder.compute_exposure(data=tmp_options, freq=args.freq, collect=collect)
                 daily_option_chain_data = tmp_options.drop(['trades', 'netDealerExposure'])
                 pcr = feature_builder.put_call_ratio(data=tmp_options, freq=args.freq, collect=collect)
-                # pcr = feature_builder.lags(pcr, ['pcr'])
+                pcr = feature_builder.lags(pcr, ['pcr'])
                 exposure = feature_builder.lags(exposure, ['gex', 'vax', 'vex', 'vox'])
                 ########################################################################################################
                 ## First aggregation in USDT and level terms
                 ########################################################################################################
                 agg_option_chain_data = exposure.join(pcr, on=['underlying_name', 'timestamp'])
                 ########################################################################################################
-                ## Aggregation per contract type: call or put
+                ## Aggregation per contract type: call and put
                 ########################################################################################################
                 spread = feature_builder.spread(data=tmp_options, freq=args.freq, collect=collect)
-                pdb.set_trace()
-                # spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
+                spread = feature_builder.lags(spread, ['spread_call', 'spread_put'])
                 skew = feature_builder.volatility_skew(data=tmp_options, freq=args.freq, collect=collect)
                 skew_columns = list(product(['call', 'put'], ['OTM', 'ATM', 'ITM', 'DITM']))
                 skew_columns = \
                     [f'{option_type_moneyness[0]}_{option_type_moneyness[1]}' for option_type_moneyness in skew_columns]
                 skew = feature_builder.lags(skew, skew_columns)
+                mkt_participants = \
+                    daily_option_chain_data.select(
+                        [pl.col('underlying_name'), pl.col('timestamp'),
+                         pl.when(pl.col('moneyness_label').is_in(['ATM', 'ITM'])).then(pl.lit('informed'))
+                         .otherwise(pl.when(pl.col('moneyness_label') == 'OTM')
+                                    .then(pl.lit('institutional')).otherwise(pl.lit('retail')))
+                         .alias('mkt_participants')]).sort(by='timestamp')
+                mkt_participants = \
+                    mkt_participants.group_by_dynamic(index_column='timestamp', every=args.freq.replace('in', '')).agg(
+                    [pl.col('underlying_name').last(), pl.col('mkt_participants').mode().get(-1).get(0)]
+                )
+                mkt_participants = \
+                    mkt_participants.with_columns(
+                        [(pl.col('mkt_participants') == pl.lit(mkt_participant)).cast(pl.UInt8)
+                         .alias(f'is_{mkt_participant}') for mkt_participant in ['retail', 'informed', 'institutional']
+                ]).drop('mkt_participants')
+                agg_option_chain_data = \
+                    agg_option_chain_data.join(mkt_participants, on=['underlying_name', 'timestamp'],
+                                               how='left').join(spread, on=['underlying_name', 'timestamp'])
+                agg_option_chain_data = \
+                    agg_option_chain_data.unpivot(index=['underlying_name', 'timestamp'], variable_name='features',
+                                                  value_name='features_values')
                 pdb.set_trace()
-            mkt_participants = \
-                daily_option_chain_data.select([pl.col('underlying_name'), pl.col('timestamp'),
-                                                pl.when(pl.col('moneyness_label').is_in(['ATM', 'ITM']))
-                                               .then(pl.lit('informed'))
-                                               .otherwise(pl.when(pl.col('moneyness_label') == 'OTM')
-                                                          .then(pl.lit('institutional')).otherwise(pl.lit('retail')))
-                                               .alias('mkt_participants')]).sort(by='timestamp')
-            mkt_participants = \
-                mkt_participants.group_by_dynamic(index_column='timestamp', every=args.freq.replace('in', '')).agg(
-                [pl.col('underlying_name').last(), pl.col('mkt_participants').mode().get(-1)]
-            )
-            mkt_participants = \
-                mkt_participants.with_columns([(pl.col('mkt_participants') == pl.lit(mkt_participant)).cast(pl.UInt8)
-                          .alias(f'is_{mkt_participant}') for mkt_participant in ['retail', 'informed', 'institutional']
-            ]).drop('mkt_participants')
-            agg_option_chain_data = agg_option_chain_data.join(skew, on=['underlying_name', 'timestamp']).join(
-                mkt_participants, on=['underlying_name', 'timestamp']).join(spread, on=['underlying_name', 'timestamp'])
-            # agg_option_chain_data = agg_option_chain_data.melt(id_vars=['underlying_name', 'timestamp'],
-            #                                                    variable_name='features',
-            #                                                    value_name='features_values')
-            pdb.set_trace()
-            agg_option_chain_data = \
-                agg_option_chain_data.unpivot(index=['underlying_name', 'timestamp'], variable_name='features',
-                                              value_name='features_values')
-            agg_option_chain_data = agg_option_chain_data.with_columns(
-                pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
-                .then(pl.col('features').str.split('_').list.last())
-                .otherwise(pl.lit('contemporaneous'))
-                .alias('lag')
-            )
-
-            agg_option_chain_data.sink_csv(f'{args.target_path}/tmp_{symbol}')
-            agg_option_chain_data = pd.read_csv(f'{args.target_path}/tmp_{symbol}', chunksize=100_000)
-            os.remove(f'{args.target_path}/tmp_{symbol}')
-            try:
-                while True:
-                    chunk = next(agg_option_chain_data)
-                    chunk.to_sql(name='option_features', con=db_connect, if_exists='append', index=False)
-            except StopIteration:
-                break
-            print(f'[Insertion]: Option features for {symbol} have been inserted into the database.')
-            pdb.set_trace()
-            # agg_option_chain_data = pd.read_parquet(f'{args.target_path}/tmp_{symbol}',)
-            # for batch in agg_option_chain_data_stream.iter_slices(100_000):
-            #     pdb.set_trace()
-            #     batch.to_pandas().to_sql(name='option_features', con=db_connect, if_exists='append', index=False)
-            # agg_option_chain_data.lazy().collect(streaming=True).to_pandas().to_sql(name='option_features',
-            #                                                                         con=db_connect, if_exists='append',
-            #                                                                         index=False)
+                agg_option_chain_data = agg_option_chain_data.with_columns(
+                    pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
+                    .then(pl.col('features').str.split('_').list.last())
+                    .otherwise(pl.lit('contemporaneous'))
+                    .alias('lag')
+                )
+                agg_option_chain_data.sink_csv(f'{args.target_path}/tmp_{symbol}')
+                agg_option_chain_data = pd.read_csv(f'{args.target_path}/tmp_{symbol}', chunksize=100_000)
+                os.remove(f'{args.target_path}/tmp_{symbol}')
+                try:
+                    while True:
+                        chunk = next(agg_option_chain_data)
+                        chunk.to_sql(name='option_features', con=db_connect, if_exists='append', index=False)
+                except StopIteration:
+                    break
+                print(f'[Insertion]: Option features for {symbol} have been inserted into the database.')
+                pdb.set_trace()
+                # agg_option_chain_data = pd.read_parquet(f'{args.target_path}/tmp_{symbol}',)
+                # for batch in agg_option_chain_data_stream.iter_slices(100_000):
+                #     pdb.set_trace()
+                #     batch.to_pandas().to_sql(name='option_features', con=db_connect, if_exists='append', index=False)
+                # agg_option_chain_data.lazy().collect(streaming=True).to_pandas().to_sql(name='option_features',
+                #                                                                         con=db_connect, if_exists='append',
+                #                                                                         index=False)
 
