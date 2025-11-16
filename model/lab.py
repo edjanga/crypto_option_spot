@@ -185,34 +185,26 @@ class FeatureBuilder:
         return vol_weighted_mark_iv.div(vol_volume).unstack(level=1)
 
     @staticmethod
-    def volatility_skew(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame:
-        # skew = data
+    def volatility_skew(data: pl.LazyFrame, freq: str, collect: bool = True) -> pl.DataFrame:
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
         dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
         dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean())
-        for idx, label in enumerate(LABELS[1:]):
-            tmp = data.filter(pl.col('moneyness_label') == label)
-            tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
-                index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean())
-            tmp = tmp.join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left', suffix=f'_DOTM')
-            tmp = tmp.with_columns((pl.col('mark_iv') - pl.col('mark_iv_DOTM')).alias(f'{label}')).select(
-                ['underlying_name', 'timestamp', f'{label}', 'type'])
-            if 'skew' not in vars():
-                skew = tmp
-            else:
-                skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
-        skew = skew.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
-            index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']
-        ).agg([pl.col(f'{label}').mean() for label in ['OTM', 'ATM', 'ITM', 'DITM']])
-        skew_call = skew.filter(pl.col('type') == 'call').drop('type').rename({col: f'call_{col}' for col in
-                                                                               ['OTM', 'ATM', 'ITM', 'DITM']})
-        skew_put = skew.filter(pl.col('type') == 'put').drop('type').rename({col: f'put_{col}' for col in
-                                                                             ['OTM', 'ATM', 'ITM', 'DITM']})
-        if collect:
-            return skew_call.collect(engine=ENGINE), skew_put.collect(engine=ENGINE)
-        return skew_call, skew_put
+        label_frames = []
+        for label in LABELS[1:]:
+            tmp = (data.filter(pl.col('moneyness_label') == label).group_by_dynamic(index_column='timestamp',
+                                                                                    every=pl_freq,
+                                                                                    by=['underlying_name', 'type'])
+                   .agg(pl.col('mark_iv').mean().alias(f'{label}'))
+                   .join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left')
+                   .with_columns((pl.col(f'{label}') - pl.col('DOTM')).alias(label))
+                   .select(["underlying_name", "timestamp", "type", label]))
+            label_frames.append(tmp)
+        skew = label_frames[0]
+        for tmp in label_frames[1:]:
+            skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
+        pdb.set_trace()
 
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
