@@ -80,46 +80,46 @@ class FeatureBuilder:
         return moments.collect(engine=ENGINE)
 
     @staticmethod
-    # def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
-    #     intraday_lags_exprs = [pl.col(feature) for feature in features]
-    #     for lag in INTRADAY_LAGS:
-    #         window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
-    #         for feature in features:
-    #             intraday_lags_exprs.append((pl.col(f'{feature}').rolling_mean(window_size)).shift().over
-    #                                        ('underlying_name').alias(f'{feature}_{lag}'))
-    #     for lag in INTERDAY_LAGS:
-    #         feature_lag = list(product(features, [lag]))
-    #         pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
-    #         if 'feature_lags' not in vars():
-    #             feature_lags = data.with_columns(intraday_lags_exprs)
-    #         feature_interday_lag = \
-    #             (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),  by='underlying_name')
-    #              .agg([(pl.col(f'{feature}').mean()).alias(f'{feature}_{lag}') for feature, lag in feature_lag]))
-    #         feature_interday_lag = feature_interday_lag.select(
-    #             [pl.col('underlying_name'), pl.col('timestamp')]+
-    #             [(pl.col(f'{feature}_{lag}').shift(1).over('underlying_name')) for feature, lag in feature_lag])
-    #     feature_lags = feature_lags.join(feature_interday_lag, on=['underlying_name', 'timestamp'], how='left')
-    #     feature_lags = \
-    #         feature_lags.with_columns([pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
-    #              for feature, lag in feature_lag])
-    #     return feature_lags
-    def lags(data: pl.LazyFrame, features: list[str] = ['RV'] + [f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
-        exprs = []
+    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
+        intraday_lags_exprs = [pl.col(feature) for feature in features]
         for lag in INTRADAY_LAGS:
-            window = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
-            for f in features:
-                exprs.append(pl.col(f).rolling_mean(window).over('underlying_name').shift(1).alias(f"{f}_{lag}"))
-        intra = data.with_columns(exprs)
-        inter = []
+            window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
+            for feature in features:
+                intraday_lags_exprs.append((pl.col(f'{feature}').rolling_mean(window_size)).shift().over
+                                           ('underlying_name').alias(f'{feature}_{lag}'))
         for lag in INTERDAY_LAGS:
+            feature_lag = list(product(features, [lag]))
             pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
-            tmp = (data.group_by_dynamic('timestamp', every=pl_lag, by='underlying_name')
-                   .agg([pl.col(f).mean().alias(f"{f}_{lag}") for f in features])
-                   .with_columns([pl.col(f"{f}_{lag}").shift(1).over("underlying_name") for f in features]))
-            inter.append(tmp)
-        for tmp in inter:
-            intra = intra.join(tmp, on=['underlying_name', 'timestamp'], how='left')
-        return intra
+            if 'feature_lags' not in vars():
+                feature_lags = data.with_columns(intraday_lags_exprs)
+            feature_interday_lag = \
+                (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),  by='underlying_name')
+                 .agg([(pl.col(f'{feature}').mean()).alias(f'{feature}_{lag}') for feature, lag in feature_lag]))
+            feature_interday_lag = feature_interday_lag.select(
+                [pl.col('underlying_name'), pl.col('timestamp')]+
+                [(pl.col(f'{feature}_{lag}').shift(1).over('underlying_name')) for feature, lag in feature_lag])
+        feature_lags = feature_lags.join(feature_interday_lag, on=['underlying_name', 'timestamp'], how='left')
+        feature_lags = \
+            feature_lags.with_columns([pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
+                 for feature, lag in feature_lag])
+        return feature_lags
+    # def lags(data: pl.LazyFrame, features: list[str] = ['RV'] + [f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
+    #     exprs = []
+    #     for lag in INTRADAY_LAGS:
+    #         window = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
+    #         for f in features:
+    #             exprs.append(pl.col(f).rolling_mean(window).over('underlying_name').shift(1).alias(f"{f}_{lag}"))
+    #     intra = data.with_columns(exprs)
+    #     inter = []
+    #     for lag in INTERDAY_LAGS:
+    #         pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
+    #         tmp = (data.group_by_dynamic('timestamp', every=pl_lag, by='underlying_name')
+    #                .agg([pl.col(f).mean().alias(f"{f}_{lag}") for f in features])
+    #                .with_columns([pl.col(f"{f}_{lag}").shift(1).over("underlying_name") for f in features]))
+    #         inter.append(tmp)
+    #     for tmp in inter:
+    #         intra = intra.join(tmp, on=['underlying_name', 'timestamp'], how='left')
+    #     return intra
 
 
     @staticmethod
@@ -187,19 +187,35 @@ class FeatureBuilder:
         spread = spread.join(spread_put, on=['underlying_name', 'timestamp'])
         return spread
 
-    @staticmethod
-    def avg_volatility(data: pd.DataFrame, moneyness_label: str, freq: str) -> pd.Series:
-        vol = data.query(f'moneyness_label == "{moneyness_label}"').drop('moneyness_label', axis=1)
-        vol['weighted_mark_iv'] = vol['mark_iv'].mul(vol['volume'])
-        vol_weighted_mark_iv = \
-            vol.groupby([pd.Grouper(key='underlying_name'),
-                         pd.Grouper(key='type'),
-                         pd.Grouper(level='timestamp', sort=True, freq=freq)])['weighted_mark_iv'].sum()
-        vol_volume = \
-            vol.groupby(([pd.Grouper(key='underlying_name'),
-                         pd.Grouper(key='type'),
-                         pd.Grouper(level='timestamp', sort=True, freq=freq)]))['volume'].sum()
-        return vol_weighted_mark_iv.div(vol_volume).unstack(level=1)
+    # @staticmethod
+    # def volatility_skew(data: pl.LazyFrame, freq: str,
+    #                     collect: bool = True) -> Union[Tuple[pl.DataFrame], Tuple[pl.LazyFrame]]:
+    #     if 'min' in freq:
+    #         pl_freq = freq.replace('min', 'm')
+    #     dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
+    #     dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
+    #         index_column='timestamp', every=pl_freq,
+    #         by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean().alias('DOTM'))
+    #     monyness_label_frames = []
+    #     for monyness_label in LABELS[1:]:
+    #         tmp = (data.filter(pl.col('moneyness_label') == monyness_label))
+    #         tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')])
+    #         tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq, by=['underlying_name', 'type'])\
+    #             .agg(pl.col('mark_iv').mean().alias(f'{monyness_label}'))\
+    #             .join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left')\
+    #             .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label))\
+    #             .select(["underlying_name", "timestamp", "type", monyness_label])
+    #         monyness_label_frames.append(tmp)
+    #     skew = monyness_label_frames[0]
+    #     for tmp in monyness_label_frames[1:]:
+    #         skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
+    #     skew_call = (skew.filter(pl.col('type') == 'call').drop('type')
+    #                  .rename({monyness_label: f'call_{monyness_label}' for monyness_label in LABELS[1:]}))
+    #     skew_put = (skew.filter(pl.col('type') == 'put').drop('type')
+    #                 .rename({monyness_label: f'put{monyness_label}' for monyness_label in LABELS[1:]}))
+    #     if collect:
+    #         return skew_call.collect(engine=ENGINE), skew_put.collect(engine=ENGINE)
+    #     return skew_call, skew_put
 
     @staticmethod
     def volatility_skew(data: pl.LazyFrame, freq: str,
@@ -207,29 +223,25 @@ class FeatureBuilder:
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
         dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
-        dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
+        dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq,
-            by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean().alias('DOTM'))
+            by='underlying_name').agg(pl.col('mark_iv').mean().alias('DOTM'))
         monyness_label_frames = []
         for monyness_label in LABELS[1:]:
             tmp = (data.filter(pl.col('moneyness_label') == monyness_label))
-            tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')])
-            tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq, by=['underlying_name', 'type'])\
-                .agg(pl.col('mark_iv').mean().alias(f'{monyness_label}'))\
-                .join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left')\
-                .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label))\
-                .select(["underlying_name", "timestamp", "type", monyness_label])
+            tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('timestamp')])
+            tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name') \
+                .agg(pl.col('mark_iv').mean().alias(f'{monyness_label}')) \
+                .join(dotm, on='underlying_name', how='left') \
+                .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label)) \
+                .select(['underlying_name', 'timestamp', monyness_label])
             monyness_label_frames.append(tmp)
         skew = monyness_label_frames[0]
         for tmp in monyness_label_frames[1:]:
-            skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
-        skew_call = (skew.filter(pl.col('type') == 'call').drop('type')
-                     .rename({monyness_label: f'call_{monyness_label}' for monyness_label in LABELS[1:]}))
-        skew_put = (skew.filter(pl.col('type') == 'put').drop('type')
-                    .rename({monyness_label: f'put{monyness_label}' for monyness_label in LABELS[1:]}))
+            skew = skew.join(tmp, on=['underlying_name', 'timestamp'], how='left')
         if collect:
-            return skew_call.collect(engine=ENGINE), skew_put.collect(engine=ENGINE)
-        return skew_call, skew_put
+            return skew.collect(engine=ENGINE)
+        return skew
 
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
