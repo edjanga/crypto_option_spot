@@ -236,8 +236,8 @@ class FeatureBuilder:
                 .join(dotm, on='timestamp', how='left') \
                 .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label)) \
                 .select(['timestamp', monyness_label])
+            pdb.set_trace()
             monyness_label_frames.append(tmp)
-        pdb.set_trace()
         skew = monyness_label_frames[0]
         for tmp in monyness_label_frames[1:]:
             skew = skew.join(tmp, on='timestamp', how='left')
