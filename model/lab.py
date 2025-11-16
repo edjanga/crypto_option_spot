@@ -104,32 +104,6 @@ class FeatureBuilder:
                  for feature, lag in feature_lag])
         return feature_lags
 
-    # @staticmethod
-    # def rv_lags(data: pl.DataFrame, freq: str, D: str):
-    #     all_lags = INTRADAY_LAGS + INTERDAY_LAGS
-    #     start_idx = all_lags.index(freq)
-    #     end_idx = all_lags.index(D) + 1
-    #     lags = all_lags[start_idx:end_idx]
-    #     intraday_lags_exprs = [pl.col('RV')]
-    #     for lag in lags:
-    #         if lag in INTRADAY_LAGS:
-    #             window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
-    #             intraday_lags_exprs.append(pl.col('RV').rolling_mean(window_size).over
-    #                                        ('underlying_name').alias(f'RV_{lag}'))
-    #         elif lag in INTERDAY_LAGS:
-    #             pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
-    #             if 'rv_lags' not in vars():
-    #                 rv_lags = data.with_columns(intraday_lags_exprs)
-    #             rv_interday_lag = (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),
-    #                                                      by='underlying_name')
-    #                                .agg(pl.col('RV').mean().alias(f'RV_mean'))
-    #                                .with_columns(pl.col('RV_mean').shift(1).over('underlying_name').alias(f'RV_{lag}'))
-    #                                .drop('RV_mean'))
-    #             rv_lags = rv_lags.join(rv_interday_lag, on=['underlying_name', 'timestamp'], how='left')
-    #     rv_lags = \
-    #         rv_lags.with_columns(
-    #             [pl.col(f'RV_{lag}').fill_null(strategy='forward').over('underlying_name') for lag in lags])
-    #     return rv_lags
 
     @staticmethod
     def define_market_participants(data: pl.DataFrame) -> pd.DataFrame:
@@ -212,7 +186,7 @@ class FeatureBuilder:
 
     @staticmethod
     def volatility_skew(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame:
-        skew = data
+        # skew = data
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
         dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
@@ -225,8 +199,10 @@ class FeatureBuilder:
             tmp = tmp.join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left', suffix=f'_DOTM')
             tmp = tmp.with_columns((pl.col('mark_iv') - pl.col('mark_iv_DOTM')).alias(f'{label}')).select(
                 ['underlying_name', 'timestamp', f'{label}', 'type'])
-            skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
-        skew = skew.select(['timestamp', 'underlying_name', 'type', 'OTM', 'ATM', 'ITM', 'DITM'])
+            if 'skew' not in vars():
+                skew = tmp
+            else:
+                skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
         skew = skew.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']
         ).agg([pl.col(f'{label}').mean() for label in ['OTM', 'ATM', 'ITM', 'DITM']])
@@ -234,10 +210,9 @@ class FeatureBuilder:
                                                                                ['OTM', 'ATM', 'ITM', 'DITM']})
         skew_put = skew.filter(pl.col('type') == 'put').drop('type').rename({col: f'put_{col}' for col in
                                                                              ['OTM', 'ATM', 'ITM', 'DITM']})
-        skew = skew_call.join(skew_put, on=['underlying_name', 'timestamp'])
         if collect:
-            return skew.collect(engine=ENGINE)
-        return skew
+            return skew_call.collect(engine=ENGINE), skew_put.collect(engine=ENGINE)
+        return skew_call, skew_put
 
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
