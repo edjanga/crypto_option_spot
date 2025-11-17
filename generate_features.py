@@ -157,6 +157,5 @@ if __name__ == '__main__':
                 else:
                     print(f'[Features]: No data for {symbol} between {date.strftime(DATE_FORMAT)} and '
                           f'{(date+relativedelta(days=30)).strftime(DATE_FORMAT)}.')
-            pdb.set_trace()
             print(f'[Insertion]: Option features for {symbol} have been inserted into the database.')
 
