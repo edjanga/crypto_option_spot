@@ -187,62 +187,6 @@ class FeatureBuilder:
         spread = spread.join(spread_put, on=['underlying_name', 'timestamp'])
         return spread
 
-    # @staticmethod
-    # def volatility_skew(data: pl.LazyFrame, freq: str,
-    #                     collect: bool = True) -> Union[Tuple[pl.DataFrame], Tuple[pl.LazyFrame]]:
-    #     if 'min' in freq:
-    #         pl_freq = freq.replace('min', 'm')
-    #     dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
-    #     dotm = dotm.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')]).group_by_dynamic(
-    #         index_column='timestamp', every=pl_freq,
-    #         by=['underlying_name', 'type']).agg(pl.col('mark_iv').mean().alias('DOTM'))
-    #     monyness_label_frames = []
-    #     for monyness_label in LABELS[1:]:
-    #         tmp = (data.filter(pl.col('moneyness_label') == monyness_label))
-    #         tmp = tmp.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('timestamp')])
-    #         tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq, by=['underlying_name', 'type'])\
-    #             .agg(pl.col('mark_iv').mean().alias(f'{monyness_label}'))\
-    #             .join(dotm, on=['underlying_name', 'type', 'timestamp'], how='left')\
-    #             .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label))\
-    #             .select(["underlying_name", "timestamp", "type", monyness_label])
-    #         monyness_label_frames.append(tmp)
-    #     skew = monyness_label_frames[0]
-    #     for tmp in monyness_label_frames[1:]:
-    #         skew = skew.join(tmp, on=['underlying_name', 'type', 'timestamp'], how='left')
-    #     skew_call = (skew.filter(pl.col('type') == 'call').drop('type')
-    #                  .rename({monyness_label: f'call_{monyness_label}' for monyness_label in LABELS[1:]}))
-    #     skew_put = (skew.filter(pl.col('type') == 'put').drop('type')
-    #                 .rename({monyness_label: f'put{monyness_label}' for monyness_label in LABELS[1:]}))
-    #     if collect:
-    #         return skew_call.collect(engine=ENGINE), skew_put.collect(engine=ENGINE)
-    #     return skew_call, skew_put
-
-    @staticmethod
-    def volatility_skew(data: pl.LazyFrame, freq: str,
-                        collect: bool = True) -> Union[Tuple[pl.DataFrame], Tuple[pl.LazyFrame]]:
-        if 'min' in freq:
-            pl_freq = freq.replace('min', 'm')
-        dotm = data.filter(pl.col('moneyness_label') == 'DOTM')
-        dotm = \
-            dotm.sort(by=[pl.col('timestamp')]).group_by_dynamic(
-                index_column='timestamp', every=pl_freq).agg(pl.col('mark_iv').mean().alias('DOTM'))
-        monyness_label_frames = []
-        for monyness_label in LABELS[1:]:
-            tmp = (data.filter(pl.col('moneyness_label') == monyness_label))
-            tmp = tmp.sort(by=pl.col('timestamp'))
-            tmp = tmp.group_by_dynamic(index_column='timestamp', every=pl_freq) \
-                .agg(pl.col('mark_iv').mean().alias(f'{monyness_label}')) \
-                .join(dotm, on='timestamp', how='left') \
-                .with_columns((pl.col(f'{monyness_label}') - pl.col('DOTM')).alias(monyness_label)) \
-                .select(['timestamp', monyness_label])
-            monyness_label_frames.append(tmp)
-        skew = monyness_label_frames[0]
-        for tmp in monyness_label_frames[1:]:
-            skew = skew.join(tmp, on='timestamp', how='left')
-        if collect:
-            return skew.collect(engine=ENGINE)
-        return skew
-
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
         if 'min' in freq:
