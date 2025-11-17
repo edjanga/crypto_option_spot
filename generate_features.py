@@ -77,7 +77,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     else:
         date_interval = pd.date_range(start=args.start_date, end=args.end_date, freq='30D', inclusive='both')
-        for symbol in ['XRPUSDT']:
+        for symbol in SYMBOLS:
             print(f'[Insertion]: Process to generate option features for {symbol} has started.........................')
             for idx, date in enumerate(date_interval):
                 print(
