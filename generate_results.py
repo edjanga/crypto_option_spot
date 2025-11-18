@@ -45,7 +45,7 @@ if __name__ == '__main__':
     SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
     SYMBOLS_QUERY = f'({",".join(SYMBOLS_QUERY)})'
     features_query = f'WITH base AS(SELECT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
-    f'AND "target" = "RV") SELECT underlying_name, timestamp, features, features_values, lag FROM base ' \
+    f'AND "target" = "{args.target}") SELECT underlying_name, timestamp, features, features_values, lag FROM base ' \
     f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values, lag ' \
     f'FROM base;'
     features = pd.read_sql(sql=features_query, con=db_connect, chunksize=100_000)
