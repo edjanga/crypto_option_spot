@@ -10,12 +10,6 @@ from model.lab import FeatureBuilder, LassoRegressor, BoostingRegressor, LSTMReg
 from dateutil.relativedelta import relativedelta
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
 from sklearn.preprocessing import MinMaxScaler
-import polars as pl
-
-
-def return_filename(filename: str):
-    return filename
-
 
 models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
@@ -50,17 +44,23 @@ if __name__ == '__main__':
     ####################################################################################################################
     SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
     SYMBOLS_QUERY = f'({",".join(SYMBOLS_QUERY)})'
-    features_query = \
-        f'SELECT "underlying_name","timestamp","target","target_values", "features", "features_values", "lag" ' \
-        f'FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} AND "target" = "{args.target}" ' \
-        f'AND "lag" IN ({LAGS});'
-    features = pd.read_sql(sql=features_query, con=db_connect).drop(['target', 'lag'], axis=1)
+    features_query = f'WITH base AS(SELECT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
+    f'AND "target" = "RV") SELECT underlying_name, timestamp, features, features_values, lag FROM base ' \
+    f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values, lag ' \
+    f'FROM base;'
+    features = pd.read_sql(sql=features_query, con=db_connect, chunksize=100_000)
+    tmp_features = list()
+    while True:
+        try:
+            tmp_features.append(next(features).drop('lag', axis=1))
+        except StopIteration:
+            break
+    features = pd.concat(tmp_features)
     features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
-    features = features.set_index(['underlying_name', 'timestamp'])
-    target = features.pop('target_values').rename(args.target)
+    features = features[(features['timestamp'] >= args.start_date) & (features['timestamp'] < args.end_date)]
     features = \
-        pd.pivot(features, columns='features', values='features_values').join(target, on=['underlying_name',
-                                                                                          'timestamp'])
+        pd.pivot_table(features, columns='features', values='features_values', index=['underlying_name', 'timestamp'])
+    features.index = features.index.set_names(['underlying_name', 'timestamp'])
     ####################################################################################################################
     ## Options
     ####################################################################################################################
@@ -68,23 +68,25 @@ if __name__ == '__main__':
         options_features_query = \
             f'SELECT "features","features_values","underlying_name","timestamp", "lag" FROM option_features ' \
             f'WHERE "underlying_name" IN {SYMBOLS_QUERY} AND "lag" IN ({LAGS});'
-        options_features = pd.read_sql(sql=options_features_query, con=db_connect).drop('lag', axis=1)
+        tmp_options_features = list()
+        options_features = \
+            pd.read_sql(sql=options_features_query, con=db_connect, chunksize=100_000)
+        while True:
+            try:
+                tmp_options_features.append(next(options_features).drop('lag', axis=1))
+            except StopIteration:
+                break
+        options_features = pd.concat(tmp_options_features)
         options_features['timestamp'] = pd.to_datetime(options_features['timestamp'], utc=pytz.UTC)
-        options_features = options_features.set_index(['underlying_name', 'timestamp', 'features'])
-        options_features = options_features.loc[~options_features.index.duplicated(), :]
-        options_features = options_features.unstack(-1).droplevel(axis=1, level=0)
-        options_features.loc[:, ~options_features.columns.str.contains('market_participants')] = \
-            options_features.loc[:, ~options_features.columns.str.contains('market_participants')].astype(float)
+        options_features = \
+            options_features[(options_features['timestamp'] >= args.start_date) &
+                             (options_features['timestamp'] < args.end_date)]
+        options_features = pd.pivot_table(data=options_features, values='features_values', columns='features',
+                                          index=['underlying_name', 'timestamp'])
         options_features = \
             options_features.groupby(by=pd.Grouper(level='underlying_name'),
                                      group_keys=False).apply(lambda x: x.ffill())
-        options_features = \
-            pd.concat([options_features,
-                       pd.get_dummies(options_features.filter(regex='market_participants'),
-                                      columns=['market_participants_call', 'market_participants_put'],
-                                      prefix='is', prefix_sep='_').astype(np.int8)], axis=1).drop(
-                ['market_participants_call', 'market_participants_put'], axis=1)
-        features = features.join(options_features, on=['underlying_name', 'timestamp'])
+        features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     ####################################################################################################################
@@ -116,7 +118,7 @@ if __name__ == '__main__':
                 ~train_X.columns.isin(cols_ignore_in_scaling)] = \
                     minmax_scaler[symbol].fit_transform(train_X.xs(symbol, drop_level=False).loc[:,
                                                         ~train_X.columns.isin(cols_ignore_in_scaling)])
-        study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime("%Y-%m-%d")}'
+        study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
         if model.name in ['lasso', 'elastic', 'lightgbm']:
             rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
             models.loc[date] = rres_study.user_attrs['best_estimator'] if model.name == 'lightgbm' else rres_study
@@ -146,7 +148,6 @@ if __name__ == '__main__':
             (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[args.D], unit='D').days))
         test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
                               (features.index.get_level_values(1).date < end_date_forecast), :]
-        test_X = test_X.groupby(by=pd.Grouper(level=0), group_keys=False).apply(lambda x: x.ffill())
         test_y = test_X.pop(args.target)
         if (args.D != '1D') & (model.name == 'lstm'):
             ############################################################################################################
@@ -186,9 +187,9 @@ if __name__ == '__main__':
                       data=models.loc[models.index.date == date].iloc[0](test_X_tensor).detach().numpy().reshape(
                           test_X_tensor.shape[0]) if model.name == 'lstm' else
                       models.loc[models.index.date == date].iloc[0].predict(test_X))
-        ############################################################################################################
+        ################################################################################################################
         ## Model assessement
-        ############################################################################################################
+        ################################################################################################################
         test_y = pd.concat([test_y.rename('values'), pd.Series(y_hat, index=test_y.index, name='forecast')], axis=1)
         test_y = \
             test_y.replace(0, np.nan).groupby(by=[pd.Grouper(level=0)], group_keys=False).apply(lambda x: x.ffill())
@@ -196,14 +197,16 @@ if __name__ == '__main__':
         mase_metric = list()
         for symbol in test_y.index.get_level_values(0).unique():
             symbol_test_y, symbol_train_y = test_y.xs(symbol, axis=0, level=0), train_y.xs(symbol, axis=0, level=0)
+            symbol_test_y = symbol_test_y.dropna()
+            symbol_train_y = symbol_train_y.dropna()
             mase_metric.append(mase_score(y_true=symbol_test_y.iloc[:, 0].values,
                                           y_pred=symbol_test_y.iloc[:, 1].values,
                                           y_train=symbol_train_y.values))
         mase.append([sum(mase_metric)/len(mase_metric),
                      start_date_forecast, model.name.lower(), args.target, args.D, args.options, args.freq])
-        ############################################################################################################
+        ################################################################################################################
         ## Feature importance
-        ############################################################################################################
+        ################################################################################################################
         permutation_feature_importance_obj.model = models.loc[models.index.date == date].iloc[0]
         permutation_feature_importance_obj.test = test_X
         permutation_feature_importance_obj.test_y = test_y
@@ -235,7 +238,6 @@ if __name__ == '__main__':
     features_importance = \
         features_importance.assign(regression=args.regression, D=args.D, freq=args.freq, market=args.options,
                                    target=args.target)
-    pdb.set_trace()
     ####################################################################################################################
     ## Database insertion or exporting to .csv files
     ####################################################################################################################
