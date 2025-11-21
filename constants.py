@@ -33,7 +33,7 @@ VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for LSTM
-PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 3)], 'num_layers': list(range(1, 2)),
+PARAMS_LSTM = {'hidden_size': [2**n for n in range(2, 8)], 'num_layers': list(range(1, 5)),
                'learning_rate': [0.001, 0.005, 0.01], 'beta': list(np.linspace(0, 1, 11))}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 # Font sizes for plots
