@@ -293,8 +293,8 @@ class ElasticRegressor(Regressor):
 
     def model_train(self, features: Union[pd.DataFrame, np.ndarray], target: Union[pd.DataFrame, np.ndarray],
                     **kwargs) -> ElasticNetCV:
-        rres = ElasticNetCV(alphas=np.linspace(0.1, 0.9, 9, dtype=np.float64), l1_ratio=np.linspace(1e-1, 5e-1, 5),
-                            cv=tscv, random_state=123, max_iter=MAX_ITER, n_jobs=-1)
+        rres = ElasticNetCV(l1_ratio=np.linspace(1e-1, 5e-1, 5),
+                            cv=tscv, random_state=123, max_iter=MAX_ITER, n_jobs=-1, n_alphas=50)
         rres.fit(features, target)
         return rres
 
@@ -371,7 +371,8 @@ class LSTMRegressor(Regressor):
     def model_fine_tune(train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
                         date: datetime, L: str, target: str, n_trials: int = N_TRIALS,
                         max_epochs: int = EPOCH) -> LSTMModel:
-        print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} has started..')
+        print(f'Fine tuning: '
+              f'{model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} has started...............')
         model.eval()
         for name, param in model.named_parameters():
             if name not in ['fc.weight', 'fc.bias']:
@@ -432,7 +433,6 @@ class PermutationFeatureImportance:
     def test(self, test: Union[pd.DataFrame, np.ndarray, DataLoader]) -> None:
         self._test = test
 
-
     @property
     def test_y(self) -> pd.Series:
         return self._test_y
@@ -458,12 +458,17 @@ class PermutationFeatureImportance:
             for feature in self._test.columns:
                 shuffled_test, feature = shuffle_single_feature(self._test, feature)
                 self._test_y.iloc[:, 1] = \
-                    self.model.predict(shuffled_test) if not isinstance(self.model, LSTMModel) else pdb.set_trace()
+                    self.model.predict(shuffled_test) if not isinstance(self.model, LSTMModel) else \
+                        self.model(torch.from_numpy(
+                            shuffled_test.values.reshape(1, shuffled_test.values.shape[0],
+                                                         shuffled_test.values.shape[1])).to(torch.float32)
+                                   ).flatten().unsqueeze(0).detach().numpy()[0]
                 feature_importance[feature] += \
                 (self._test_y.diff(axis=1).iloc[:, -1].div(avg1s)).abs().groupby(by=pd.Grouper(level=0)).mean().mean()
             count += 1
         feature_importance = pd.Series(feature_importance)/50
         return feature_importance
+
 
 
 class PnLExplained:
