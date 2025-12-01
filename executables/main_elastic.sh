@@ -38,23 +38,19 @@
 #wait
 #echo "All jobs completed!"
 #deactivate
-L=3M
 MAX_JOBS=2
 run_job() {
-    local L=$1
-    local freq=$2
-    local target=$3
-    local options=$4
-    local D=$5
-    local start_date=$6
-    local end_date=$7
-
+    local freq=$1
+    local target=$2
+    local options=$3
+    local D=$4
+    local start_date=$5
+    local end_date=$6
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running: D=$D freq=$freq target=$target options=$options dates=$start_date to $end_date"
-
     python3 ../generate_results.py \
         --start_date=$start_date \
         --end_date=$end_date \
-        --L=$L \
+        --L=3M \
         --freq=$freq \
         --regression=elastic \
         --target=$target \
@@ -83,7 +79,7 @@ for date_range in "${date_ranges[@]}"; do
                     while [ $(jobs -r | wc -l) -ge $MAX_JOBS ]; do
                         sleep 0.1
                     done
-                    run_job "$L" "$freq" "$target" "$options" "$D" "$start_date" "$end_date" &
+                    run_job $freq" "$target" "$options" "$D" "$start_date" "$end_date" &
                 done
             done
         done
