@@ -254,7 +254,6 @@ if __name__ == '__main__':
         features_importance.to_csv(f'{args.target_path}/features_importance.csv', mode='a',
                                    header=not os.path.exists(f'{args.target_path}/features_importance.csv'))
         print(f'[Data Export]: Results for {args} have been exported into csv files.')
-    pdb.set_trace()
 
 
 
