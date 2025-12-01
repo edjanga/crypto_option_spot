@@ -38,6 +38,7 @@
 #wait
 #echo "All jobs completed!"
 #deactivate
+L=3M
 MAX_JOBS=2
 run_job() {
     local L=$1

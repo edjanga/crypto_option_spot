@@ -40,6 +40,7 @@
 #echo "All jobs completed!"
 #deactivate
 #!/bin/bash
+L=3M
 MAX_JOBS=2
 run_job() {
     local L=$1
@@ -64,7 +65,6 @@ run_job() {
         --to_csv=0
 }
 export -f run_job
-# Define date ranges
 date_ranges=(
     "2023-01-01 2024-01-01"
     "2024-01-01 2025-01-01"
@@ -90,12 +90,10 @@ for date_range in "${date_ranges[@]}"; do
             done
         done
     done
-    # Wait for all jobs in this date range to complete before moving to next
     echo "Waiting for all jobs in date range $start_date to $end_date to complete..."
     wait
     echo "✓ Completed date range: $start_date to $end_date"
 done
-
 echo ""
 echo "=========================================="
 echo "All jobs completed successfully!"
