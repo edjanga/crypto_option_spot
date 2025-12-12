@@ -11,15 +11,10 @@ import pytz
 from model.lab import PnLExplained, shuffle_single_feature
 from optuna.samplers import RandomSampler
 from dateutil.relativedelta import relativedelta
-from constants import DATE_FORMAT, N_JOBS, N_TRIALS, FEES_SPOT, FEES_OPTIONS, DAYS_CONVERTER, TITLE_FONT_SIZE,\
-    LABEL_AXIS_FONT_SIZE, HEIGHT, WIDTH, SYMBOLS, LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, VOL_REGIMES, ATM_MONEYNESSES, \
-    SUPERSCRIPT, ENGINE
+from constants import DATE_FORMAT, N_JOBS, N_TRIALS, FEES_SPOT, FEES_OPTIONS, DAYS_CONVERTER, SYMBOLS,\
+    LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, VOL_REGIMES, ATM_MONEYNESSES, ENGINE
 from functools import partial
-from typing import Dict, List, Tuple
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.figure_factory as ff
+from typing import Dict, List, Tuple, Union
 from scipy.optimize import minimize
 from scipy.stats.distributions import norm
 import statsmodels.api as sm
@@ -38,7 +33,7 @@ import argparse
 def process_daily_option_chain_date(date: datetime.datetime, directory: str,
                                     freq: str) -> Tuple[datetime, pl.LazyFrame]:
     print(f'Option chain data for {date.strftime(DATE_FORMAT)} is being generated.........')
-    option_chain_data = pl.scan_parquet(f'{directory}/{date.year}/options/{date.strftime(DATE_FORMAT)}')
+    option_chain_data = pl.scan_parquet(f'{directory}/*/{date.year}/options/{date.strftime(DATE_FORMAT)}')
     option_chain_data = option_chain_data.sort(['underlying_name', 'timestamp'])
     option_chain_data = (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
                                                             group_by='underlying_name', include_boundaries=False,
@@ -131,7 +126,7 @@ def svix_daily(date: datetime, option_chain: pd.DataFrame, iv_interpolation: pd.
     symbol_option_type = list(itertools.product(symbol, ['call', 'put']))
     print(f'[SVIX Computation]: SVIX_{D.lower()} {date.strftime(DATE_FORMAT)} is being computed.........\n')
     underlying_price = option_chain[['timestamp', 'underlying_price', 'underlying_name']].set_index('timestamp')
-    underlying_price = underlying_price.loc[underlying_price.index.date == date.date()]
+    underlying_price = underlying_price.loc[underlying_price.index.date == date]
     underlying_price = underlying_price.drop_duplicates(keep='last')
     underlying_price = pd.pivot_table(underlying_price.reset_index(), columns='underlying_name',
                                       values='underlying_price', index='timestamp')
@@ -170,7 +165,7 @@ def svix_daily(date: datetime, option_chain: pd.DataFrame, iv_interpolation: pd.
         sym, option_type = sym_option_type[0], sym_option_type[1]
         option_chain_sym_type = option_chain.query(f'(underlying_name == "{sym}") & (type == "{option_type}")')
         strikes = option_chain_sym_type[['strike_price', 'timestamp']].set_index('timestamp')
-        strikes = strikes.loc[strikes.index.date == date.date()].reset_index()
+        strikes = strikes.loc[strikes.index.date == date].reset_index()
         strikes, strikes_grid = preprocess_strikes(strikes)
         strikes = \
             strikes.reindex(pd.date_range(start=date, freq=freq, end=date + relativedelta(days=1), inclusive='left',
@@ -226,99 +221,142 @@ def svix_daily(date: datetime, option_chain: pd.DataFrame, iv_interpolation: pd.
     return tmp, D
 
 
-def objective_daily(trial: optuna.trial.Trial, transaction_cost: bool, spread: bool, **kwargs) -> float:
-    param = dict([('threshold_filter', trial.suggest_float(name='threshold_filter', low=0, high=1, step=.01))])
+def objective_daily(trial: optuna.trial.Trial, transaction_cost: bool, spread: bool, mean_bar: pd.DataFrame,
+                    **kwargs) -> float:
+    param = dict([('threshold_filter', trial.suggest_float(name='threshold_filter', low=0, high=1, step=.1))])
     data = kwargs['data']
-    signal_filter_long = \
-        ((data['forecast'].subtract(data['values'].shift())).div(data['values'].mean())).gt(param['threshold_filter'])
-    signal_filter_short = \
-        ((data['forecast'].subtract(data['values'].shift())).div(data['values'].mean())).lt(-param['threshold_filter'])
-    signal_filter_long = signal_filter_long.astype(int)
-    signal_filter_short = signal_filter_short.astype(int)
     if kwargs['target'] == 'RV':
-        signal_filter = pd.concat([signal_filter_long, signal_filter_short], axis=1)
+        signal_filter_long = \
+            ((data['forecast'].subtract(data['values'].shift())).div(mean_bar.loc[data.index, :])).gt(
+                param['threshold_filter'])
+        signal_filter_short = \
+            ((data['forecast'].subtract(data['values'].shift())).div(mean_bar.loc[data.index, :])).lt(
+                -param['threshold_filter'])
+        signal_filter_long = signal_filter_long.astype(int)
+        signal_filter_short = signal_filter_short.astype(int)
         option_chain_data = kwargs['option_chain_data']
-        signal_filter = \
-            signal_filter.loc[list(set(option_chain_data.index).intersection(signal_filter.index)), :].sort_index()
         vrp = kwargs['vrp']
         param.update(
             dict([('lower_bound_atm', trial.suggest_float(name='lower_bound_atm', low=np.log(LOW_ATM_MONEYNESS),
                                                           high=np.log(.05 + LOW_ATM_MONEYNESS))),
                   ('upper_bound_atm', trial.suggest_float(name='upper_bound_atm', low=np.log(-.05 + HIGH_ATM_MONEYNESS),
                                                           high=np.log(HIGH_ATM_MONEYNESS)))]))
-        option_chain_data['atm'] = option_chain_data['moneyness'].gt(param['lower_bound_atm']) & \
+        option_chain_data.loc[:, 'atm'] = option_chain_data['moneyness'].gt(param['lower_bound_atm']) & \
                                    option_chain_data['moneyness'].lt(param['upper_bound_atm'])
         option_chain_data = option_chain_data[option_chain_data.atm].drop(['atm', 'moneyness'], axis=1)
         option_chain_data = \
             option_chain_data.groupby(by=[pd.Grouper(key='option_tag'),
-                                          pd.Grouper(level=0)]).agg({'underlying_price': 'last',
+                                          pd.Grouper(level=0)]).agg({'underlying_name': 'last',
+                                                                     'underlying_price': 'last',
                                                                      'spread': 'sum', 'mid_price': 'sum'})
         option_chain_data['transaction_fees'] = FEES_SPOT * option_chain_data['underlying_price']
         option_chain_data['transaction_fees'] = option_chain_data['transaction_fees'].where(
             option_chain_data['transaction_fees'].le(FEES_OPTIONS * option_chain_data['mid_price']),
             FEES_OPTIONS * option_chain_data['mid_price'])
-        option_chain_data['short_returns'] = option_chain_data['mid_price'].shift() - option_chain_data['mid_price']
-        option_chain_data['long_returns'] = option_chain_data['mid_price'] - option_chain_data['mid_price'].shift()
+        option_chain_data['long_returns'] = option_chain_data.groupby(pd.Grouper(level=0), group_keys=False).apply(
+            lambda x: x['mid_price'] - x['mid_price'].shift())
+        option_chain_data['short_returns'] = -option_chain_data['long_returns']
         if transaction_cost:
-            option_chain_data['short_returns'] = option_chain_data['short_returns'].subtract(
-                (option_chain_data['transaction_fees'] + option_chain_data['transaction_fees'].shift()))
-            option_chain_data['long_returns'] = option_chain_data['long_returns'].subtract(
-                (option_chain_data['transaction_fees'] + option_chain_data['transaction_fees'].shift()))
+            option_chain_data['long_returns'] = \
+                option_chain_data['long_returns'] - option_chain_data.groupby(
+                    pd.Grouper(level=0), group_keys=False).apply(
+                    lambda x: x['transaction_fees'] + x['transaction_fees'].shift())
+            option_chain_data['short_returns'] = \
+                option_chain_data['short_returns'] - option_chain_data.groupby(
+                    pd.Grouper(level=0), group_keys=False).apply(
+                    lambda x: x['transaction_fees'] + x['transaction_fees'].shift())
         if spread:
-            option_chain_data['short_returns'] = option_chain_data['short_returns'].subtract(
-                (option_chain_data['spread'] + option_chain_data['spread'].shift()) / 2)
-            option_chain_data['long_returns'] = option_chain_data['long_returns'].subtract(
-                (option_chain_data['spread'] + option_chain_data['spread'].shift()) / 2)
-        option_chain_data['short_returns'] = option_chain_data['short_returns'].div(option_chain_data['mid_price'])
-        option_chain_data['long_returns'] = option_chain_data['long_returns'].div(option_chain_data['mid_price'])
-        vrp = np.sign(vrp.reindex(option_chain_data.index.get_level_values(1)))
+            option_chain_data['long_returns'] = \
+                option_chain_data['long_returns'] - option_chain_data.groupby(
+                    pd.Grouper(level=0), group_keys=False).apply(
+                    lambda x: .5*(x['spread'] + x['spread'].shift()))
+            option_chain_data['short_returns'] = \
+                option_chain_data['short_returns'] - option_chain_data.groupby(
+                    pd.Grouper(level=0), group_keys=False).apply(
+                    lambda x: .5 * (x['spread'] + x['spread'].shift()))
+        option_chain_data['long_returns'] = \
+            option_chain_data['long_returns'].div(option_chain_data['mid_price'].groupby(
+                pd.Grouper(level=0), group_keys=False).apply(lambda x: x.shift()))
+        option_chain_data['short_returns'] = \
+            option_chain_data['short_returns'].div(option_chain_data['mid_price'].groupby(
+                pd.Grouper(level=0), group_keys=False).apply(lambda x: x.shift()))
+        long_returns = option_chain_data[['long_returns', 'underlying_name']].groupby(
+            [pd.Grouper(key='underlying_name'), pd.Grouper(level=1)])[['long_returns']].mean()
+        short_returns = option_chain_data[['short_returns', 'underlying_name']].groupby(
+            [pd.Grouper(key='underlying_name'), pd.Grouper(level=1)])[['short_returns']].mean()
+        long_returns = \
+            pd.concat([long_returns.assign(D='1D'), long_returns.assign(D='1W'),
+                       long_returns.assign(D='1M')]).set_index('D', append=True)
+        long_returns = long_returns.unstack(level=[0, 2]).replace([-np.inf, np.inf], np.nan).droplevel(axis=1, level=0)
+        short_returns = pd.concat(
+            [short_returns.assign(D='1D'), short_returns.assign(D='1W'),
+             short_returns.assign(D='1M')]).set_index('D', append=True)
+        short_returns = \
+            short_returns.unstack(level=[0, 2]).replace([-np.inf, np.inf], np.nan).droplevel(axis=1, level=0)
+        vrp = np.sign(vrp.reindex(option_chain_data.index.get_level_values(1))).sort_index()
         short_vrp, long_vrp = (vrp == 1).astype(int), (vrp == -1).astype(int)
-        short_vrp = short_vrp.rename(columns={'$\\text{VRP}_{0 \\rightarrow D}$': 'short_vrp'})
-        long_vrp = long_vrp.rename(columns={'$\\text{VRP}_{0 \\rightarrow D}$': 'long_vrp'})
-        option_chain_data = option_chain_data.join(signal_filter.shift(), on='timestamp')
-        option_chain_data = \
-            option_chain_data.join(long_vrp.shift(), on='timestamp').join(short_vrp.shift(), on='timestamp')
-        option_chain_data = option_chain_data.replace([np.inf, -np.inf], np.nan)
-        option_chain_data['short_returns'] = option_chain_data['short_returns'] * option_chain_data[1] * \
-                                             option_chain_data['short_vrp']
-        option_chain_data['long_returns'] = option_chain_data['long_returns'] * option_chain_data[0] * \
-                                             option_chain_data['long_vrp']
-        returns = option_chain_data['short_returns']+option_chain_data['long_returns']
-        sharpe = \
-            returns.groupby(by=pd.Grouper(level=1)).sum().mean() / returns.groupby(by=pd.Grouper(level=1)).sum().std()
+        signal_filter_long.columns = \
+            signal_filter_long.columns.set_levels(signal_filter_long.columns.levels[-1].str.lower(), level=1)
+        signal_filter_short.columns = \
+            signal_filter_short.columns.set_levels(signal_filter_short.columns.levels[-1].str.lower(), level=1)
+        long_returns.columns = \
+            long_returns.columns.set_levels(long_returns.columns.levels[-1].str.lower(), level=1)
+        short_returns.columns = \
+            short_returns.columns.set_levels(short_returns.columns.levels[-1].str.lower(), level=1)
+        long_returns = long_returns.mul(long_vrp.loc[long_returns.index]).mul(signal_filter_long.loc[long_returns.index])
+        short_returns = \
+            short_returns.mul(short_returns.loc[long_returns.index]).mul(signal_filter_short.loc[short_returns.index])
+        returns = long_returns.add(short_returns)
+        sharpe = (returns.stack(level=1).swaplevel(-1, 0).groupby(level=0).mean()
+                  /returns.stack(level=1).swaplevel(-1, 0).groupby(level=0).std()).mean(axis=1).to_dict()
         trial.set_user_attr(key='lower_bound_atm', value=param['lower_bound_atm'])
         trial.set_user_attr(key='upper_bound_atm', value=param['upper_bound_atm'])
-        trial.set_user_attr(key='sharpe', value=0 if np.isnan(sharpe) else sharpe)
     else:
+        signal_filter_long = ((data['forecast'].subtract(data['values'].shift())).div(mean_bar)).gt(
+            param['threshold_filter'])
+        signal_filter_short = \
+            ((data['forecast'].subtract(data['values'].shift())).div(mean_bar)).lt(
+                -param['threshold_filter'])
+        signal_filter_long = signal_filter_long.astype(int)
+        signal_filter_short = signal_filter_short.astype(int)
         spot_returns_long, spot_returns_short = kwargs['spot_returns']['values'], -kwargs['spot_returns']['values']
         spot_returns_long = spot_returns_long.loc[:, signal_filter_long.columns.get_level_values(0).unique()]
         spot_returns_short = spot_returns_short.loc[:, signal_filter_short.columns.get_level_values(0).unique()]
-        spot_prices = kwargs['spot_prices'].loc[:, signal_filter_short.columns.get_level_values(0).unique()]
+        spot_prices = kwargs['spot_prices']#.loc[:, signal_filter_short.columns.get_level_values(0).unique()]
         if transaction_cost:
             fees = .001 * (spot_prices+spot_prices.shift())/spot_prices.shift()
-            spot_returns_long = spot_returns_long - fees
-            spot_returns_short = spot_returns_short - fees
+            fees = \
+                pd.concat([pd.DataFrame(fees.unstack()).assign(D='1D'),
+                           pd.DataFrame((fees.unstack())).assign(D='1W'),
+                           pd.DataFrame((fees.unstack())).assign(D='1M')]).reset_index(0).rename(
+                    columns={'level_0': 'underlying_name', 0: 'fees'})
+            fees = pd.pivot(data=fees, columns=['underlying_name', 'D'], values='fees')
+            spot_returns_long, spot_returns_short = spot_returns_long.subtract(fees), spot_returns_short.subtract(fees)
         if spread:
-            pdb.set_trace()
+            spread_prices = kwargs['spread_prices']/spot_prices.shift()
+            spread_prices = \
+                pd.concat([pd.DataFrame(spread_prices.unstack()).assign(D='1D'),
+                           pd.DataFrame((spread_prices.unstack())).assign(D='1W'),
+                           pd.DataFrame((spread_prices.unstack())).assign(D='1M')]).reset_index(0).rename(
+                    columns={'level_0': 'underlying_name', 0: 'fees'})
+            spread_prices = pd.pivot(data=spread_prices, columns=['underlying_name', 'D'], values='fees')
+            spot_returns_long = spot_returns_long.subtract(.5*(spread_prices.add(spread_prices)))
+            spot_returns_short = spot_returns_short.subtract(.5*(spread_prices.add(spread_prices)))
         signals = np.sign(data.xs('forecast', axis=1, level=0)).shift()
-        spot_returns_long = \
-            pd.concat([spot_returns_long]*signal_filter_long.columns.get_level_values(0).unique().shape[0])
-        spot_returns_short = \
-            pd.concat([spot_returns_short] * signal_filter_short.columns.get_level_values(0).unique().shape[0])
-        spot_returns = (signals.mul(signal_filter_long).mul(spot_returns_long)) + \
-                       (signals.mul(signal_filter_short).mul(spot_returns_short))
+        spot_returns_long, spot_returns_short = \
+            spot_returns_long.dropna(how='all', axis=1), spot_returns_short.dropna(how='all', axis=1)
+        spot_returns = (signals.mul(signal_filter_long).mul(spot_returns_long)).dropna(how='all', axis=1) + \
+                       (signals.mul(signal_filter_short).mul(spot_returns_short)).dropna(how='all', axis=1)
         mean_returns, std_returns = spot_returns.mean(), spot_returns.std()
-        sharpe = mean_returns.div(std_returns).groupby(by=pd.Grouper(level=0)).mean().to_dict()
-        trial.set_user_attr(key='sharpe', value=sum(sharpe.values()) / len(sharpe))
+        sharpe = mean_returns.div(std_returns).groupby(by=pd.Grouper(level=1)).mean().to_dict()
     trial.set_user_attr(key='threshold_filter', value=param['threshold_filter'])
     trial.set_user_attr(key='target', value=kwargs['target'])
-    if kwargs['target'] == 'RV':
-        return 0 if np.isnan(sharpe) else sharpe
-    else:
-        return sum(sharpe.values())/len(sharpe)
+    trial.set_user_attr(key='sharpe',
+                        value=0 if np.isnan(sum(sharpe.values())/len(sharpe)) else sum(sharpe.values())/len(sharpe))
+    return trial.user_attrs['sharpe']
 
 
-def callback(study, trial):
+def callback(study, trial) -> None:
     if study.best_trial.number == trial.number:
         if trial.user_attrs['target'] == 'RV':
             study.set_user_attr(key='lower_bound_atm', value=trial.user_attrs['lower_bound_atm'])
@@ -378,6 +416,10 @@ def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
     return feature_importance
 
 
+def return_date(date: datetime.datetime) -> datetime.datetime:
+    return date
+
+
 class FrameworkApplication:
     _option_chain = dict()
     _option_moneyness = None
@@ -388,15 +430,18 @@ class FrameworkApplication:
         self._data = data
         self._db_connect = sqlite3.connect(f'{target_path}/crypto_option_spot.db')
         self._underlying_prices = \
-            pl.scan_parquet(f'{target_path}/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
-                                                                    pl.col('timestamp'), pl.col('mid_price[0]')])
+            pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
+                                                                     pl.col('timestamp'), pl.col('mid_price[0]'),
+                                                                     pl.col('spreads[0]')])
         self._underlying_prices = self._underlying_prices.collect(engine=ENGINE)
-        self._underlying_prices = self._underlying_prices.pivot(index='timestamp', columns='underlying_name',
-                                                                values='mid_price[0]')
+        self._underlying_spreads = self._underlying_prices.pivot(
+            index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
+        self._underlying_prices = self._underlying_prices.pivot(
+            index='timestamp', on='underlying_name', values='mid_price[0]')
         self._underlying_rv = self._underlying_prices.select(['timestamp'] + [
-            (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS]).to_pandas()
+            (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS[2:]]).to_pandas()
         self._underlying_returns = self._underlying_prices.select(['timestamp'] + [
-            (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS]).to_pandas()
+            (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS[2:]]).to_pandas()
 
     @property
     def data(self) -> pd.DataFrame:
@@ -421,7 +466,7 @@ class FrameworkApplication:
             daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
             daily_option_chain_date = daily_option_chain_date.with_columns(
                 ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
-            FrameworkApplication._option_chain[date] = daily_option_chain_date.collect().to_pandas()
+            FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
         return None
 
     @staticmethod
@@ -466,7 +511,7 @@ class FrameworkApplication:
         date_range_D = list(itertools.product(dates, ['1d', '1w', '1m']))
         for date_D in date_range_D:
             svix_s, D = svix_daily(date_D[0], FrameworkApplication._option_chain[date_D[0]],
-                                   iv_interpolation_coef.loc[iv_interpolation_coef.index.date == date_D[0].date()],
+                                   iv_interpolation_coef.loc[iv_interpolation_coef.index.date == date_D[0]],
                                    date_D[1], freq, aggregated)
             svix[D].append(svix_s)
         for D in svix.keys():
@@ -480,13 +525,11 @@ class FrameworkApplication:
 
     @staticmethod
     def backtest_per_day(transaction_cost: bool, spread: bool, freq: str, date: datetime.datetime,
-                         **kwargs) -> Tuple[pd.Series | pd.DataFrame]:
+                         mean_bar: pd.DataFrame, **kwargs) -> Union[Tuple[pd.Series | pd.DataFrame], None]:
         data = kwargs['data']
         if kwargs['target'] == 'RV':
-            date_sym_d = kwargs['date_sym_d']
             vrp = kwargs['vrp']
             vrp_y = kwargs['vrp_y']
-            sym = kwargs['sym']
             option_chain_data = FrameworkApplication._option_chain[date]
             option_chain_data_y = FrameworkApplication._option_chain[date - relativedelta(days=1)]
             option_chain_data['option_tag'] = option_chain_data.symbol.str.split('-').apply(lambda x: '-'.join(x[:-1]))
@@ -494,8 +537,7 @@ class FrameworkApplication:
                 lambda x: '-'.join(x[:-1]))
             option_chain_data_y = \
                 option_chain_data_y[['option_tag', 'underlying_price', 'mid_price', 'spread', 'moneyness', 'timestamp',
-                                     'underlying_name']].query(f'underlying_name == "{sym}"').drop('underlying_name',
-                                                                                                   axis=1)
+                                     'underlying_name']]
             ############################################################################################################
             ## Parameter optimisation
             ############################################################################################################
@@ -505,22 +547,16 @@ class FrameworkApplication:
                 option_chain_data_y.set_index('timestamp', inplace=True)
                 study = optuna.create_study(
                     direction='maximize',
-                    study_name=
-                    f'Parameter optimisation ({dict([(True, "RV"), (False, "Returns")])[kwargs["target"] == "RV"]}): '
-                    f'Process for {sym}-{date.strftime(DATE_FORMAT)} has started.',
+                    study_name=f'Parameter optimisation RV: Process {date.strftime(DATE_FORMAT)} has started.',
                     sampler=RandomSampler(123))
                 objective = partial(objective_daily, option_chain_data=option_chain_data_y,
-                                    data=data.loc[data.index.date != date.date()], vrp=vrp_y,
-                                    transaction_cost=transaction_cost, spread=spread, target=kwargs['target'])
+                                    data=data.loc[data.index.date != date], vrp=vrp_y,
+                                    transaction_cost=transaction_cost, spread=spread, target=kwargs['target'],
+                                    mean_bar=mean_bar)
                 study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
                                n_jobs=N_JOBS)
             except ValueError:
-                returns = pd.Series(data=0,
-                                    index=pd.date_range(start=date.date(), end=date.date() + relativedelta(days=1),
-                                                        freq=freq, inclusive='left', tz=pytz.UTC))
-                returns.name = sym
-                n_trades = pd.Series(data=0, index=returns.index)
-                n_trades.name = sym
+                return None
             else:
                 lower_bound_moneyness, upper_bound_moneyness, threshold_filter = study.user_attrs['lower_bound_atm'], \
                     study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
@@ -531,199 +567,237 @@ class FrameworkApplication:
                 option_chain_data['moneyness'].ge(lower_bound_moneyness) & \
                 option_chain_data['moneyness'].le(upper_bound_moneyness)
             option_chain_data = \
-                option_chain_data[option_chain_data.atm].drop('atm', axis=1).query(f'underlying_name == "{sym}"')
+                option_chain_data[option_chain_data.atm]
             option_chain_data = option_chain_data.set_index('timestamp')
             option_chain_data = \
                 option_chain_data.groupby(by=[pd.Grouper(key='option_tag'),
-                                              pd.Grouper(level=0)]).agg({'underlying_price': 'last',
+                                              pd.Grouper(level=0)]).agg({'underlying_name': 'last', 'atm': 'last',
+                                                                         'underlying_price': 'last',
                                                                          'spread': 'sum', 'mid_price': 'sum'})
-            option_chain_data_group = option_chain_data.groupby(by=pd.Grouper(level='option_tag'))
-            option_chain_data['long_returns'] = option_chain_data_group['mid_price'].transform(lambda x: x - x.shift())
-            option_chain_data['short_returns'] = option_chain_data_group['mid_price'].transform(lambda x: x.shift() - x)
+            option_chain_data['long_returns'] = option_chain_data.groupby(pd.Grouper(level=0), group_keys=False).apply(
+                lambda x: x['mid_price'] - x['mid_price'].shift())
+            option_chain_data['short_returns'] = -option_chain_data['long_returns']
             if transaction_cost:
                 option_chain_data['transaction_fees'] = FEES_SPOT * option_chain_data['underlying_price']
                 option_chain_data['transaction_fees'] = option_chain_data['transaction_fees'].where(
                     option_chain_data['transaction_fees'].le(FEES_OPTIONS * option_chain_data['mid_price']),
                     FEES_OPTIONS * option_chain_data['mid_price'])
                 option_chain_data['long_returns'] = option_chain_data['long_returns'].subtract(
-                    (option_chain_data['transaction_fees'] + option_chain_data['transaction_fees'].shift()))
+                    option_chain_data['transaction_fees'].groupby(pd.Grouper(level=0),
+                                                                  group_keys=False).apply(lambda x: x+x.shift()))
                 option_chain_data['short_returns'] = option_chain_data['short_returns'].subtract(
-                    (option_chain_data['transaction_fees'] + option_chain_data['transaction_fees'].shift()))
+                    option_chain_data['transaction_fees'].groupby(pd.Grouper(level=0),
+                                                                  group_keys=False).apply(lambda x: x + x.shift()))
             if spread:
                 option_chain_data['long_returns'] = \
-                    option_chain_data['long_returns'].subtract((option_chain_data['spread'] +
-                                                                option_chain_data['spread'].shift()) / 2)
+                    option_chain_data['long_returns'] - option_chain_data.groupby(
+                        pd.Grouper(level=0), group_keys=False).apply(
+                        lambda x: .5 * (x['spread'] + x['spread'].shift()))
                 option_chain_data['short_returns'] = \
-                    option_chain_data['short_returns'].subtract((option_chain_data['spread'] +
-                                                                 option_chain_data['spread'].shift()) / 2)
-            option_chain_data['long_returns'] = option_chain_data['long_returns'].div(option_chain_data['mid_price'])
-            option_chain_data['short_returns'] = option_chain_data['short_returns'].div(option_chain_data['mid_price'])
-            data = data.loc[data.index.date == date.date()]
-            signal_filter = pd.concat(
-                [data['forecast'].subtract(data['values'].shift()).div(data['values'].mean()).gt(threshold_filter),
-                 data['forecast'].subtract(data['values'].shift()).div(data['values'].mean()).lt(-threshold_filter)],
-                axis=1).astype(int).reindex(option_chain_data.index.get_level_values(1))
-            vrp = np.sign(vrp.reindex(option_chain_data.index.get_level_values(1)))
-            long_vrp = (vrp == -1).astype(int)
-            short_vrp = (vrp == 1).astype(int)
+                    option_chain_data['short_returns'] - option_chain_data.groupby(
+                        pd.Grouper(level=0), group_keys=False).apply(
+                        lambda x: .5 * (x['spread'] + x['spread'].shift()))
             option_chain_data['long_returns'] = \
-                option_chain_data['long_returns'].mul(signal_filter.iloc[:, 0].shift().values).mul(
-                    long_vrp.shift().values.reshape(-1))
+                option_chain_data['long_returns'].div(option_chain_data['mid_price'].groupby(
+                    pd.Grouper(level=0), group_keys=False).apply(lambda x: x.shift()))
             option_chain_data['short_returns'] = \
-                option_chain_data['short_returns'].mul(signal_filter.iloc[:, 1].shift().values).mul(
-                    short_vrp.shift().values.reshape(-1))
-            returns = option_chain_data['long_returns'] + option_chain_data['short_returns']
-            returns = returns.groupby(by=pd.Grouper(level=1)).mean().fillna(0)
-            # n_trades = pd.concat([signal_filter.iloc[:, 0].mul(long_vrp.values.reshape(-1)),
-            #                       signal_filter.iloc[:, 1].mul(short_vrp.values.reshape(-1))], axis=1).sum(axis=1)
-            n_trades = pd.concat([(option_chain_data['long_returns'].mul(long_vrp.values.reshape(-1))).abs().gt(0),
-                                  (option_chain_data['short_returns'].mul(short_vrp.values.reshape(-1))).abs().gt(0)],
-                                 axis=1).sum(axis=1)
-            n_trades = n_trades.groupby(by=pd.Grouper(level=0)).sum()
-            returns.name = sym
-            returns = returns.reindex(
-                pd.date_range(start=date.date(), end=date.date() + relativedelta(days=1), freq=freq,
-                              inclusive='left', tz=pytz.UTC))
-            n_trades.name = sym
+                option_chain_data['short_returns'].div(option_chain_data['mid_price'].groupby(
+                    pd.Grouper(level=0), group_keys=False).apply(lambda x: x.shift()))
+            long_returns = option_chain_data[['long_returns', 'underlying_name']].groupby(
+                [pd.Grouper(key='underlying_name'), pd.Grouper(level=1)])[['long_returns']].mean()
+            short_returns = option_chain_data[['short_returns', 'underlying_name']].groupby(
+                [pd.Grouper(key='underlying_name'), pd.Grouper(level=1)])[['short_returns']].mean()
+            long_returns = \
+                pd.concat([long_returns.assign(D='1D'), long_returns.assign(D='1W'),
+                           long_returns.assign(D='1M')]).set_index('D', append=True)
+            long_returns = long_returns.unstack(level=[0, 2]).replace([-np.inf, np.inf], np.nan).droplevel(axis=1,
+                                                                                                           level=0)
+            short_returns = pd.concat(
+                [short_returns.assign(D='1D'), short_returns.assign(D='1W'),
+                 short_returns.assign(D='1M')]).set_index('D', append=True)
+            short_returns = \
+                short_returns.unstack(level=[0, 2]).replace([-np.inf, np.inf], np.nan).droplevel(axis=1, level=0)
+            vrp = np.sign(vrp.reindex(option_chain_data.index.get_level_values(1))).sort_index()
+            short_vrp, long_vrp = (vrp == 1).astype(int), (vrp == -1).astype(int)
+            signal_filter_long = \
+                ((data['forecast'].subtract(data['values'].shift())).div(mean_bar.loc[data.index, :])).gt(
+                    threshold_filter)
+            signal_filter_short = \
+                ((data['forecast'].subtract(data['values'].shift())).div(mean_bar.loc[data.index, :])).lt(
+                    -threshold_filter)
+            signal_filter_long = signal_filter_long.astype(int)
+            signal_filter_short = signal_filter_short.astype(int)
+            signal_filter_long.columns = \
+                signal_filter_long.columns.set_levels(signal_filter_long.columns.levels[-1].str.lower(), level=1)
+            signal_filter_short.columns = \
+                signal_filter_short.columns.set_levels(signal_filter_short.columns.levels[-1].str.lower(), level=1)
+            long_returns.columns = \
+                long_returns.columns.set_levels(long_returns.columns.levels[-1].str.lower(), level=1)
+            short_returns.columns = \
+                short_returns.columns.set_levels(short_returns.columns.levels[-1].str.lower(), level=1)
+            long_returns = long_returns.mul(long_vrp.loc[long_returns.index]).mul(
+                signal_filter_long.loc[long_returns.index])
+            long_vrp.loc[long_returns.index].mul(signal_filter_long.loc[long_returns.index])
+            short_returns = \
+                short_returns.mul(short_returns.loc[long_returns.index]).mul(
+                    signal_filter_short.loc[short_returns.index])
+            returns = long_returns.add(short_returns)
+            returns = returns.loc[~returns.index.duplicated(), :]
+            atm = option_chain_data[['underlying_name', 'atm']].groupby(['underlying_name',
+                                                                         pd.Grouper(level=1)])[['atm']].sum()
+            atm = pd.concat([atm.assign(D='1d'), atm.assign(D='1w'), atm.assign(D='1m')])
+            atm = pd.pivot(atm.reset_index(0), columns=['underlying_name', 'D'], values='atm')
+            n_trades = long_vrp.loc[long_returns.index].mul(signal_filter_long.loc[long_returns.index]).mul(atm).add(
+                short_vrp.loc[short_returns.index].mul(signal_filter_short.loc[short_returns.index])).mul(atm)
+            n_trades = n_trades.loc[~n_trades.index.duplicated(), :]
+            returns = returns.reindex(pd.date_range(start=date, end=date + relativedelta(days=1), freq=freq,
+                                                    inclusive='left', tz=pytz.UTC))
             n_trades = n_trades.reindex(returns.index)
-            return returns, n_trades, date_sym_d[-1]
+            return returns, n_trades
         else:
             spot_returns_long, spot_returns_short = kwargs['spot_returns']['values'], -kwargs['spot_returns']['values']
             spot_prices = kwargs['spot_prices']
             spot_returns_y = kwargs['spot_returns_y']
             spot_prices_y = kwargs['spot_prices_y']
+            spread_prices = kwargs['spread_prices']
             study = optuna.create_study(
                 direction='maximize', study_name=f'Parameter optimisation: '
                                                  f'process for {date.strftime(DATE_FORMAT)} has started.',
                 sampler=RandomSampler(123))
             objective = partial(objective_daily, spot_returns=spot_returns_y, transaction_cost=transaction_cost,
                                 spread=spread, spot_prices=spot_prices_y, target=kwargs['target'],
-                                data=data)
-            study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
-                           n_jobs=N_JOBS)
+                                data=data.loc[data.index.date < date, :],
+                                spread_prices=spread_prices.loc[spread_prices.index.date ==
+                                                                (date - relativedelta(days=1)), :],
+                                mean_bar=mean_bar.loc[mean_bar.index.date == (date - relativedelta(days=1)), :])
+            study.optimize(objective, n_trials=N_TRIALS//20, callbacks=[callback], show_progress_bar=True,
+                           n_jobs=os.cpu_count()//2)
             ############################################################################################################
             ## Backtest
             ############################################################################################################
             threshold_filter = study.user_attrs['threshold_filter']
-            signal_filter = (data['forecast']-data['values'].shift())
-            signal_filter = signal_filter.div(data['values'].loc[data['values'].index.date < date, :].mean())
+            signal_filter = (data.loc[data.index.date == date, :]['forecast']-
+                             data.loc[data.index.date == date, :]['values'].shift())
+            signal_filter = signal_filter.div(mean_bar.loc[mean_bar.index.date == date])
             signal_filter_long, signal_filter_short = \
                 signal_filter.gt(threshold_filter), signal_filter.lt(-threshold_filter)
             signal = np.sign(data['forecast']).shift()
             signal_long, signal_short = signal.mul(signal_filter_long), signal.mul(signal_filter_short)
-            fee = .001 * ((spot_prices+spot_prices.shift()).div(spot_prices.shift()))
-            fee = fee.loc[:, signal.columns.get_level_values(0).unique().tolist()]
-            spot_returns_long, spot_returns_short = (spot_returns_long - fee, spot_returns_short - fee)
-            spot_returns_long = pd.concat([spot_returns_long]*signal.columns.get_level_values(1).unique().shape[0],
-                                          axis=1)
-            spot_returns_short = pd.concat([spot_returns_short] * signal.columns.get_level_values(1).unique().shape[0],
-                                           axis=1)
-            spot_returns_long = pd.DataFrame(data=spot_returns_long.values, index=signal_long.index,
-                                             columns=signal_long.columns)
-            spot_returns_short = pd.DataFrame(data=spot_returns_short.values, index=signal_short.index,
-                                              columns=signal_short.columns)
-            returns = (spot_returns_long.mul(signal_long)) + (spot_returns_short.mul(signal_short))
+            if transaction_cost:
+                fees = .001 * (spot_prices + spot_prices.shift()) / spot_prices.shift()
+                fees = \
+                    pd.concat([pd.DataFrame(fees.unstack()).assign(D='1D'),
+                               pd.DataFrame((fees.unstack())).assign(D='1W'),
+                               pd.DataFrame((fees.unstack())).assign(D='1M')]).reset_index(0).rename(
+                        columns={'level_0': 'underlying_name', 0: 'fees'})
+                fees = pd.pivot(data=fees, columns=['underlying_name', 'D'], values='fees')
+                spot_returns_long, spot_returns_short = \
+                    spot_returns_long.subtract(fees), spot_returns_short.subtract(fees)
+            if spread:
+                spread_prices = spread_prices / spot_prices.shift()
+                spread_prices = \
+                    pd.concat([pd.DataFrame(spread_prices.unstack()).assign(D='1D'),
+                               pd.DataFrame((spread_prices.unstack())).assign(D='1W'),
+                               pd.DataFrame((spread_prices.unstack())).assign(D='1M')]).reset_index(0).rename(
+                        columns={'level_0': 'underlying_name', 0: 'fees'})
+                spread_prices = pd.pivot(data=spread_prices, columns=['underlying_name', 'D'], values='fees')
+                spot_returns_long = spot_returns_long.subtract(.5 * (spread_prices.add(spread_prices.shift())))
+                spot_returns_short = spot_returns_short.subtract(.5 * (spread_prices.add(spread_prices.shift())))
+            # spot_returns_long = pd.concat([pd.melt(spot_returns_long, ignore_index=False, var_name='underlying_name',
+            #                                        value_name='returns').assign(D='1D'),
+            #                                pd.melt(spot_returns_long, ignore_index=False, var_name='underlying_name',
+            #                                        value_name='returns').assign(D='1W'),
+            #                                pd.melt(spot_returns_long, ignore_index=False, var_name='underlying_name',
+            #                                        value_name='returns').assign(D='1M')])
+            # spot_returns_short = pd.concat([pd.melt(spot_returns_short, ignore_index=False, var_name='underlying_name',
+            #                                         value_name='returns').assign(D='1D'),
+            #                                 pd.melt(spot_returns_short, ignore_index=False, var_name='underlying_name',
+            #                                         value_name='returns').assign(D='1W'),
+            #                                 pd.melt(spot_returns_short, ignore_index=False, var_name='underlying_name',
+            #                                         value_name='returns').assign(D='1M')])
+            # spot_returns_long = pd.pivot(spot_returns_long, columns=['underlying_name', 'D'], values='returns')
+            # spot_returns_short = pd.pivot(spot_returns_short, columns=['underlying_name', 'D'], values='returns')
+            returns = ((spot_returns_long.mul(signal_long)) +
+                       (spot_returns_short.mul(signal_short))).dropna(how='all', axis=1).dropna()
             return returns
 
     def backtest(self, transaction_cost: bool, spread: bool, freq, **kwargs) -> Tuple[pd.DataFrame] | pd.DataFrame:
-        symbol = self._data.columns.get_level_values(1).unique().tolist()
+        pnl = list()
         if kwargs['target'] == 'RV':
+            trading_volume = list()
             dates = list(FrameworkApplication._option_chain.keys())
             vrp = kwargs['vrp']
-            pnl = dict([(D, dict([(sym, list()) for sym in symbol])) for D in ['1d', '1w', '1m']])
-            trading_volume = dict([(D, dict([(sym, list()) for sym in symbol])) for D in ['1d', '1w', '1m']])
         else:
-            pnl = list()
             spot_returns = self._data.xs('returns', level=2, axis=1)
             spot_prices = self._underlying_prices.sort(by='timestamp').group_by_dynamic(index_column='timestamp',
                                                                                         every=freq.replace('in', ''))
             spot_prices = spot_prices.agg(pl.all().last()).to_pandas().set_index('timestamp')
-            dates = list(np.unique(spot_returns.index.date))
-        date_symbol_D = list(itertools.product(dates[1:], symbol, ['1d', '1w', '1m']))
-        date_D = list(itertools.product(dates[1:], ['1d', '1w', '1m']))
-        symbol_D = list(itertools.product(symbol, ['1d', '1w', '1m']))
+            dates = list(np.unique(spot_returns.index.date))[:50]
         if kwargs['target'] == 'RV':
-            for date_sym_d in date_symbol_D:
-                today, yesterday, D = date_sym_d[0], date_sym_d[0] - relativedelta(days=1), date_sym_d[-1]
-                sym = date_sym_d[1]
+            vrp = pd.pivot(vrp.reset_index([0, 1]), columns=['underlying_name', 'D'],
+                           values='$\\text{VRP}_{0 \\rightarrow D}$')
+            mean_bar = self._data.xs('RV', axis=1, level=2)['values'].apply(
+                lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean()).shift().ffill()
+            mean_bar = mean_bar.reindex(self._data.index).ffill()
+            for date in dates[1:]:
+                today, yesterday = date, date - relativedelta(days=1)
                 try:
-                    vrp_sym = vrp.xs(sym, axis=0, level=0).xs(D, axis=0, level=0)
-                    returns, n_trades, D = \
-                        self.backtest_per_day(option_chain_data=FrameworkApplication._option_chain[date_sym_d[0]],
-                                              option_chain_data_y=
-                                              FrameworkApplication._option_chain[yesterday],
-                                              sym=date_sym_d[1],
-                                              vrp=
-                                              vrp_sym.loc[vrp_sym.index.date == today.date()],
-                                              vrp_y=
-                                              vrp_sym.loc[vrp_sym.index.date == yesterday.date()],
-                                              data=self._data.xs(date_sym_d[1], axis=1, level=1).xs(
-                                                 'RV', axis=1, level=1).xs(date_sym_d[-1].upper(), axis=1, level=1).loc[
-                                                   (today - relativedelta(
-                                                       days=DAYS_CONVERTER[D.upper()])).strftime(
-                                                       DATE_FORMAT):today.strftime(DATE_FORMAT)],
-                                              date=today, transaction_cost=transaction_cost, spread=spread,
-                                              date_sym_d=date_sym_d, freq=freq, target=kwargs['target'])
+                    if vrp.loc[vrp.index.date == today].empty:
+                        raise KeyError
+                    returns, n_trades = \
+                        self.backtest_per_day(option_chain_data=FrameworkApplication._option_chain[today],
+                                              option_chain_data_y=FrameworkApplication._option_chain[yesterday],
+                                              vrp=vrp.loc[vrp.index.date == today],
+                                              vrp_y=vrp.loc[vrp.index.date == yesterday],
+                                              data=self._data.xs('RV', axis=1, level=2, drop_level=True).loc[
+                                                   (today - relativedelta(days=30)).strftime(DATE_FORMAT):
+                                                   today.strftime(DATE_FORMAT)], date=today,
+                                              transaction_cost=transaction_cost, spread=spread,  freq=freq,
+                                              target=kwargs['target'], mean_bar=mean_bar)
                 except KeyError:
                     continue
-                pnl[D][returns.name].append(returns.fillna(0))
-                trading_volume[D][n_trades.name].append(n_trades.fillna(0))
+                else:
+                    pnl.append(returns)
+                    trading_volume.append(n_trades)
         else:
-            for date_D in date_D:
-                today, yesterday, D = date_D[0], date_D[0] - relativedelta(days=1), date_D[1]
-                spot_returns_today = spot_returns.loc[spot_returns.index.date == today].xs(D.upper(), axis=1, level=2)
-                spot_returns_yesterday = \
-                    spot_returns.loc[spot_returns.index.date == yesterday].xs(D.upper(), axis=1, level=2)
-                spot_prices_today = spot_prices.loc[spot_prices.index.date == today]
-                spot_prices_yesterday = spot_prices.loc[spot_prices.index.date == yesterday]
-                data = \
-                    spot_returns.loc[
-                    (spot_returns.index.date >= today - relativedelta(days=DAYS_CONVERTER[D.upper()])) &
-                    (spot_returns.index.date == yesterday), :]
-                returns = self.backtest_per_day(spot_returns=spot_returns_today, spot_returns_y=spot_returns_yesterday,
-                                                transaction_cost=transaction_cost, spread=spread, freq=freq,
-                                                target=kwargs['target'], spot_prices=spot_prices_today,
-                                                spot_prices_y=spot_prices_yesterday, date=today, data=data)
-                pnl.append(returns)
+            mean_bar = spot_returns['values'].apply(lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean())
+            mean_bar = mean_bar.reindex(spot_returns.index).ffill()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()//2) as executor:
+                futures = [executor.submit(return_date, date) for date in dates[1:]]
+                for future in concurrent.futures.as_completed(futures):
+                    today, yesterday = future.result(), future.result() - relativedelta(days=1)
+                    spot_returns_today = spot_returns.loc[spot_returns.index.date == today]
+                    spot_returns_yesterday = \
+                        spot_returns.loc[spot_returns.index.date == yesterday]
+                    spot_prices_today = spot_prices.loc[spot_prices.index.date == today]
+                    spot_prices_yesterday = spot_prices.loc[spot_prices.index.date == yesterday]
+                    data = spot_returns.loc[(spot_returns.index.date >= today - relativedelta(days=30)) &
+                                            (spot_returns.index.date <= today), :]
+                    spread_prices = \
+                        self._underlying_spreads.loc[
+                        (self._underlying_spreads.index.date <= today) &
+                        (self._underlying_spreads.index.date >= today - relativedelta(days=30)),:].resample(freq).last()
+                    returns = self.backtest_per_day(spot_returns=spot_returns_today,
+                                                    spot_returns_y=spot_returns_yesterday,
+                                                    transaction_cost=transaction_cost, spread=spread, freq=freq,
+                                                    target=kwargs['target'], spot_prices=spot_prices_today,
+                                                    spot_prices_y=spot_prices_yesterday, date=today, data=data,
+                                                    spread_prices=spread_prices,
+                                                    mean_bar=mean_bar.loc[(mean_bar.index.date >= yesterday) &
+                                                                          (mean_bar.index.date <= today), :])
+                    pnl.append(returns)
+        pnl = pd.concat(pnl).sort_index()
         if kwargs['target'] == 'RV':
-            for sym_D in symbol_D:
-                sym, D = sym_D
-                try:
-                    pnl[D][sym] = pd.concat(pnl[D][sym]).sort_index()
-                    trading_volume[D][sym] = pd.concat(trading_volume[D][sym]).sort_index()
-                except ValueError:
-                    continue
-        if kwargs['target'] == 'RV':
-            for D in d_order.categories:
-                try:
-                    pnl[D] = pd.concat(pnl[D], axis=1)
-                    trading_volume[D] = pd.concat(trading_volume[D], axis=1)
-                except TypeError:
-                    del pnl[D]
-                    del trading_volume[D]
-                except ValueError:
-                    try:
-                        pnl[D] = pd.pivot(pd.concat(pnl[D], axis=0).drop_duplicates().reset_index(0), columns='level_0',
-                                          values=0).sort_index().ffill()
-                        trading_volume[D] = \
-                            pd.pivot_table(pd.concat(trading_volume[D], axis=0).reset_index().drop_duplicates(),
-                                           columns='level_0', values=0, index='timestamp').sort_index()
-                    except ValueError:
-                        continue
-        pnl = pd.concat(pnl, axis=1) if target == 'RV' else pd.concat(pnl)
-        if kwargs['target'] == 'RV':
-            trading_volume = pd.concat(trading_volume, axis=1)
-            # trading_volume = \
-            #     trading_volume.reindex(pd.date_range(start=pnl.index[0].date(), end=pnl.index[-1].date(), freq=freq,
-            #                                          tz=pytz.UTC))
-            # trading_volume = trading_volume.fillna(trading_volume.expanding().mean()).round()
-        # pnl = pnl.reindex(pd.date_range(start=pnl.index[0].date() - relativedelta(days=1), end=pnl.index[-1].date(),
-        #                                 freq=freq, tz=pytz.UTC))
-        # pnl = pnl.fillna(pnl.expanding().mean())
+            trading_volume = pd.concat(trading_volume)
+            trading_volume = \
+                trading_volume.reindex(pd.date_range(start=pnl.index[0].date(), end=pnl.index[-1].date(), freq=freq,
+                                                     tz=pytz.UTC))
+        pnl = pnl.reindex(pd.date_range(start=pnl.index[0].date() - relativedelta(days=1),
+                                        end=pnl.index[-1].date()+relativedelta(days=1), freq=freq, tz=pytz.UTC,
+                                        inclusive='left'))
         if target == 'RV':
             return pnl, trading_volume
-        else:
-            return pnl
+        return pnl
 
     @property
     def db_connect(self):
@@ -743,7 +817,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Order
     ####################################################################################################################
-    pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True)
+    pairs_order = CategoricalDtype(categories=['SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True) #'BTCUSDT', 'ETHUSDT',
     d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
     volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
     market_order = CategoricalDtype(categories=[0, 1], ordered=True)
@@ -767,32 +841,41 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Model selection
     ####################################################################################################################
-    mase = \
-        pd.read_sql(con=framework_application_obj.db_connect,
-                    sql='SELECT "MASE","regression","target","D","market","freq","timestamp" FROM metric;')
+    if os.path.exists(f'{args.target_path}/metric.csv'):
+        mase = pd.read_csv(f'{args.target_path}/metric.csv')
+    else:
+        mase = \
+            pd.read_sql(con=framework_application_obj.db_connect,
+                        sql='SELECT "MASE","regression","target","D","market","freq","timestamp", "volatility_regime" '
+                            'FROM metric;')
     mase['timestamp'] = pd.to_datetime(mase['timestamp'], utc=True)
     mase = mase.set_index(['D', 'timestamp'])
     model_ranking = mase.groupby(by=[pd.Grouper(key='regression'), pd.Grouper(key='freq')])[['MASE']].mean()
     with open(f'{args.target_path}/crypto_option_spot/mase_per_regression_freq_pair.txt', 'w') as \
             mase_per_regression_freq_pair_file:
         mase_per_regression_freq_pair_file.writelines(model_ranking.unstack(0).droplevel(axis=1, level=0).loc[
-            ['15min', '30min', '1h'], ['lightgbm']].to_latex()) #['lasso', 'lstm']
+            ['15min', '30min', '1h'], ['lightgbm']].to_latex())
     best_model_tags = list(model_ranking.idxmin().iloc[0])
     ####################################################################################################################
     ## MASE Reporting
     ####################################################################################################################
-    mase_comparison = \
-        pd.read_sql(con=framework_application_obj.db_connect,
-                    sql=f'SELECT "timestamp","MASE","regression","target","D","market","freq" '
-                        f'FROM metric WHERE regression="{best_model_tags[0]}" AND freq="{best_model_tags[-1]}";')
+    if os.path.exists(f'{args.target_path}/metric.csv'):
+        mase_comparison = pd.read_csv(f'{args.target_path}/metric.csv')
+        mase_comparison = \
+            mase_comparison.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
+    else:
+        mase_comparison = \
+            pd.read_sql(con=framework_application_obj.db_connect,
+                        sql=f'SELECT "timestamp","MASE","regression","target","D","market","freq","volatility_regime" '
+                            f'FROM metric WHERE regression="{best_model_tags[0]}" AND freq="{best_model_tags[-1]}";')
     mase_comparison['timestamp'] = pd.to_datetime(mase_comparison['timestamp'], utc=True)
     mase_comparison = mase_comparison.set_index(['D', 'timestamp'])
     mase_comparison = mase_comparison.groupby(by=pd.Grouper(key='market'))['MASE'].mean()
     best_market = mase_comparison.idxmin()
     best_model = mase.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
-    best_model = pd.concat([best_model, volatility_regime.reindex(best_model.index).ffill()], axis=1)
     mase_global = \
-        best_model.groupby(by=[pd.Grouper(level='D'), pd.Grouper(key='market')])[['MASE']].mean().reset_index()
+        best_model.groupby(by=[pd.Grouper(level='D'), pd.Grouper(key='volatility_regime'),
+                               pd.Grouper(key='market')])[['MASE']].mean().reset_index()
     mase_global['D'] = mase_global['D'].transform(lambda x: f'<i>{x.lower()}</i>')
     mase_global['market'] = np.where(mase_global['market'] == 1, '<i>X<sup>(S,O)</sup></i>', '<i>X<sup>S</sup></i>')
     mase_per_volatility = \
@@ -814,12 +897,16 @@ if __name__ == '__main__':
         mase_per_volatility.loc[:, mase_per_volatility.columns.get_level_values(2) == 1].round(2)
     mase_per_volatility.columns = mase_per_volatility.columns.set_names('Market Regimes', level=0)
     mase_per_volatility = mase_per_volatility.style.format(decimal='.', thousands=',', precision=4)
+    os.makedirs(f'{args.target_path}/crypto_option_spot', exist_ok=True)
     with open(f'{args.target_path}/crypto_option_spot/mase_per_volatility.txt', 'w') as mase_per_volatility_file:
         mase_per_volatility_file.writelines(mase_per_volatility.to_latex())
     ####################################################################################################################
     ## Features and target values
     ####################################################################################################################
-    features = pd.read_sql(con=framework_application_obj.db_connect, sql='SELECT * FROM spot_features;')
+    if os.path.exists(f'{args.target_path}/spot_features.csv'):
+        features = pd.read_csv(f'{args.target_path}/spot_features.csv')
+    else:
+        features = pd.read_sql(con=framework_application_obj.db_connect, sql='SELECT * FROM spot_features;')
     features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
     targets = features[['underlying_name', 'timestamp', 'target', 'target_values']]
     targets = pd.pivot_table(targets, index=['target', 'timestamp'], columns='underlying_name',
@@ -831,17 +918,27 @@ if __name__ == '__main__':
     ## Feature importance
     ####################################################################################################################
     if best_market == 1:
-        option_features = pd.read_sql(con=framework_application_obj.db_connect,
-                                      sql='SELECT * FROM option_features;')
+        if os.path.exists(f'{args.target_path}/option_features.csv'):
+            option_features = pd.read_csv(f'{args.target_path}/option_features.csv')
+        else:
+            option_features = pd.read_sql(con=framework_application_obj.db_connect,
+                                          sql='SELECT * FROM option_features;')
         option_features['timestamp'] = pd.to_datetime(option_features['timestamp'], utc=pytz.UTC)
         option_features = pd.pivot(option_features, index=['underlying_name', 'timestamp'], columns='features',
                                    values='features_values')
         features = features.join(option_features)
-    feature_importance = pd.read_sql(con=framework_application_obj.db_connect,
-                                     sql=f'SELECT "features","D","freq","market","MASE","target","timestamp" '
-                                         f"FROM feature_importance "
-                                         f"WHERE regression = '{best_model_tags[0].lower()}' AND "
-                                         f"freq = '{best_model_tags[-1]}' AND market = '{best_market}'")
+    if os.path.exists(f'{args.target_path}/features_importance.csv'):
+        feature_importance = pd.read_csv(f'{args.target_path}/features_importance.csv')
+        feature_importance = \
+            feature_importance.query(
+                f'regression == "{best_model_tags[0].lower()}" & '
+                f'(freq == "{best_model_tags[-1]}") & (market == {best_market})').drop('volatility_regime', axis=1)
+    else:
+        feature_importance = pd.read_sql(con=framework_application_obj.db_connect,
+                                         sql=f'SELECT "features","D","freq","market","MASE","target","timestamp" '
+                                             f"FROM features_importance "
+                                             f"WHERE regression = '{best_model_tags[0].lower()}' AND "
+                                             f"freq = '{best_model_tags[-1]}' AND market = '{best_market}'")
     feature_importance = feature_importance.drop(['freq', 'market'], axis=1)
     feature_importance['timestamp'] = pd.to_datetime(feature_importance['timestamp'], utc=pytz.UTC)
     feature_importance = feature_importance.set_index(['D', 'timestamp'])
@@ -901,9 +998,8 @@ if __name__ == '__main__':
     ####################################################################################################################
     returns = data.xs('forecast', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
     returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
-    rv = \
-        data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1).resample(best_model_tags[-1]).sum().replace(0,
-                                                                                                               np.nan)
+    rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
+    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
     svix = pd.read_sql(sql='SELECT * FROM svix', con=framework_application_obj.db_connect)
     svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
@@ -938,20 +1034,20 @@ if __name__ == '__main__':
     vrp = vrp.set_index(['aggregated', 'underlying_name'],
                         append=True).swaplevel(2, 0).swaplevel(2, 1).swaplevel(-1, 1).swaplevel(-1, -2)
     vrp = vrp.rename(columns={'vrp': '$\\text{VRP}_{0 \\rightarrow D}$'})
-    vrp.index = vrp.index.set_names(['aggregated', 'underlying_name', '$D$', 'timestamp'])
+    vrp.index = vrp.index.set_names(['aggregated', 'underlying_name', 'D', 'timestamp'])
     for aggregated in [True, False]:
         if aggregated:
             tmp_svix = pd.DataFrame(pd.Series(agg_svix.unstack(), name='$\\text{Crypto SVIX}_{0 \\rightarrow D}$'))
-            tmp_svix.index = tmp_svix.index.set_names(['$D$', 'timestamp'])
+            tmp_svix.index = tmp_svix.index.set_names(['D', 'timestamp'])
         else:
             tmp_svix = svix.xs(int(aggregated), axis=0, level=0).dropna()[['D', 'underlying_name', 'svix']]
             tmp_svix = tmp_svix.set_index(['underlying_name', 'D'], append=True).swaplevel(1, 0).swaplevel(-1, 1)
-            tmp_svix.index = tmp_svix.index.set_names(['underlying_name', '$D$', 'timestamp'])
+            tmp_svix.index = tmp_svix.index.set_names(['underlying_name', 'D', 'timestamp'])
         tmp_svix = tmp_svix.rename(columns={'svix': '$\\text{Crypto SVIX}_{0 \\rightarrow D}$'})
         vrp_svix = pd.DataFrame(pd.Series(returns.unstack(), name='$\\text{returns}_{0 \\rightarrow D}$').rename_axis(
-            ['underlying_name', '$D$', 'timestamp'])).join(
-            tmp_svix, on=['$D$', 'timestamp'] if aggregated else ['underlying_name', '$D$', 'timestamp']).join(
-            vrp.xs(int(aggregated), axis=0, level=0), on=['underlying_name', '$D$', 'timestamp']).dropna()
+            ['underlying_name', 'D', 'timestamp'])).join(
+            tmp_svix, on=['D', 'timestamp'] if aggregated else ['underlying_name', 'D', 'timestamp']).join(
+            vrp.xs(int(aggregated), axis=0, level=0), on=['underlying_name', 'D', 'timestamp']).dropna()
         vrp_svix = vrp_svix.loc[:, ['$\\text{Crypto SVIX}_{0 \\rightarrow D}$','$\\text{VRP}_{0 \\rightarrow D}$',
                                     '$\\text{returns}_{0 \\rightarrow D}$']]
         vrp_svix = \
@@ -960,22 +1056,22 @@ if __name__ == '__main__':
         vrp_svix = vrp_svix.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1)], group_keys=False).apply(
             vrp_svix_effect)
         vrp_svix = vrp_svix.reset_index().assign(aggregated=int(aggregated))
-        vrp_svix = pd.melt(vrp_svix, id_vars=['aggregated', 'underlying_name', '$D$'], value_name='MASE',
+        vrp_svix = pd.melt(vrp_svix, id_vars=['aggregated', 'underlying_name', 'D'], value_name='MASE',
                            var_name='Factors')
         vrp_svix = \
-            pd.pivot(vrp_svix, columns=['underlying_name', 'Factors'], index=['aggregated', '$D$'], values='MASE')
-        # vrp_svix = vrp_svix.loc[:, pd.MultiIndex.from_product([list(pairs_order.categories),
-        #                                                        ['$\\text{VRP}_{0 \\rightarrow D}$',
-        #                                                         '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']])]
-        # tmp_vrp_svix = \
-        #     vrp_svix.loc[:, pd.MultiIndex.from_product([list(pairs_order.categories),
-        #                                                 ['$\\text{Crypto SVIX}_{0 \\rightarrow D}$',
-        #                                                  '$\\text{VRP}_{0 \\rightarrow D}$']])].copy()
-        # vrp_svix = vrp_svix.round(4)
-        # vrp_svix = vrp_svix.where(vrp_svix.values <= tmp_vrp_svix.values, vrp_svix.map(lambda x: f"\\textbf{{{x}}}"))
-        # vrp_svix = vrp_svix.loc[list(product([0, 1], d_order.categories)), :]
+            pd.pivot(vrp_svix, columns=['underlying_name', 'Factors'], index=['aggregated', 'D'], values='MASE')
+        vrp_svix = vrp_svix.loc[:, pd.MultiIndex.from_product([list(pairs_order.categories),
+                                                               ['$\\text{VRP}_{0 \\rightarrow D}$',
+                                                                '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']])]
+        tmp_vrp_svix = \
+            vrp_svix.loc[:, pd.MultiIndex.from_product([list(pairs_order.categories),
+                                                        ['$\\text{Crypto SVIX}_{0 \\rightarrow D}$',
+                                                         '$\\text{VRP}_{0 \\rightarrow D}$']])].copy()
+        vrp_svix = vrp_svix.round(4)
+        vrp_svix = vrp_svix.where(vrp_svix.values <= tmp_vrp_svix.values, vrp_svix.map(lambda x: f"\\textbf{{{x}}}"))
         vrp_svix_aggregated[(aggregated, underlying_name)] = vrp_svix
 vrp_svix_aggregated = pd.concat(vrp_svix_aggregated.values())
+vrp_svix_aggregated = vrp_svix_aggregated.loc[list(product([0, 1], d_order.categories)), :]
 with open(f'{args.target_path}/crypto_option_spot/vrp_svix.txt', 'w') as vrp_svix_file:
     vrp_svix_file.writelines(vrp_svix_aggregated.to_latex(escape=False))
 ########################################################################################################################
@@ -989,24 +1085,23 @@ for target in ['RV', 'returns']:
             pnl, trading_volume = \
                 framework_application_obj.backtest(vrp=vrp.xs(int(aggregated), 0, 0), transaction_cost=True,
                                                    spread=True, freq=best_model_tags[-1], target=target)
-            pnl, trading_volume = pnl.swaplevel(0, 1, axis=1), trading_volume.swaplevel(0, 1, axis=1)
-            # pnl.columns = pnl.columns.set_levels(pnl.columns.levels[-1].str.upper(), level=1)
-            pnl.columns = pnl.columns.set_names(['underlying_name', 'D'])
-            pnl.index = pnl.index.set_names(['timestamp'])
-            # trading_volume.columns = \
-            #     trading_volume.columns.set_levels(trading_volume.columns.levels[-1].str.lower(), level=1)
+            pnl.index, trading_volume.index = \
+                pnl.index.set_names(['timestamp']), trading_volume.index.set_names(['timestamp'])
             pnl_dd[(int(aggregated), target)] = pnl
             trading_volume_dd[(int(aggregated), target)] = trading_volume
     else:
-        pnl = framework_application_obj.backtest(transaction_cost=True, spread=False, freq=best_model_tags[-1],
-                                                 target=target).dropna()
+        pnl = framework_application_obj.backtest(transaction_cost=True, spread=True, freq=best_model_tags[-1],
+                                                 target=target)
         pnl.columns = pnl.columns.set_levels(pnl.columns.levels[-1].str.lower(), level=1)
         pnl_dd[('', target)] = pnl
 pnl = pd.concat(pnl_dd)
 trading_volume = pd.concat(trading_volume_dd)
 pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
 trading_volume.index = trading_volume.index.set_names(['aggregated', 'target', 'timestamp'])
-pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='fail', index=True)
-print(f'[Insertion]: P&L has been inserted into the database.')
-trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='fail', index=True)
-print(f'[Insertion]: Trading volume has been inserted into the database.')
+factor_analysis, tail_analysis = \
+    pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
+                                   ranking=feature_importance_ranking, targets=data.xs('values', level=0, axis=1))
+factor_analysis.to_sql(name='factor_analysis', con=framework_application_obj.db_connect, if_exists='fail', index=True)
+print(f'[Insertion]: Factor analysis has been inserted into the database.')
+tail_analysis.to_sql(name='tail_analysis', con=framework_application_obj.db_connect, if_exists='fail', index=True)
+print(f'[Insertion]: Tail analysis has been inserted into the database.')

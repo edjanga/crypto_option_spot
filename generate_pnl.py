@@ -70,8 +70,6 @@ if __name__ == '__main__':
     data_pnl['timestamp'] = pd.to_datetime(data_pnl['timestamp'], utc=pytz.UTC)
     data = data_pnl.set_index(['aggregated', 'target', 'timestamp'])
     pdb.set_trace()
-
-
     data_pnl = framework_application_obj.backtest(vrp=vrp, transaction_cost=True, spread=True,
                                                freq=args.freq, target=args.target)
     if args.target == 'RV':
