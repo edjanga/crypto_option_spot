@@ -78,6 +78,8 @@ if __name__ == '__main__':
     options_features = \
         options_features[(options_features['timestamp'] >= args.start_date) &
                          (options_features['timestamp'] < args.end_date)]
+    options_features['features_values'] = \
+        pd.to_numeric(options_features['features_values'], errors='coerce').astype('float32')
     options_features = pd.pivot_table(data=options_features, values='features_values', columns='features',
                                       index=['underlying_name', 'timestamp'])
     options_features = \
