@@ -55,6 +55,7 @@ if __name__ == '__main__':
     features = pd.concat(tmp_features, ignore_index=True)
     features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
     features = features[(features['timestamp'] >= args.start_date) & (features['timestamp'] < args.end_date)]
+    features['features_values'] = pd.to_numeric(features['features_values'], errors='coerce').astype('float32')
     features = \
         pd.pivot_table(features, columns='features', values='features_values', index=['underlying_name', 'timestamp'])
     features.index = features.index.set_names(['underlying_name', 'timestamp'])
