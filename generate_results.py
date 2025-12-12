@@ -52,7 +52,7 @@ if __name__ == '__main__':
             tmp_features.append(next(features))
         except StopIteration:
             break
-    features = pd.concat(tmp_features)
+    features = pd.concat(tmp_features, ignore_index=True)
     features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
     features = features[(features['timestamp'] >= args.start_date) & (features['timestamp'] < args.end_date)]
     features = \
