@@ -1,13 +1,11 @@
+import os
 import pdb
-
-import numpy as np
-import pytz
 from constants import *
 from itertools import product
 import pandas as pd
 import torch
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.linear_model import LassoCV, ElasticNetCV
+from sklearn.linear_model import LassoCV, ElasticNet
 from sklearn.metrics import mean_squared_error
 from typing import List, Union, Dict, Tuple
 import optuna
@@ -28,13 +26,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+
 DEVICE = 'cpu'
 if torch.backends.mps.is_available():
     DEVICE = 'mps'
 elif torch.cuda.is_available():
     DEVICE = 'cuda'
 
-tscv = TimeSeriesSplit(n_splits=5)
+tscv = TimeSeriesSplit(n_splits=2)
 
 
 def shuffle_single_feature(test, feature: str) -> Tuple[pd.DataFrame, str]:
@@ -45,6 +44,53 @@ def shuffle_single_feature(test, feature: str) -> Tuple[pd.DataFrame, str]:
         feature_value = np.random.permutation(shuffled_test.xs(symbol, axis=0, level=0)[feature].values)
         shuffled_test.loc[shuffled_test.index.get_level_values(0) == symbol, feature] = feature_value
     return shuffled_test, feature
+
+
+def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
+    list_factors = x.features.values.tolist()
+    target = x.target.unique()[0]
+    targets = targets.xs(target, axis=1, level=-1).filter(regex='|'.join(list_factors)).unstack()
+    targets = targets.loc[targets.index.get_level_values(0).isin(list_factors)]
+    X = data.filter(regex='|'.join(list_factors))
+    pnl = pnl.xs(x.name[1], axis=1, level=1).xs(x.name[-1], axis=0, level=1).stack()
+    pnl.name = 'P&L'
+    if not targets.empty:
+        pdb.set_trace()
+        # x = x.join(targets.filter(regex='|'.join(list_factors)), axis=1, how='left')
+    X = pnl.reset_index(0).swaplevel(0, 1).join(X, on=['underlying_name', 'timestamp']).set_index('aggregated',
+                                                                                                  append=True)
+    X['P&L'] = X['P&L'] + np.random.uniform(0, 1e-8, X.shape[0])
+    X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
+    X = (X - X.min()).div(X.max() - X.min())
+    params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
+    params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
+    return params
+
+
+def run_pnl_decile_ols(x, ranking, data, targets) -> pd.Series:
+    ranking = ranking.query(f'(volatility_regime == "{x.name[1]}") & (D == "{x.name[2]}") & (target == "{x.name[3]}")')
+    list_factors = ranking.features.unique().tolist()
+    data = data.filter(regex='|'.join(list_factors))
+    target = targets.xs(x.name[3], axis=1, level=1).xs(x.name[2].upper(), axis=1,
+                                                       level=1).filter(regex='|'.join(list_factors))
+    if not target.empty:
+        pdb.set_trace()
+    x = x.drop(['aggregated', 'target', 'D', 'volatility_regime', 'P&L decile'], axis=1)
+    X = x.set_index('underlying_name', append=True).swaplevel(0, 1).join(data, on=['underlying_name', 'timestamp'])
+    X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
+    X = X.groupby(by=[pd.Grouper(level='underlying_name')], group_keys=False).apply(
+        lambda x: (x - x.min()).div(x.max() - x.min())).dropna()
+    params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
+    params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
+    return params
+
+
+
+
+def run_pnl_ols_copy(x):
+    pdb.set_trace()
+    model = sm.OLS(x['P&L'], sm.add_constant(x.drop(columns=['P&L']))).fit()
+    return model.params
 
 
 class FeatureBuilder:
@@ -103,24 +149,6 @@ class FeatureBuilder:
             feature_lags.with_columns([pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
                  for feature, lag in feature_lag])
         return feature_lags
-    # def lags(data: pl.LazyFrame, features: list[str] = ['RV'] + [f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
-    #     exprs = []
-    #     for lag in INTRADAY_LAGS:
-    #         window = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
-    #         for f in features:
-    #             exprs.append(pl.col(f).rolling_mean(window).over('underlying_name').shift(1).alias(f"{f}_{lag}"))
-    #     intra = data.with_columns(exprs)
-    #     inter = []
-    #     for lag in INTERDAY_LAGS:
-    #         pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
-    #         tmp = (data.group_by_dynamic('timestamp', every=pl_lag, by='underlying_name')
-    #                .agg([pl.col(f).mean().alias(f"{f}_{lag}") for f in features])
-    #                .with_columns([pl.col(f"{f}_{lag}").shift(1).over("underlying_name") for f in features]))
-    #         inter.append(tmp)
-    #     for tmp in inter:
-    #         intra = intra.join(tmp, on=['underlying_name', 'timestamp'], how='left')
-    #     return intra
-
 
     @staticmethod
     def define_market_participants(data: pl.DataFrame) -> pd.DataFrame:
@@ -160,7 +188,7 @@ class FeatureBuilder:
             pl_freq = freq.replace('min', 'm')
         data.filter(pl.col('type') == 'put')
         pcr = data.filter(pl.col('type') == 'put').sort(by=[pl.col('underlying_name'), pl.col('type'),
-                                                                       pl.col('timestamp')]).group_by_dynamic(
+                                                            pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('volume').sum())
         call = data.filter(pl.col('type') == 'call').sort(by=[pl.col('underlying_name'), pl.col('type'),
                                                               pl.col('timestamp')]).group_by_dynamic(
@@ -249,19 +277,22 @@ class Regressor:
             train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
         train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
             train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
-        if ('lightgbm' in trial.study.study_name) | ('booster' in trial.study.study_name):
+        if 'elastic' in trial.study.study_name:
+            alpha = trial.suggest_float('alpha', 1e-4, 1.0, log=True)
+            l1_ratio = trial.suggest_float('l1_ratio', low=.1, high=.9, step=.1)
+            rres = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, max_iter=3_000, fit_intercept=True, selection='random',
+                              tol=1e-2, random_state=123)
+            rres.fit(train_X, train_y)
+        elif ('lightgbm' in trial.study.study_name) | ('booster' in trial.study.study_name):
             train_loader, valid_loader = lgb.Dataset(train_X, label=train_y), lgb.Dataset(valid_X, label=valid_y)
-            param = {
-                'objective': 'regression', 'metric': 'mse', 'verbosity': -1,
-                'max_depth': trial.suggest_int('max_depth', 1, 3),
-                'lr': trial.suggest_categorical(name='lr', choices=[.01, .05, .1]),
-                'tree_learner': 'data',
-                'feature_fraction': trial.suggest_float('feature_fraction', .1, .5, step=.1, log=False),
-                'extra_tree': True, 'boosting_type': 'goss', 'early_stopping_round': STOPPING_ROUNDS,
-                'num_threads': 0, 'force_row_wise': torch.mps.is_available(), 'max_bin': 255,
-                'min_data_in_leaf': 20, 'lambda_l2': trial.suggest_categorical(name='lambda_l2',
-                                                                               choices=np.linspace(.1, .9, 9)),
-                'feature_pre_filter': False
+            param = {'objective': 'regression', 'metric': 'mse', 'verbosity': -1,
+                     'max_depth': trial.suggest_int('max_depth', 1, 3), 'tree_learner': 'data',
+                     'lr': trial.suggest_float(name='lr', low=0.01, high=0.1, log=True),
+                     'feature_fraction': trial.suggest_float('feature_fraction', low=.1, high=.5, log=True),
+                     'boosting_type': 'goss', 'early_stopping_round': STOPPING_ROUNDS,
+                     'num_threads': os.cpu_count()//2, 'force_row_wise': False,
+                     'max_bin': 32, 'min_data_in_leaf': 20, 'feature_pre_filter': False, 'pre_partition': True,
+                     'lambda_l2': trial.suggest_categorical(name='lambda_l2', choices=np.linspace(.1, .9, 9)),
             }
             rres = lgb.train(param, train_set=train_loader, valid_sets=[valid_loader],
                              num_boost_round=NUM_BOOST_ROUND//10,
@@ -279,9 +310,8 @@ class LassoRegressor(Regressor):
 
     def model_train(self, features: Union[pd.DataFrame, np.ndarray], target: Union[pd.DataFrame, np.ndarray],
                     **kwargs) -> LassoCV:
-        rres = \
-            LassoCV(alphas=np.linspace(0.1, 0.9, 9, dtype=np.float64), cv=tscv, random_state=123, max_iter=MAX_ITER,
-                    n_jobs=-1)
+        rres = LassoCV(alphas=np.linspace(0.1, 0.9, 9, dtype=np.float64), cv=tscv, random_state=123, max_iter=MAX_ITER,
+                       n_jobs=os.cpu_count()//2)
         rres.fit(features, target)
         return rres
 
@@ -290,13 +320,12 @@ class ElasticRegressor(Regressor):
 
     def __init__(self, name: str = 'elastic'):
         super(ElasticRegressor, self).__init__(name=name)
-
-    def model_train(self, features: Union[pd.DataFrame, np.ndarray], target: Union[pd.DataFrame, np.ndarray],
-                    **kwargs) -> ElasticNetCV:
-        rres = ElasticNetCV(l1_ratio=np.linspace(1e-1, 5e-1, 5),
-                            cv=tscv, random_state=123, max_iter=MAX_ITER, n_jobs=-1, n_alphas=50)
-        rres.fit(features, target)
-        return rres
+    # def model_train(self, features: Union[pd.DataFrame, np.ndarray], target: Union[pd.DataFrame, np.ndarray],
+    #                 **kwargs) -> ElasticNet:
+    #     rres = ElasticNet(l1_ratio=np.linspace(1e-1, 5e-1, 5),
+    #                         cv=tscv, random_state=123, max_iter=5_000, n_jobs=-1, n_alphas=5)
+    #     rres.fit(features, target)
+    #     return rres
 
 
 class BoostingRegressor(Regressor):
@@ -351,7 +380,8 @@ class LSTMRegressor(Regressor):
             print(f'Parameters: {params}')
             model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
                               num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-                              beta=params['beta'], feature_names=train_X.columns.tolist(), positiveness=positiveness)
+                              beta=params['beta'], feature_names=train_X.columns.tolist(), positiveness=positiveness,
+                              dropout=params['dropout'])
             trainer = \
                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
@@ -470,7 +500,6 @@ class PermutationFeatureImportance:
         return feature_importance
 
 
-
 class PnLExplained:
 
     def __init__(self, underlying_returns: pd.DataFrame, underlying_rv: pd.DataFrame):
@@ -482,249 +511,34 @@ class PnLExplained:
         self._rv = self._rv.resample(freq).sum()
 
     def pnl_analysis(self, pnl: pd.DataFrame, ranking: pd.DataFrame,
-                     features: pd.DataFrame, targets: pd.DataFrame, freq: str, moment: str) -> None:
+                     features: pd.DataFrame, targets: pd.DataFrame, freq: str) -> Tuple[pd.DataFrame]:
         self.resample_moments(freq)
         rv_mkt = pd.qcut(self._rv.mean(axis=1), q=[0, .45, .9, 1], labels=VOL_REGIMES)
         rv_mkt.name = 'volatility_regime'
-        coefficients = dict()
-        tmp_target = targets.xs(dict([('first', 'returns'), ('second', 'RV')])[moment], axis=0, level=0)
-        fig_tails = make_subplots(rows=3, cols=3, shared_xaxes=True, shared_yaxes=True,
-                                  column_titles=['low', 'normal', 'high'],
-                                  row_titles=[f'<i>{d}</i>' for d in ['1d', '1w', '1m']])
-        for d, vol in list(product(['1d', '1w', '1m'], ['Low', 'Normal', 'High'])):
-            tmp_ranking = ranking.query(f'(D == "{d}") & '
-                                        f'(target == "{dict([("first", "returns"), ("second", "RV")])[moment]}") & '
-                                        f'(volatility_regime == "{vol}")')
-            if tmp_ranking.empty:
-                continue
-            tmp_ranking = tmp_ranking.drop(['D', 'target'], axis=1)
-            tmp_ranking['features'] = \
-                tmp_ranking.features.str.replace(r"^is_(BTCUSDT|ETHUSDT|XRPUSDT|BNBUSDT|SOLUSDT)$", r"\1",
-                                                 regex=True)
-            list_factors = tmp_ranking.features.values.tolist()  # Order is the ranking
-            try:
-                tmp_features = features.filter(regex='|'.join(list_factors), axis=1)
-                tmp_target = tmp_target.filter(regex='|'.join(list_factors), axis=1)
-            except TypeError:
-                continue
-            tmp_pnl = \
-                pd.melt(frame=pnl, ignore_index=False).set_index('underlying_name', append=True).swaplevel(0, 1)
-            tmp_pnl = tmp_pnl.rename(columns={'value': 'P&L'}).dropna().query(
-                f'D == "{dict([("first", d.upper()),("second", d)])[moment]}"').drop('D', axis=1)
-            if tmp_pnl.empty:
-                continue
-            tmp_pnl.index = tmp_pnl.index.set_names(['underlying_name', 'timestamp'])
-            tmp = tmp_pnl.join(tmp_target, on='timestamp').join(tmp_features).dropna()
-            for analysis in ['factors', 'tails']:
-                if analysis == 'factors':
-                    tmp_factors = tmp.groupby(by=pd.Grouper(level=0), group_keys=False).apply(
-                        lambda x: (x - x.max()).div(x.max() - x.min()))
-                    tmp_factors = tmp_factors.join(rv_mkt, on='timestamp')
-                    tmp_factors = sm.add_constant(tmp_factors).query(f'volatility_regime == "{vol}"')
-                    coefficients[(d, vol)] = \
-                        sm.OLS(tmp_factors['P&L'],
-                               tmp_factors.drop(['P&L', 'volatility_regime'], axis=1)).fit().params
-                    coefficients[(d, vol)].index = \
-                        ['α'] + [f'β<sub>{i}</sub>' for i in range(1, coefficients[(d, vol)].shape[0])]
-                elif analysis == 'tails':
-                    zmin, zmax = np.inf, -np.inf
-                    tmp = tmp.join(rv_mkt, on='timestamp')
-                    if moment == 'first':
-                        tmp['P&L decile'] = tmp.groupby(by=pd.Grouper(level=0), group_keys=False)['P&L'].apply(
-                            lambda x: pd.qcut(x, q=10, labels=list(range(1, 11))))
-                    else:
-                        tmp['P&L decile'] = tmp.groupby(by=pd.Grouper(level=0), group_keys=False)['P&L'].apply(
-                            lambda x: pd.cut(x, bins=10, labels=list(range(1, 11))))
-                    tmp = tmp.query(f'volatility_regime == "{vol}"').drop('volatility_regime', axis=1)
-                    heatmap = list()
-                    for decile in range(1, 11):
-                        tmp_decile = tmp.query(f'`P&L decile` == {decile}').drop('P&L decile', axis=1)
-                        tmp_decile = \
-                            tmp_decile.groupby(by=pd.Grouper(level=0), group_keys=False).apply(
-                                lambda x: (x - x.max()).div(x.max() - x.min()))
-                        tmp_decile = tmp_decile.replace([np.inf, -np.inf], np.nan).dropna()
-                        tmp_decile = sm.add_constant(tmp_decile)
-                        try:
-                            coefficient_values = \
-                                sm.OLS(tmp_decile['P&L'], tmp_decile.drop('P&L', axis=1)).fit().params.tolist()
-                        except ValueError:
-                            continue
-                        heatmap.append(coefficient_values)
-                        if zmin > min(coefficient_values):
-                            zmin = min(coefficient_values)
-                        if zmax < max(coefficient_values):
-                            zmax = max(coefficient_values)
-                    fig_tails.add_trace(
-                        trace=go.Heatmap(z=heatmap, x=['α'] + [f'β<sub>{i}</sub>' for i in range(1, 6)],
-                                         y=['1<sup>st</sup>', '2<sup>nd</sup>', '3<sup>rd</sup>'] +
-                                           [f'{q}<sup>th</sup>' for q in range(4, 11)],
-                                         colorscale='Viridis', zmin=zmin, zmax=zmax, showlegend=False),
-                        col=['Low', 'Normal', 'High'].index(vol) + 1, row=['1d', '1w', '1m'].index(d) + 1)
-        ############################################################################################################
-        ## Factor analysis
-        ############################################################################################################
-        coefficients = pd.DataFrame(coefficients).unstack()
-        try:
-            coefficients.index = coefficients.index.set_names(['D', 'volatility_regime', 'Factors'])
-        except ValueError:
-            pdb.set_trace()
-        coefficients = coefficients.dropna().reset_index().rename(columns={0: 'values'})
-        coefficients['colour'] = np.where(coefficients['values'] > 0, 'green', 'red')
-        fig_factors = \
-            px.bar(data_frame=coefficients, y='values', x='Factors', facet_row='D',
-                   facet_col='volatility_regime', color='colour',
-                   color_discrete_map={'green': px.colors.qualitative.Plotly[2],
-                                       'red': px.colors.qualitative.Plotly[1]},
-                   category_orders={'volatility_regime': ['Low', 'Normal', 'High'],
-                                    'Factors': ['α'] + [f'β<sub>{i}</sub>' for i in range(1, 6)]},
-                   title=f'Aggregated P&L Attribution via Factor Analysis: '
-                 f'{dict([(True, "Second-Moment Strategy"), (False, "First-Moment Strategy")])[moment == "second"]}')
-        fig_factors.update_yaxes(matches=None, title='')
-        fig_factors.for_each_annotation(lambda x: x.update({'text': f'{x["text"].split("=")[-1].lower()}'}),
-                                        selector=lambda x: 'volatility_regime' in x['text'])
-        fig_factors.for_each_annotation(lambda x: x.update({'text': f'<i>{x["text"].split("=")[-1]}</i>'}),
-                                        selector=lambda x: 'D' in x['text'])
-        fig_factors.update_layout(
-            showlegend=False, font=dict(size=LABEL_AXIS_FONT_SIZE), title=dict(font=dict(size=30)))
-        fig_factors.show()
-        ############################################################################################################
-        ## Tail analysis
-        ############################################################################################################
-        for idx, _ in enumerate(fig_tails.data):
-            fig_tails.data[idx].zmin, fig_tails.data[idx].zmax = zmin, zmax
-        fig_tails.update_layout(
-            font=dict(size=LABEL_AXIS_FONT_SIZE),
-            title=dict(
-                text=f'Aggregated P&L Tail Analysis via Factor Analysis: '
-                     f'{dict([(True, "Second-Moment Strategy"), (False, "First-Moment Strategy")])[moment=="second"]}',
-                font=dict(size=30)))
-        fig_tails.show()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        # if moment == 'first':
-        #     for d, vol in list(product(['1d', '1w', '1m'], ['Low', 'Normal', 'High'])):
-        #         tmp_ranking = ranking.query(f'(D == "{d}") & (target == "returns") & (volatility_regime == "{vol}")')
-        #         tmp_ranking = tmp_ranking.drop(['D', 'target'], axis=1)
-        #         tmp_ranking['features'] = \
-        #             tmp_ranking.features.str.replace(r"^is_(BTCUSDT|ETHUSDT|XRPUSDT|BNBUSDT|SOLUSDT)$", r"\1",
-        #                                              regex=True)
-        #         list_factors = tmp_ranking.features.values.tolist() # Order is the ranking
-        #         try:
-        #             tmp_features = features.filter(regex='|'.join(list_factors), axis=1)
-        #             tmp_target = tmp_target.filter(regex='|'.join(list_factors), axis=1)
-        #         except TypeError:
-        #             continue
-        #         tmp_pnl = \
-        #             pd.melt(frame=pnl, ignore_index=False).set_index('underlying_name', append=True).swaplevel(0, 1)
-        #         tmp_pnl = tmp_pnl.rename(columns={'value': 'P&L'}).dropna().query(f'D == "{d}"').drop('D', axis=1)
-        #         if tmp_pnl.empty:
-        #             continue
-        #         tmp_pnl.index = tmp_pnl.index.set_names(['underlying_name', 'timestamp'])
-        #         tmp = tmp_pnl.join(tmp_target, on='timestamp').join(tmp_features).dropna()
-        #         for analysis in ['factors', 'tails']:
-        #             if analysis == 'factors':
-        #                 tmp_factors = tmp.groupby(by=pd.Grouper(level=0), group_keys=False).apply(
-        #                     lambda x: (x - x.max()).div(x.max() - x.min()))
-        #                 tmp_factors = tmp_factors.join(rv_mkt, on='timestamp')
-        #                 tmp_factors = sm.add_constant(tmp_factors).query(f'volatility_regime == "{vol}"')
-        #                 coefficients[(d, vol)] = \
-        #                     sm.OLS(tmp_factors['P&L'],
-        #                            tmp_factors.drop(['P&L', 'volatility_regime'], axis=1)).fit().params
-        #                 coefficients[(d, vol)].index = \
-        #                     ['α']+[f'β<sub>{i}</sub>' for i in range(1, coefficients[(d, vol)].shape[0])]
-        #             elif analysis == 'tails':
-        #                 zmin, zmax = np.inf, -np.inf
-        #                 tmp = tmp.join(rv_mkt, on='timestamp')
-        #                 tmp['P&L decile'] = tmp.groupby(by=pd.Grouper(level=0), group_keys=False)['P&L'].apply(
-        #                         lambda x: pd.qcut(x, q=10, labels=list(range(1, 11))))
-        #                 tmp = tmp.query(f'volatility_regime == "{vol}"').drop('volatility_regime', axis=1)
-        #                 heatmap = list()
-        #                 for decile in range(1, 11):
-        #                     pdb.set_trace()
-        #                     tmp_decile = tmp.query(f'`P&L decile` == {decile}').drop('P&L decile', axis=1)
-        #                     tmp_decile = \
-        #                         tmp_decile.groupby(by=pd.Grouper(level=0), group_keys=False).apply(
-        #                             lambda x: (x - x.max()).div(x.max() - x.min()))
-        #                     tmp_decile = sm.add_constant(tmp_decile)
-        #                     coefficient_values = \
-        #                         sm.OLS(tmp_decile['P&L'], tmp_decile.drop('P&L', axis=1)).fit().params.tolist()
-        #                     heatmap.append(coefficient_values)
-        #                     if zmin > min(coefficient_values):
-        #                         zmin = min(coefficient_values)
-        #                     if zmax < max(coefficient_values):
-        #                         zmax = max(coefficient_values)
-        #                 fig_tails.add_trace(
-        #                     trace=go.Heatmap(z=heatmap, x=['α'] + [f'β<sub>{i}</sub>' for i in range(1, 6)],
-        #                                      y=['1<sup>st</sup>', '2<sup>nd</sup>', '3<sup>rd</sup>']+
-        #                                        [f'{q}<sup>th</sup>' for q in range(4, 11)],
-        #                                      colorscale='Viridis', zmin=zmin, zmax=zmax, showlegend=False),
-        #                     col=['Low', 'Normal', 'High'].index(vol)+1, row=['1d', '1w', '1m'].index(d)+1)
-        #     ############################################################################################################
-        #     ## Factor analysis
-        #     ############################################################################################################
-        #     coefficients = pd.DataFrame(coefficients).unstack()
-        #     try:
-        #         coefficients.index = coefficients.index.set_names(['D', 'volatility_regime', 'Factors'])
-        #     except ValueError:
-        #         pdb.set_trace()
-        #     coefficients = coefficients.dropna().reset_index().rename(columns={0: 'values'})
-        #     coefficients['colour'] = np.where(coefficients['values'] > 0, 'green', 'red')
-        #     fig_factors = \
-        #         px.bar(data_frame=coefficients, y='values', x='Factors', facet_row='D', facet_col='volatility_regime',
-        #                color='colour', color_discrete_map={'green': px.colors.qualitative.Plotly[2],
-        #                                                    'red': px.colors.qualitative.Plotly[1]},
-        #                category_orders={'volatility_regime': ['Low', 'Normal', 'High'],
-        #                                 'Factors': ['α']+[f'β<sub>{i}</sub>' for i in range(1, 6)]},
-        #                title=
-        #                f'Aggregated P&L Attribution via Factor Analysis: '
-        #                f'{dict([(True, "Second-Moment Strategy"),(False, "First-Moment Strategy")])[target=="RV"]}')
-        #     fig_factors.update_yaxes(matches=None, title='')
-        #     fig_factors.for_each_annotation(lambda x: x.update({'text': f'{x["text"].split("=")[-1].lower()}'}),
-        #                                     selector=lambda x: 'volatility_regime' in x['text'])
-        #     fig_factors.for_each_annotation(lambda x: x.update({'text': f'<i>{x["text"].split("=")[-1]}</i>'}),
-        #                                     selector=lambda x: 'D' in x['text'])
-        #     fig_factors.update_layout(
-        #         showlegend=False, font=dict(size=LABEL_AXIS_FONT_SIZE), title=dict(font=dict(size=30)))
-        #     fig_factors.show()
-        #     ############################################################################################################
-        #     ## Tail analysis
-        #     ############################################################################################################
-        #     if target == 'returns':
-        #         for idx, _ in enumerate(fig_tails.data):
-        #             fig_tails.data[idx].zmin, fig_tails.data[idx].zmax = zmin, zmax
-        #         fig_tails.update_layout(
-        #             font=dict(size=LABEL_AXIS_FONT_SIZE),
-        #             title=dict(
-        #                 text=f'Aggregated P&L Tail Analysis via Factor Analysis: '
-        #                      f'{dict([(True, "Second-Moment Strategy"), (False, "First-Moment Strategy")])[target=="RV"]}',
-        #                 font=dict(size=30)))
-        #         # fig_tails.update_xaxes(title='Factors')
-        #         # fig_tails.update_yaxes(title='Deciles')
-        #         fig_tails.show()
-        # elif moment == 'second':
-        #
-        # pdb.set_trace()
-        # return None
-
-
-
-
-
-
-
+        ranking['features'] = ranking.features.str.replace(r'^is_(BTCUSDT|ETHUSDT|XRPUSDT|BNBUSDT|SOLUSDT)$', r'\1',
+                                                           regex=True)
+        ranking['features'] = \
+            ['_'.join(name.split('_')[:-1]+[name.split('_')[-1].upper()])
+             if ('_1m' in name) | ('_1w' in name) | ('_1d' in name) else name for name in ranking['features']]
+        factor_analysis = ranking.groupby(by=[pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
+                                              pd.Grouper(key='target')],
+                                          group_keys=True).apply(
+            lambda x, data, targets, pnl: run_pnl_ols(x, data, targets, pnl), data=features,
+            targets=targets.xs('1D', axis=1, level=-1), pnl=pnl).unstack()
+        tail_analysis = pnl.stack([0, 1])
+        tail_analysis.name = 'P&L'
+        tail_analysis = pd.DataFrame(tail_analysis)
+        tail_analysis['P&L'] = tail_analysis['P&L']+np.random.uniform(0, 1e-8, tail_analysis.shape[0])
+        tail_analysis['P&L decile'] = \
+            tail_analysis.groupby(by=[pd.Grouper(level='target')], group_keys=False)['P&L'].apply(
+                lambda x: pd.qcut(x, q=10, labels=list(range(1, 11))))
+        tail_analysis = tail_analysis.reset_index([0, 1, 3, 4]).join(rv_mkt)
+        tail_analysis = tail_analysis.groupby(
+            by=[pd.Grouper(key='P&L decile'), pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
+                pd.Grouper(key='target'), pd.Grouper(key='aggregated')]).apply(
+            lambda x, ranking, data, targets: run_pnl_decile_ols(x, ranking, data, targets),
+            ranking=ranking, data=features, targets=targets).unstack().dropna()
+        return factor_analysis, tail_analysis
 
 
 
