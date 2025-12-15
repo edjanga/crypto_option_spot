@@ -44,7 +44,7 @@ class LSTMModel(p_light.LightningModule):
         else:
             self.lstm = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, num_layers=self.num_layers,
                                 batch_first=True, dropout=self.dropout if num_layers > 1 else 0.0)
-        self.layer_norm = nn.LayerNorm([lstm_output_size])
+        self.layer_norm = nn.LayerNorm(lstm_output_size)
         self.fc = nn.Linear(lstm_output_size, output_size)
         self.criterion = nn.MSELoss(reduction='mean')
         self.train_loss_curve = []
@@ -57,7 +57,7 @@ class LSTMModel(p_light.LightningModule):
         out = self.fc(out)
         if self.positiveness:
             out = F.softplus(out, beta=self.beta)
-        return out
+        return out.squeeze(-1)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -79,7 +79,6 @@ class LSTMModel(p_light.LightningModule):
 
     def configure_optimizers(self) -> dict:
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
-                                                               verbose=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         return {'optimizer': optimizer,
                 'lr_scheduler': {'scheduler': scheduler, 'monitor': 'valid_loss', 'interval': 'epoch', 'frequency': 1}}
