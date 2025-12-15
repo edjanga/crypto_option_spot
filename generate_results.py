@@ -231,6 +231,8 @@ if __name__ == '__main__':
                                         'FROM spot_features WHERE target == "RV";', con=db_connect).drop('target',
                                                                                                          axis=1)
         underlying_rv['timestamp'] = pd.to_datetime(underlying_rv['timestamp'], utc=pytz.UTC)
+        underlying_rv['target_values'] = pd.to_numeric(underlying_rv['target_values'], errors='coerce').astype(
+            'float32')
         underlying_rv = underlying_rv.groupby(by=pd.Grouper(key='timestamp'))['target_values'].mean()
         volatility_regime = underlying_rv.resample(freq).sum()
         volatility_regime = \
