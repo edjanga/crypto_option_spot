@@ -5,7 +5,7 @@ from itertools import product
 import pandas as pd
 import torch
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.linear_model import LassoCV, ElasticNet
+from sklearn.linear_model import Lasso, ElasticNet
 from sklearn.metrics import mean_squared_error
 from typing import List, Union, Dict, Tuple
 import optuna
@@ -22,9 +22,7 @@ import pytorch_lightning as p_light
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 import statsmodels.api as sm
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+
 
 
 DEVICE = 'cpu'
@@ -83,14 +81,6 @@ def run_pnl_decile_ols(x, ranking, data, targets) -> pd.Series:
     params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
     params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
     return params
-
-
-
-
-def run_pnl_ols_copy(x):
-    pdb.set_trace()
-    model = sm.OLS(x['P&L'], sm.add_constant(x.drop(columns=['P&L']))).fit()
-    return model.params
 
 
 class FeatureBuilder:
@@ -277,6 +267,10 @@ class Regressor:
             train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
         train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
             train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
+        if 'lasso' in trial.study.study_name:
+            alpha = trial.suggest_float('alpha', 1e-4, 1.0, log=True)
+            rres = Lasso(alpha=alpha)
+            rres.fit(train_X, train_y)
         if 'elastic' in trial.study.study_name:
             alpha = trial.suggest_float('alpha', 1e-4, 1.0, log=True)
             l1_ratio = trial.suggest_float('l1_ratio', low=.1, high=.9, step=.1)
@@ -308,24 +302,11 @@ class LassoRegressor(Regressor):
     def __init__(self, name: str = 'lasso'):
         super(LassoRegressor, self).__init__(name=name)
 
-    def model_train(self, features: Union[pd.DataFrame, np.ndarray], target: Union[pd.DataFrame, np.ndarray],
-                    **kwargs) -> LassoCV:
-        rres = LassoCV(alphas=np.linspace(0.1, 0.9, 9, dtype=np.float64), cv=tscv, random_state=123, max_iter=MAX_ITER,
-                       n_jobs=os.cpu_count()//2)
-        rres.fit(features, target)
-        return rres
-
 
 class ElasticRegressor(Regressor):
 
     def __init__(self, name: str = 'elastic'):
         super(ElasticRegressor, self).__init__(name=name)
-    # def model_train(self, features: Union[pd.DataFrame, np.ndarray], target: Union[pd.DataFrame, np.ndarray],
-    #                 **kwargs) -> ElasticNet:
-    #     rres = ElasticNet(l1_ratio=np.linspace(1e-1, 5e-1, 5),
-    #                         cv=tscv, random_state=123, max_iter=5_000, n_jobs=-1, n_alphas=5)
-    #     rres.fit(features, target)
-    #     return rres
 
 
 class BoostingRegressor(Regressor):
