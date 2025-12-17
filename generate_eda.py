@@ -112,8 +112,7 @@ class EDA:
                 time2mat = option_chain.select(['underlying_name', 'type', 'tau'])
                 time2mat = time2mat.sort(by=[pl.col('underlying_name'), pl.col('type')])
                 time2mat = time2mat.group_by(['underlying_name', 'type']).agg(pl.col('tau').min().alias('min'),
-                    pl.col('tau').mean().alias('mean'), pl.col('tau').max().alias('max')
-                ).collect().to_pandas()
+                    pl.col('tau').mean().alias('mean'), pl.col('tau').max().alias('max')).collect().to_pandas()
                 time2mat = time2mat.set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
                 time2mat.index = pd.MultiIndex.from_product([['Time to maturity'], ['max', 'mean', 'min']])
                 if time2mat_eda.get(symbol) is None:
