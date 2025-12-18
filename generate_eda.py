@@ -19,107 +19,115 @@ class EDA:
         if options:
             moneyness_eda, iv_eda, strikes_eda, time2mat_eda, trading_days, n_obs_eda = \
                 dict(), dict(), dict(), dict(), dict(), dict()
-            for symbol, year in itertools.product(SYMBOLS[2:], list(range(2023, 2026))):
+            for symbol, year in itertools.product(SYMBOLS, list(range(2023, 2026))):
                 paths = list(Path(f'{self._target_path}/{symbol}/{year}/options').glob('*-*-*'))
                 if len(paths) == 0:
                     continue
-                option_chain = pl.scan_parquet(f'{self._target_path}/{symbol}/{year}/options/*-*-*')
-                option_chain = option_chain.select(['symbol', 'underlying_name', 'timestamp', 'type', 'strike_price',
-                                                    'expiration', 'moneyness', 'mid_price', 'mark_iv'])
-                option_chain = option_chain.with_columns(
-                    ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
-                option_chain = option_chain.with_columns(pl.when(pl.col('type') == 'call').then(pl.col('moneyness').cut(
-                    breaks=MONEYNESS_BINS, labels=LABELS)).when(pl.col('type') == 'put').then(pl.col('moneyness').cut(
-                    breaks=MONEYNESS_BINS, labels=LABELS[::-1])).otherwise(None).alias('moneyness_label'))
-                ########################################################################################################
-                ## MONEYNESS
-                ########################################################################################################
-                moneyness_label = option_chain.select(['underlying_name', 'type', 'moneyness_label', 'moneyness'])
-                moneyness_label = \
-                    moneyness_label.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('moneyness_label')])
-                moneyness = moneyness_label.group_by(['underlying_name', 'type', 'moneyness_label']).agg(
-                    pl.len().alias(''), pl.col('moneyness').min().alias('min'),
-                    pl.col('moneyness').mean().alias('mean'), pl.col('moneyness').max().alias('max')
-                ).collect().to_pandas()
-                tmp_moneyness_label = pd.pivot(moneyness.iloc[:, :4].dropna(),
-                                               columns=['underlying_name', 'type'], index='moneyness_label', values='')
-                tmp_moneyness_label = tmp_moneyness_label.loc[['DOTM', 'OTM', 'ATM', 'ITM', 'DITM'], :]
-                tmp_moneyness_values = \
-                    moneyness.drop(['', 'moneyness_label'], axis=1).groupby(['underlying_name', 'type'])
-                tmp_moneyness_values = \
-                    tmp_moneyness_values.agg({'min': 'min', 'mean': 'mean', 'max': 'max'}).transpose()
-                tmp_moneyness_values = tmp_moneyness_values.loc[['max', 'mean', 'min'], :]
-                tmp_moneyness = pd.concat([tmp_moneyness_label, tmp_moneyness_values])
-                tmp_moneyness.index = pd.MultiIndex.from_product([['log m'], ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM',
-                                                                              'max', 'mean', 'min']])
-                if moneyness_eda.get(symbol) is None:
-                    moneyness_eda[symbol] = tmp_moneyness
-                else:
-                    moneyness_eda[symbol].iloc[:-3, :] = \
-                        moneyness_eda[symbol].iloc[:-3, :].add(tmp_moneyness.iloc[:-3, :])
-                    ############################################### CALL ###############################################
-                    moneyness_eda[symbol].iloc[-3, 0] = \
-                        tmp_moneyness.iloc[-3, 0] if tmp_moneyness.iloc[-3, 0] > moneyness_eda[symbol].iloc[-3, 0] \
-                            else moneyness_eda[symbol].iloc[-3, 0]
-                    moneyness_eda[symbol].iloc[-2, 0] = .5*(tmp_moneyness.iloc[-2, 0]+moneyness_eda[symbol].iloc[-2, 0])
-                    moneyness_eda[symbol].iloc[-3, 0] = \
-                        tmp_moneyness.iloc[-1, 0] if tmp_moneyness.iloc[-1, 0] < moneyness_eda[symbol].iloc[-1, 0] \
-                            else moneyness_eda[symbol].iloc[-1, 0]
-                    ############################################### PUT ################################################
-                    moneyness_eda[symbol].iloc[-3, 1] = \
-                        tmp_moneyness.iloc[-3, 1] if tmp_moneyness.iloc[-3, 1] > moneyness_eda[symbol].iloc[-3, 1] \
-                            else moneyness_eda[symbol].iloc[-3, 1]
-                    moneyness_eda[symbol].iloc[-2, 1] = .5 * (
-                                tmp_moneyness.iloc[-2, 1] + moneyness_eda[symbol].iloc[-2, 1])
-                    moneyness_eda[symbol].iloc[-3, 1] = \
-                        tmp_moneyness.iloc[-1, 1] if tmp_moneyness.iloc[-1, 1] < moneyness_eda[symbol].iloc[-1, 1] \
-                            else moneyness_eda[symbol].iloc[-1, 1]
-                ########################################################################################################
-                ## IV
-                ########################################################################################################
-                iv = option_chain.select(['underlying_name', 'type', 'mark_iv'])
-                iv = iv.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                iv = iv.group_by(['underlying_name', 'type']).agg(pl.col('mark_iv').min().alias('min'),
-                                                                  pl.col('mark_iv').mean().alias('mean'),
-                                                                  pl.col('mark_iv').max().alias('max')).collect()
-                iv = iv.to_pandas().set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
-                iv.index = pd.MultiIndex.from_product([['IV'], ['max', 'mean', 'min']])
-                if iv_eda.get(symbol) is None:
-                    iv_eda[symbol] = iv
-                else:
-                    ############################################### CALL ###############################################
-                    iv_eda[symbol].iloc[0, 0] = \
-                        iv.iloc[0, 0] if iv.iloc[0, 0] > iv_eda[symbol].iloc[0, 0] else iv_eda[symbol].iloc[0, 0]
-                    iv_eda[symbol].iloc[1, 0] = .5*(iv.iloc[1, 0]+iv_eda[symbol].iloc[1, 0])
-                    iv_eda[symbol].iloc[2, 0] = \
-                        iv.iloc[2, 0] if iv.iloc[2, 0] < iv_eda[symbol].iloc[2, 0] else iv_eda[symbol].iloc[2, 0]
-                    ############################################### PUT ################################################
-                    iv_eda[symbol].iloc[0, 1] = \
-                        iv.iloc[0, 1] if iv.iloc[0, 1] > iv_eda[symbol].iloc[0, 1] else iv_eda[symbol].iloc[0, 1]
-                    iv_eda[symbol].iloc[1, 1] = .5 * (iv.iloc[1, 1] + iv_eda[symbol].iloc[1, 1])
-                    iv_eda[symbol].iloc[2, 1] = \
-                        iv.iloc[2, 1] if iv.iloc[2, 1] < iv_eda[symbol].iloc[2, 1] else iv_eda[symbol].iloc[2, 1]
-                ########################################################################################################
-                ## Strikes
-                ########################################################################################################
-                strikes = option_chain.select(['underlying_name', 'type', 'strike_price'])
-                strikes = strikes.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                strikes = strikes.group_by(['underlying_name', 'type'])
-                strikes = strikes.agg(pl.col('strike_price').n_unique().alias('strike_count')).collect().to_pandas()
-                strikes = strikes.set_index(['underlying_name', 'type']).transpose()
-                strikes.index = pd.MultiIndex.from_product([['Total strikes'], ['']])
-                strikes_eda[symbol] = strikes if strikes_eda.get(symbol) is None else strikes_eda[symbol].add(strikes)
-                ########################################################################################################
-                ## Time to expiration
-                ########################################################################################################
-                time2mat = option_chain.select(['underlying_name', 'type', 'tau'])
-                time2mat = time2mat.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                time2mat = time2mat.group_by(['underlying_name', 'type']).agg(pl.col('tau').min().alias('min'),
-                    pl.col('tau').mean().alias('mean'), pl.col('tau').max().alias('max')).collect().to_pandas()
-                time2mat = time2mat.set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
-                time2mat.index = pd.MultiIndex.from_product([['Time to maturity'], ['max', 'mean', 'min']])
-                if time2mat_eda.get(symbol) is None:
-                    time2mat_eda[symbol] = time2mat
+                chunksize = len(paths)//4
+                for chunk in list(range(0, chunksize, len(paths)+1)):
+                    option_chain = pl.scan_parquet(paths[chunk:chunk+chunksize])
+                    option_chain = \
+                        option_chain.select(['symbol', 'underlying_name', 'timestamp', 'type', 'strike_price',
+                                             'expiration', 'moneyness', 'mid_price', 'mark_iv'])
+                    option_chain = option_chain.with_columns(
+                        ((pl.col('expiration')-pl.col('timestamp')).dt.total_days()/360).alias('tau'))
+                    option_chain = \
+                        option_chain.with_columns(pl.when(pl.col('type') == 'call').then(pl.col('moneyness').cut(
+                        breaks=MONEYNESS_BINS, labels=LABELS)).when(pl.col('type') == 'put').then(pl.col('moneyness')
+                        .cut(breaks=MONEYNESS_BINS, labels=LABELS[::-1])).otherwise(None).alias('moneyness_label'))
+                    ####################################################################################################
+                    ## MONEYNESS
+                    ####################################################################################################
+                    moneyness_label = option_chain.select(['underlying_name', 'type', 'moneyness_label', 'moneyness'])
+                    moneyness_label = \
+                        moneyness_label.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('moneyness_label')])
+                    moneyness = moneyness_label.group_by(['underlying_name', 'type', 'moneyness_label']).agg(
+                        pl.len().alias(''), pl.col('moneyness').min().alias('min'),
+                        pl.col('moneyness').mean().alias('mean'), pl.col('moneyness').max().alias('max')
+                    ).collect().to_pandas()
+                    tmp_moneyness_label = pd.pivot(moneyness.iloc[:, :4].dropna(),
+                                                   columns=['underlying_name', 'type'], index='moneyness_label',
+                                                   values='')
+                    tmp_moneyness_label = tmp_moneyness_label.loc[['DOTM', 'OTM', 'ATM', 'ITM', 'DITM'], :]
+                    tmp_moneyness_values = \
+                        moneyness.drop(['', 'moneyness_label'], axis=1).groupby(['underlying_name', 'type'])
+                    tmp_moneyness_values = \
+                        tmp_moneyness_values.agg({'min': 'min', 'mean': 'mean', 'max': 'max'}).transpose()
+                    tmp_moneyness_values = tmp_moneyness_values.loc[['max', 'mean', 'min'], :]
+                    tmp_moneyness = pd.concat([tmp_moneyness_label, tmp_moneyness_values])
+                    tmp_moneyness.index = pd.MultiIndex.from_product([['log m'], ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM',
+                                                                                  'max', 'mean', 'min']])
+                    if moneyness_eda.get(symbol) is None:
+                        moneyness_eda[symbol] = tmp_moneyness
+                    else:
+                        moneyness_eda[symbol].iloc[:-3, :] = \
+                            moneyness_eda[symbol].iloc[:-3, :].add(tmp_moneyness.iloc[:-3, :])
+                        ############################################### CALL ###############################################
+                        moneyness_eda[symbol].iloc[-3, 0] = \
+                            tmp_moneyness.iloc[-3, 0] if tmp_moneyness.iloc[-3, 0] > moneyness_eda[symbol].iloc[-3, 0] \
+                                else moneyness_eda[symbol].iloc[-3, 0]
+                        moneyness_eda[symbol].iloc[-2, 0] = .5*(tmp_moneyness.iloc[-2, 0]+moneyness_eda[symbol].iloc[-2, 0])
+                        moneyness_eda[symbol].iloc[-3, 0] = \
+                            tmp_moneyness.iloc[-1, 0] if tmp_moneyness.iloc[-1, 0] < moneyness_eda[symbol].iloc[-1, 0] \
+                                else moneyness_eda[symbol].iloc[-1, 0]
+                        ############################################### PUT ################################################
+                        moneyness_eda[symbol].iloc[-3, 1] = \
+                            tmp_moneyness.iloc[-3, 1] if tmp_moneyness.iloc[-3, 1] > moneyness_eda[symbol].iloc[-3, 1] \
+                                else moneyness_eda[symbol].iloc[-3, 1]
+                        moneyness_eda[symbol].iloc[-2, 1] = .5 * (
+                                    tmp_moneyness.iloc[-2, 1] + moneyness_eda[symbol].iloc[-2, 1])
+                        moneyness_eda[symbol].iloc[-3, 1] = \
+                            tmp_moneyness.iloc[-1, 1] if tmp_moneyness.iloc[-1, 1] < moneyness_eda[symbol].iloc[-1, 1] \
+                                else moneyness_eda[symbol].iloc[-1, 1]
+                    ####################################################################################################
+                    ## IV
+                    ####################################################################################################
+                    iv = option_chain.select(['underlying_name', 'type', 'mark_iv'])
+                    iv = iv.sort(by=[pl.col('underlying_name'), pl.col('type')])
+                    iv = iv.group_by(['underlying_name', 'type']).agg(pl.col('mark_iv').min().alias('min'),
+                                                                      pl.col('mark_iv').mean().alias('mean'),
+                                                                      pl.col('mark_iv').max().alias('max')).collect()
+                    iv = \
+                        iv.to_pandas().set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
+                    iv.index = pd.MultiIndex.from_product([['IV'], ['max', 'mean', 'min']])
+                    if iv_eda.get(symbol) is None:
+                        iv_eda[symbol] = iv
+                    else:
+                        ############################################### CALL ###############################################
+                        iv_eda[symbol].iloc[0, 0] = \
+                            iv.iloc[0, 0] if iv.iloc[0, 0] > iv_eda[symbol].iloc[0, 0] else iv_eda[symbol].iloc[0, 0]
+                        iv_eda[symbol].iloc[1, 0] = .5*(iv.iloc[1, 0]+iv_eda[symbol].iloc[1, 0])
+                        iv_eda[symbol].iloc[2, 0] = \
+                            iv.iloc[2, 0] if iv.iloc[2, 0] < iv_eda[symbol].iloc[2, 0] else iv_eda[symbol].iloc[2, 0]
+                        ############################################### PUT ################################################
+                        iv_eda[symbol].iloc[0, 1] = \
+                            iv.iloc[0, 1] if iv.iloc[0, 1] > iv_eda[symbol].iloc[0, 1] else iv_eda[symbol].iloc[0, 1]
+                        iv_eda[symbol].iloc[1, 1] = .5 * (iv.iloc[1, 1] + iv_eda[symbol].iloc[1, 1])
+                        iv_eda[symbol].iloc[2, 1] = \
+                            iv.iloc[2, 1] if iv.iloc[2, 1] < iv_eda[symbol].iloc[2, 1] else iv_eda[symbol].iloc[2, 1]
+                    ####################################################################################################
+                    ## Strikes
+                    ####################################################################################################
+                    strikes = option_chain.select(['underlying_name', 'type', 'strike_price'])
+                    strikes = strikes.sort(by=[pl.col('underlying_name'), pl.col('type')])
+                    strikes = strikes.group_by(['underlying_name', 'type'])
+                    strikes = strikes.agg(pl.col('strike_price').n_unique().alias('strike_count')).collect().to_pandas()
+                    strikes = strikes.set_index(['underlying_name', 'type']).transpose()
+                    strikes.index = pd.MultiIndex.from_product([['Total strikes'], ['']])
+                    strikes_eda[symbol] = \
+                        strikes if strikes_eda.get(symbol) is None else strikes_eda[symbol].add(strikes)
+                    ####################################################################################################
+                    ## Time to expiration
+                    ####################################################################################################
+                    time2mat = option_chain.select(['underlying_name', 'type', 'tau'])
+                    time2mat = time2mat.sort(by=[pl.col('underlying_name'), pl.col('type')])
+                    time2mat = time2mat.group_by(['underlying_name', 'type']).agg(pl.col('tau').min().alias('min'),
+                        pl.col('tau').mean().alias('mean'), pl.col('tau').max().alias('max')).collect().to_pandas()
+                    time2mat = \
+                        time2mat.set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
+                    time2mat.index = pd.MultiIndex.from_product([['Time to maturity'], ['max', 'mean', 'min']])
+                    if time2mat_eda.get(symbol) is None:
+                        time2mat_eda[symbol] = time2mat
                 else:
                     ############################################### CALL ###############################################
                     time2mat_eda[symbol].iloc[0, 0] = \
