@@ -23,7 +23,7 @@ class EDA:
                 paths = list(Path(f'{self._target_path}/{symbol}/{year}/options').glob('*-*-*'))
                 if len(paths) == 0:
                     continue
-                chunksize = len(paths)//4
+                chunksize = len(paths)//13
                 for chunk in list(range(0, chunksize, len(paths)+1)):
                     option_chain = pl.scan_parquet(paths[chunk:chunk+chunksize])
                     option_chain = \
@@ -183,7 +183,7 @@ class EDA:
             rv = rv.mul((pd.to_timedelta(360, unit='d')//freq) ** .5)
             summary_eda['Returns'] = returns.agg(['min', 'mean', 'max'])
             summary_eda['Annualised RV'] = rv.agg(['min', 'mean', 'max'])
-            summary_eda = pd.concat(summary_eda)
+            summary_eda = pd.concat(summary_eda)[SYMBOLS]
         summary_eda = summary_eda.style.format(decimal='.', thousands=',',
                                                precision={True: 2, False: 6}[options])
         with open(f'{self._target_path}'
