@@ -182,8 +182,8 @@ class EDA:
             rv = rv.pow(2).resample('1D').sum()
             freq = returns.index[1] - returns.index[0]
             rv = rv.mul((pd.to_timedelta(360, unit='d')//freq) ** .5)
-            summary_eda['Returns'] = returns.agg(['min', 'mean', 'max'])
-            summary_eda['Annualised RV'] = rv.agg(['min', 'mean', 'max'])
+            summary_eda['Returns'] = returns.agg(['max', 'mean', 'min'])
+            summary_eda['Annualised RV'] = rv.agg(['max', 'mean', 'min'])
             summary_eda = pd.concat(summary_eda)[SYMBOLS]
         summary_eda = summary_eda.style.format(decimal='.', thousands=',',
                                                precision={True: 2, False: 6}[options])
