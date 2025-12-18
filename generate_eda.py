@@ -1,6 +1,6 @@
 import itertools
 import pdb
-
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from constants import MONEYNESS_BINS, LABELS, SYMBOLS
@@ -20,6 +20,9 @@ class EDA:
             moneyness_eda, iv_eda, strikes_eda, time2mat_eda, trading_days, n_obs_eda = \
                 dict(), dict(), dict(), dict(), dict(), dict()
             for symbol, year in itertools.product(SYMBOLS[2:], list(range(2023, 2026))):
+                paths = list(Path(f'{self._target_path}/{symbol}/{year}/options').glob('*-*-*'))
+                if len(paths) == 0:
+                    continue
                 option_chain = pl.scan_parquet(f'{self._target_path}/{symbol}/{year}/options/*-*-*')
                 option_chain = option_chain.select(['symbol', 'underlying_name', 'timestamp', 'type', 'strike_price',
                                                     'expiration', 'moneyness', 'mid_price', 'mark_iv'])
