@@ -322,7 +322,7 @@ def objective_daily(trial: optuna.trial.Trial, transaction_cost: bool, spread: b
         spot_returns_long, spot_returns_short = kwargs['spot_returns']['values'], -kwargs['spot_returns']['values']
         spot_returns_long = spot_returns_long.loc[:, signal_filter_long.columns.get_level_values(0).unique()]
         spot_returns_short = spot_returns_short.loc[:, signal_filter_short.columns.get_level_values(0).unique()]
-        spot_prices = kwargs['spot_prices']#.loc[:, signal_filter_short.columns.get_level_values(0).unique()]
+        spot_prices = kwargs['spot_prices']
         if transaction_cost:
             fees = .001 * (spot_prices+spot_prices.shift())/spot_prices.shift()
             fees = \
@@ -439,9 +439,9 @@ class FrameworkApplication:
         self._underlying_prices = self._underlying_prices.pivot(
             index='timestamp', on='underlying_name', values='mid_price[0]')
         self._underlying_rv = self._underlying_prices.select(['timestamp'] + [
-            (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS[2:]]).to_pandas()
+            (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS]).to_pandas()
         self._underlying_returns = self._underlying_prices.select(['timestamp'] + [
-            (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS[2:]]).to_pandas()
+            (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS]).to_pandas()
 
     @property
     def data(self) -> pd.DataFrame:
@@ -703,20 +703,6 @@ class FrameworkApplication:
                 spread_prices = pd.pivot(data=spread_prices, columns=['underlying_name', 'D'], values='fees')
                 spot_returns_long = spot_returns_long.subtract(.5 * (spread_prices.add(spread_prices.shift())))
                 spot_returns_short = spot_returns_short.subtract(.5 * (spread_prices.add(spread_prices.shift())))
-            # spot_returns_long = pd.concat([pd.melt(spot_returns_long, ignore_index=False, var_name='underlying_name',
-            #                                        value_name='returns').assign(D='1D'),
-            #                                pd.melt(spot_returns_long, ignore_index=False, var_name='underlying_name',
-            #                                        value_name='returns').assign(D='1W'),
-            #                                pd.melt(spot_returns_long, ignore_index=False, var_name='underlying_name',
-            #                                        value_name='returns').assign(D='1M')])
-            # spot_returns_short = pd.concat([pd.melt(spot_returns_short, ignore_index=False, var_name='underlying_name',
-            #                                         value_name='returns').assign(D='1D'),
-            #                                 pd.melt(spot_returns_short, ignore_index=False, var_name='underlying_name',
-            #                                         value_name='returns').assign(D='1W'),
-            #                                 pd.melt(spot_returns_short, ignore_index=False, var_name='underlying_name',
-            #                                         value_name='returns').assign(D='1M')])
-            # spot_returns_long = pd.pivot(spot_returns_long, columns=['underlying_name', 'D'], values='returns')
-            # spot_returns_short = pd.pivot(spot_returns_short, columns=['underlying_name', 'D'], values='returns')
             returns = ((spot_returns_long.mul(signal_long)) +
                        (spot_returns_short.mul(signal_short))).dropna(how='all', axis=1).dropna()
             return returns
@@ -817,7 +803,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Order
     ####################################################################################################################
-    pairs_order = CategoricalDtype(categories=['SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True) #'BTCUSDT', 'ETHUSDT',
+    pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True)
     d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
     volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
     market_order = CategoricalDtype(categories=[0, 1], ordered=True)
@@ -854,7 +840,7 @@ if __name__ == '__main__':
     with open(f'{args.target_path}/crypto_option_spot/mase_per_regression_freq_pair.txt', 'w') as \
             mase_per_regression_freq_pair_file:
         mase_per_regression_freq_pair_file.writelines(model_ranking.unstack(0).droplevel(axis=1, level=0).loc[
-            ['15min', '30min', '1h'], ['lightgbm']].to_latex())
+            ['15min', '30min', '1h'], ['lasso', 'elastic', 'lightgbm', 'lstm']].to_latex())
     best_model_tags = list(model_ranking.idxmin().iloc[0])
     ####################################################################################################################
     ## MASE Reporting
