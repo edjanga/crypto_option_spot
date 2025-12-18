@@ -62,15 +62,16 @@ class EDA:
                     else:
                         moneyness_eda[symbol].iloc[:-3, :] = \
                             moneyness_eda[symbol].iloc[:-3, :].add(tmp_moneyness.iloc[:-3, :])
-                        ############################################### CALL ###############################################
+                        ############################################### CALL ###########################################
                         moneyness_eda[symbol].iloc[-3, 0] = \
                             tmp_moneyness.iloc[-3, 0] if tmp_moneyness.iloc[-3, 0] > moneyness_eda[symbol].iloc[-3, 0] \
                                 else moneyness_eda[symbol].iloc[-3, 0]
-                        moneyness_eda[symbol].iloc[-2, 0] = .5*(tmp_moneyness.iloc[-2, 0]+moneyness_eda[symbol].iloc[-2, 0])
+                        moneyness_eda[symbol].iloc[-2, 0] = \
+                            .5*(tmp_moneyness.iloc[-2, 0]+moneyness_eda[symbol].iloc[-2, 0])
                         moneyness_eda[symbol].iloc[-3, 0] = \
                             tmp_moneyness.iloc[-1, 0] if tmp_moneyness.iloc[-1, 0] < moneyness_eda[symbol].iloc[-1, 0] \
                                 else moneyness_eda[symbol].iloc[-1, 0]
-                        ############################################### PUT ################################################
+                        ############################################### PUT ############################################
                         moneyness_eda[symbol].iloc[-3, 1] = \
                             tmp_moneyness.iloc[-3, 1] if tmp_moneyness.iloc[-3, 1] > moneyness_eda[symbol].iloc[-3, 1] \
                                 else moneyness_eda[symbol].iloc[-3, 1]
@@ -93,13 +94,13 @@ class EDA:
                     if iv_eda.get(symbol) is None:
                         iv_eda[symbol] = iv
                     else:
-                        ############################################### CALL ###############################################
+                        ############################################### CALL ###########################################
                         iv_eda[symbol].iloc[0, 0] = \
                             iv.iloc[0, 0] if iv.iloc[0, 0] > iv_eda[symbol].iloc[0, 0] else iv_eda[symbol].iloc[0, 0]
                         iv_eda[symbol].iloc[1, 0] = .5*(iv.iloc[1, 0]+iv_eda[symbol].iloc[1, 0])
                         iv_eda[symbol].iloc[2, 0] = \
                             iv.iloc[2, 0] if iv.iloc[2, 0] < iv_eda[symbol].iloc[2, 0] else iv_eda[symbol].iloc[2, 0]
-                        ############################################### PUT ################################################
+                        ############################################### PUT ############################################
                         iv_eda[symbol].iloc[0, 1] = \
                             iv.iloc[0, 1] if iv.iloc[0, 1] > iv_eda[symbol].iloc[0, 1] else iv_eda[symbol].iloc[0, 1]
                         iv_eda[symbol].iloc[1, 1] = .5 * (iv.iloc[1, 1] + iv_eda[symbol].iloc[1, 1])
@@ -128,23 +129,23 @@ class EDA:
                     time2mat.index = pd.MultiIndex.from_product([['Time to maturity'], ['max', 'mean', 'min']])
                     if time2mat_eda.get(symbol) is None:
                         time2mat_eda[symbol] = time2mat
-                else:
-                    ############################################### CALL ###############################################
-                    time2mat_eda[symbol].iloc[0, 0] = \
-                        time2mat.iloc[0, 0] if time2mat.iloc[0, 0] > time2mat_eda[symbol].iloc[0, 0] \
-                            else time2mat_eda[symbol].iloc[0, 0]
-                    time2mat_eda[symbol].iloc[1, 0] = .5 * (time2mat_eda[symbol].iloc[1, 0] + time2mat.iloc[1, 0])
-                    time2mat_eda[symbol].iloc[2, 0] = \
-                        time2mat[symbol].iloc[2, 0] if time2mat.iloc[2, 0] < time2mat_eda[symbol].iloc[2, 0] \
-                            else time2mat_eda[symbol].iloc[2, 0]
-                    ############################################### PUT ################################################
-                    time2mat_eda[symbol].iloc[0, 1] = \
-                        time2mat.iloc[0, 1] if time2mat.iloc[0, 1] > time2mat_eda[symbol].iloc[0, 1] else \
-                            time2mat_eda[symbol].iloc[0, 1]
-                    time2mat_eda[symbol].iloc[1, 1] = .5 * (time2mat.iloc[1, 1] + time2mat_eda[symbol].iloc[1, 1])
-                    time2mat_eda[symbol].iloc[2, 1] = \
-                        time2mat.iloc[2, 1] if time2mat.iloc[2, 1] < time2mat_eda[symbol].iloc[2, 1] else \
-                            time2mat_eda[symbol].iloc[2, 1]
+                    else:
+                        ############################################### CALL ###########################################
+                        time2mat_eda[symbol].iloc[0, 0] = \
+                            time2mat.iloc[0, 0] if time2mat.iloc[0, 0] > time2mat_eda[symbol].iloc[0, 0] \
+                                else time2mat_eda[symbol].iloc[0, 0]
+                        time2mat_eda[symbol].iloc[1, 0] = .5 * (time2mat_eda[symbol].iloc[1, 0] + time2mat.iloc[1, 0])
+                        time2mat_eda[symbol].iloc[2, 0] = \
+                            time2mat[symbol].iloc[2, 0] if time2mat.iloc[2, 0] < time2mat_eda[symbol].iloc[2, 0] \
+                                else time2mat_eda[symbol].iloc[2, 0]
+                        ############################################### PUT ############################################
+                        time2mat_eda[symbol].iloc[0, 1] = \
+                            time2mat.iloc[0, 1] if time2mat.iloc[0, 1] > time2mat_eda[symbol].iloc[0, 1] else \
+                                time2mat_eda[symbol].iloc[0, 1]
+                        time2mat_eda[symbol].iloc[1, 1] = .5 * (time2mat.iloc[1, 1] + time2mat_eda[symbol].iloc[1, 1])
+                        time2mat_eda[symbol].iloc[2, 1] = \
+                            time2mat.iloc[2, 1] if time2mat.iloc[2, 1] < time2mat_eda[symbol].iloc[2, 1] else \
+                                time2mat_eda[symbol].iloc[2, 1]
                     ####################################################################################################
                     ## Trading days + Total observations
                     ####################################################################################################
