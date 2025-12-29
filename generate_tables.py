@@ -948,11 +948,15 @@ if __name__ == '__main__':
         feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
                                                         regex=True)
     feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
-    data = pd.read_sql(con=framework_application_obj.db_connect,
-                       sql=f'SELECT * FROM forecasts '
-                           f'WHERE regression = "{best_model_tags[0].lower()}" '
-                           f'AND freq = "{best_model_tags[-1]}" '
-                           f'AND market = "{best_market}";').set_index('timestamp')
+    chunks = pd.read_csv(f'{args.target_path}/forecasts.csv', chunksize=1_000_000)
+    data = pd.concat(chunk.query('regression == @best_model_tags[0].lower() and freq == @best_model_tags[-1] '
+                                 'and market == @best_market') for chunk in chunks)
+    data = data.set_index('timestamp')
+    # data = pd.read_sql(con=framework_application_obj.db_connect,
+    #                    sql=f'SELECT * FROM forecasts '
+    #                        f'WHERE regression = "{best_model_tags[0].lower()}" '
+    #                        f'AND freq = "{best_model_tags[-1]}" '
+    #                        f'AND market = "{best_market}";').set_index('timestamp')
     data.index = pd.to_datetime(data.index, utc=True)
     data = \
         pd.pivot_table(data=data, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
