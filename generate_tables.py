@@ -713,12 +713,13 @@ class FrameworkApplication:
             trading_volume = list()
             dates = list(FrameworkApplication._option_chain.keys())
             vrp = kwargs['vrp']
+            dates = dates[dates.index(kwargs['vrp'].index.get_level_values(-1)[0].date()):]
         else:
             spot_returns = self._data.xs('returns', level=2, axis=1)
             spot_prices = self._underlying_prices.sort(by='timestamp').group_by_dynamic(index_column='timestamp',
                                                                                         every=freq.replace('in', ''))
             spot_prices = spot_prices.agg(pl.all().last()).to_pandas().set_index('timestamp')
-            dates = list(np.unique(spot_returns.index.date))[:50]
+            dates = list(np.unique(spot_returns.index.date))
         if kwargs['target'] == 'RV':
             vrp = pd.pivot(vrp.reset_index([0, 1]), columns=['underlying_name', 'D'],
                            values='$\\text{VRP}_{0 \\rightarrow D}$')
