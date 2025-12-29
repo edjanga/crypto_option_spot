@@ -351,8 +351,11 @@ def objective_daily(trial: optuna.trial.Trial, transaction_cost: bool, spread: b
         sharpe = mean_returns.div(std_returns).groupby(by=pd.Grouper(level=1)).mean().to_dict()
     trial.set_user_attr(key='threshold_filter', value=param['threshold_filter'])
     trial.set_user_attr(key='target', value=kwargs['target'])
-    trial.set_user_attr(key='sharpe',
-                        value=0 if np.isnan(sum(sharpe.values())/len(sharpe)) else sum(sharpe.values())/len(sharpe))
+    if len(sharpe) > 0:
+        trial.set_user_attr(key='sharpe',
+                            value=0 if np.isnan(sum(sharpe.values())/len(sharpe)) else sum(sharpe.values())/len(sharpe))
+    else:
+        trial.set_user_attr(key='sharpe', value=0)
     return trial.user_attrs['sharpe']
 
 
