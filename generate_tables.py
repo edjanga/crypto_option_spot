@@ -948,15 +948,17 @@ if __name__ == '__main__':
         feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
                                                         regex=True)
     feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
-    chunks = pd.read_csv(f'{args.target_path}/forecasts.csv', chunksize=1_000_000)
-    data = pd.concat(chunk.query('regression == @best_model_tags[0].lower() and freq == @best_model_tags[-1] '
-                                 'and market == @best_market') for chunk in chunks)
+    if os.path.exists(f'{args.target_path}/features_importance.csv'):
+        chunks = pd.read_csv(f'{args.target_path}/forecasts.csv', chunksize=1_000_000)
+        data = pd.concat(chunk.query('regression == @best_model_tags[0].lower() and freq == @best_model_tags[-1] '
+                                     'and market == @best_market') for chunk in chunks)
+    else:
+        data = pd.read_sql(con=framework_application_obj.db_connect,
+                           sql=f'SELECT * FROM forecasts '
+                               f'WHERE regression = "{best_model_tags[0].lower()}" '
+                               f'AND freq = "{best_model_tags[-1]}" '
+                               f'AND market = "{best_market}";').set_index('timestamp')
     data = data.set_index('timestamp')
-    # data = pd.read_sql(con=framework_application_obj.db_connect,
-    #                    sql=f'SELECT * FROM forecasts '
-    #                        f'WHERE regression = "{best_model_tags[0].lower()}" '
-    #                        f'AND freq = "{best_model_tags[-1]}" '
-    #                        f'AND market = "{best_market}";').set_index('timestamp')
     data.index = pd.to_datetime(data.index, utc=True)
     data = \
         pd.pivot_table(data=data, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
@@ -1088,6 +1090,10 @@ pnl = pd.concat(pnl_dd)
 trading_volume = pd.concat(trading_volume_dd)
 pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
 trading_volume.index = trading_volume.index.set_names(['aggregated', 'target', 'timestamp'])
+pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='fail', index=True)
+print(f'[Insertion]: P&L has been inserted into the database.')
+trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='fail', index=True)
+print(f'[Insertion]: Trading volume has been inserted into the database.')
 factor_analysis, tail_analysis = \
     pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                    ranking=feature_importance_ranking, targets=data.xs('values', level=0, axis=1))
