@@ -639,11 +639,11 @@ class FrameworkApplication:
             short_returns.columns = \
                 short_returns.columns.set_levels(short_returns.columns.levels[-1].str.lower(), level=1)
             long_returns = long_returns.mul(long_vrp.loc[long_returns.index]).mul(
-                signal_filter_long.loc[long_returns.index])
+                signal_filter_long.loc[long_returns.index]).apply(lambda x: x.interpolate(method='time'))
             long_vrp.loc[long_returns.index].mul(signal_filter_long.loc[long_returns.index])
             short_returns = \
                 short_returns.mul(short_returns.loc[long_returns.index]).mul(
-                    signal_filter_short.loc[short_returns.index])
+                    signal_filter_short.loc[short_returns.index]).apply(lambda x: x.interpolate(method='time'))
             returns = long_returns.add(short_returns)
             returns = returns.loc[~returns.index.duplicated(), :]
             atm = option_chain_data[['underlying_name', 'atm']].groupby(['underlying_name',
