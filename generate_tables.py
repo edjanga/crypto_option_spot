@@ -907,16 +907,16 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Feature importance
     ####################################################################################################################
-    if best_market == 1:
-        if os.path.exists(f'{args.target_path}/option_features.csv'):
-            option_features = pd.read_csv(f'{args.target_path}/option_features.csv')
-        else:
-            option_features = pd.read_sql(con=framework_application_obj.db_connect,
-                                          sql='SELECT * FROM option_features;')
-        option_features['timestamp'] = pd.to_datetime(option_features['timestamp'], utc=pytz.UTC)
-        option_features = pd.pivot(option_features, index=['underlying_name', 'timestamp'], columns='features',
-                                   values='features_values')
-        features = features.join(option_features)
+    # if best_market == 1:
+    if os.path.exists(f'{args.target_path}/option_features.csv'):
+        option_features = pd.read_csv(f'{args.target_path}/option_features.csv')
+    else:
+        option_features = pd.read_sql(con=framework_application_obj.db_connect,
+                                      sql='SELECT * FROM option_features;')
+    option_features['timestamp'] = pd.to_datetime(option_features['timestamp'], utc=pytz.UTC)
+    option_features = pd.pivot(option_features, index=['underlying_name', 'timestamp'], columns='features',
+                               values='features_values')
+    features = features.join(option_features)
     if os.path.exists(f'{args.target_path}/features_importance.csv'):
         feature_importance = pd.read_csv(f'{args.target_path}/features_importance.csv')
         feature_importance = \
@@ -952,7 +952,7 @@ if __name__ == '__main__':
         feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
                                                         regex=True)
     feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
-    if os.path.exists(f'{args.target_path}/features_importance.csv'):
+    if os.path.exists(f'{args.target_path}/forecasts.csv'):
         chunks = pd.read_csv(f'{args.target_path}/forecasts.csv', chunksize=1_000_000)
         data = pd.concat(chunk.query('regression == @best_model_tags[0].lower() and freq == @best_model_tags[-1] '
                                      'and market == @best_market') for chunk in chunks)
