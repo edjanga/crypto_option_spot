@@ -24,7 +24,6 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import statsmodels.api as sm
 
 
-
 DEVICE = 'cpu'
 if torch.backends.mps.is_available():
     DEVICE = 'mps'
@@ -59,7 +58,7 @@ def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
                                                                                                   append=True)
     X['P&L'] = X['P&L'] + np.random.uniform(0, 1e-8, X.shape[0])
     X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
-    X = (X - X.min()).div(X.max() - X.min())
+    X = (X - X.min()).div(X.max() - X.min()).replace([-np.inf, np.inf], np.nan).dropna()
     params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
     params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
     return params
