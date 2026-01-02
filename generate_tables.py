@@ -914,8 +914,8 @@ if __name__ == '__main__':
         option_features = pd.read_sql(con=framework_application_obj.db_connect,
                                       sql='SELECT * FROM option_features;')
     option_features['timestamp'] = pd.to_datetime(option_features['timestamp'], utc=pytz.UTC)
-    option_features = pd.pivot(option_features, index=['underlying_name', 'timestamp'], columns='features',
-                               values='features_values')
+    option_features = pd.pivot_table(option_features, index=['underlying_name', 'timestamp'], columns='features',
+                                     values='features_values')
     features = features.join(option_features)
     if os.path.exists(f'{args.target_path}/features_importance.csv'):
         feature_importance = pd.read_csv(f'{args.target_path}/features_importance.csv')
