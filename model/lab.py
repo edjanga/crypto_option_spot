@@ -518,7 +518,7 @@ class PnLExplained:
         tail_analysis = tail_analysis.reset_index([0, 1, 3, 4]).join(rv_mkt)
         tail_analysis = tail_analysis.groupby(
             by=[pd.Grouper(key='P&L decile'), pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
-                pd.Grouper(key='target'), pd.Grouper(key='aggregated')]).apply(
+                pd.Grouper(key='target'), pd.Grouper(key='aggregated')], group_keys=True).apply(
             lambda x, ranking, data, targets: run_pnl_decile_ols(x, ranking, data, targets),
             ranking=ranking, data=features, targets=targets).unstack().dropna()
         return factor_analysis, tail_analysis
