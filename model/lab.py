@@ -72,7 +72,10 @@ def run_pnl_decile_ols(x, ranking, data, targets) -> pd.Series:
                                                        level=1).filter(regex='|'.join(list_factors))
     if not target.empty:
         pdb.set_trace()
-    x = x.drop(['aggregated', 'target', 'D', 'volatility_regime', 'P&L decile'], axis=1)
+    try:
+        x = x.drop(['aggregated', 'target', 'D', 'volatility_regime', 'P&L decile'], axis=1)
+    except KeyError:
+        pdb.set_trace()
     X = x.set_index('underlying_name', append=True).swaplevel(0, 1).join(data, on=['underlying_name', 'timestamp'])
     X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
     X = X.groupby(by=[pd.Grouper(level='underlying_name')], group_keys=False).apply(
