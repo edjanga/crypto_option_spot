@@ -1044,7 +1044,7 @@ if __name__ == '__main__':
             ['underlying_name', 'D', 'timestamp'])).join(
             tmp_svix, on=['D', 'timestamp'] if aggregated else ['underlying_name', 'D', 'timestamp']).join(
             vrp.xs(int(aggregated), axis=0, level=0), on=['underlying_name', 'D', 'timestamp']).dropna()
-        vrp_svix = vrp_svix.loc[:, ['$\\text{Crypto SVIX}_{0 \\rightarrow D}$','$\\text{VRP}_{0 \\rightarrow D}$',
+        vrp_svix = vrp_svix.loc[:, ['$\\text{Crypto SVIX}_{0 \\rightarrow D}$', '$\\text{VRP}_{0 \\rightarrow D}$',
                                     '$\\text{returns}_{0 \\rightarrow D}$']]
         vrp_svix = \
             vrp_svix.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1)],
@@ -1098,9 +1098,9 @@ pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='repl
 print(f'[Insertion]: P&L has been inserted into the database.')
 trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: Trading volume has been inserted into the database.')
-factor_analysis, tail_analysis = \
-    pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
-                                   ranking=feature_importance_ranking, targets=data.xs('values', level=0, axis=1))
+factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
+                                                 ranking=feature_importance_ranking, targets=data.xs('values',
+                                                                                                     level=0, axis=1))
 factor_analysis.to_sql(name='factor_analysis', con=framework_application_obj.db_connect, if_exists='replace',
                        index=True)
 print(f'[Insertion]: Factor analysis has been inserted into the database.')
