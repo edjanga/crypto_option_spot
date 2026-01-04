@@ -1104,5 +1104,5 @@ factor_analysis, tail_analysis = \
 factor_analysis.to_sql(name='factor_analysis', con=framework_application_obj.db_connect, if_exists='replace',
                        index=True)
 print(f'[Insertion]: Factor analysis has been inserted into the database.')
-tail_analysis.to_sql(name='tail_analysis', con=framework_application_obj.db_connect, if_exists='replace', index=True)
-print(f'[Insertion]: Tail analysis has been inserted into the database.')
+# tail_analysis.to_sql(name='tail_analysis', con=framework_application_obj.db_connect, if_exists='replace', index=True)
+# print(f'[Insertion]: Tail analysis has been inserted into the database.')

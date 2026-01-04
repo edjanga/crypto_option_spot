@@ -64,25 +64,25 @@ def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
     return params
 
 
-def run_pnl_decile_ols(x, ranking, data, targets) -> pd.Series:
-    ranking = ranking.query(f'(volatility_regime == "{x.name[1]}") & (D == "{x.name[2]}") & (target == "{x.name[3]}")')
-    list_factors = ranking.features.unique().tolist()
-    data = data.filter(regex='|'.join(list_factors))
-    target = targets.xs(x.name[3], axis=1, level=1).xs(x.name[2].upper(), axis=1,
-                                                       level=1).filter(regex='|'.join(list_factors))
-    if not target.empty:
-        pdb.set_trace()
-    try:
-        x = x.drop(['aggregated', 'target', 'D', 'volatility_regime', 'P&L decile'], axis=1)
-    except KeyError:
-        pdb.set_trace()
-    X = x.set_index('underlying_name', append=True).swaplevel(0, 1).join(data, on=['underlying_name', 'timestamp'])
-    X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
-    X = X.groupby(by=[pd.Grouper(level='underlying_name')], group_keys=False).apply(
-        lambda x: (x - x.min()).div(x.max() - x.min())).dropna()
-    params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
-    params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
-    return params
+# def run_pnl_decile_ols(x, ranking, data, targets) -> pd.Series:
+#     ranking = ranking.query(f'(volatility_regime == "{x.name[1]}") & (D == "{x.name[2]}") & (target == "{x.name[3]}")')
+#     list_factors = ranking.features.unique().tolist()
+#     data = data.filter(regex='|'.join(list_factors))
+#     target = targets.xs(x.name[3], axis=1, level=1).xs(x.name[2].upper(), axis=1,
+#                                                        level=1).filter(regex='|'.join(list_factors))
+#     if not target.empty:
+#         pdb.set_trace()
+#     try:
+#         x = x.drop(['aggregated', 'target', 'D', 'volatility_regime', 'P&L decile'], axis=1)
+#     except KeyError:
+#         pdb.set_trace()
+#     X = x.set_index('underlying_name', append=True).swaplevel(0, 1).join(data, on=['underlying_name', 'timestamp'])
+#     X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
+#     X = X.groupby(by=[pd.Grouper(level='underlying_name')], group_keys=False).apply(
+#         lambda x: (x - x.min()).div(x.max() - x.min())).dropna()
+#     params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
+#     params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
+#     return params
 
 
 class FeatureBuilder:
@@ -508,20 +508,21 @@ class PnLExplained:
                                           group_keys=True).apply(
             lambda x, data, targets, pnl: run_pnl_ols(x, data, targets, pnl), data=features,
             targets=targets.xs('1D', axis=1, level=-1), pnl=pnl).unstack()
-        tail_analysis = pnl.stack([0, 1])
-        tail_analysis.name = 'P&L'
-        tail_analysis = pd.DataFrame(tail_analysis)
-        tail_analysis['P&L'] = tail_analysis['P&L']+np.random.uniform(0, 1e-8, tail_analysis.shape[0])
-        tail_analysis['P&L decile'] = \
-            tail_analysis.groupby(by=[pd.Grouper(level='target')], group_keys=False)['P&L'].apply(
-                lambda x: pd.qcut(x, q=10, labels=list(range(1, 11))))
-        tail_analysis = tail_analysis.reset_index([0, 1, 3, 4]).join(rv_mkt)
-        tail_analysis = tail_analysis.groupby(
-            by=[pd.Grouper(key='P&L decile'), pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
-                pd.Grouper(key='target'), pd.Grouper(key='aggregated')], group_keys=True).apply(
-            lambda x, ranking, data, targets: run_pnl_decile_ols(x, ranking, data, targets),
-            ranking=ranking, data=features, targets=targets).unstack().dropna()
-        return factor_analysis, tail_analysis
+        return factor_analysis
+        # tail_analysis = pnl.stack([0, 1])
+        # tail_analysis.name = 'P&L'
+        # tail_analysis = pd.DataFrame(tail_analysis)
+        # tail_analysis['P&L'] = tail_analysis['P&L']+np.random.uniform(0, 1e-8, tail_analysis.shape[0])
+        # tail_analysis['P&L decile'] = \
+        #     tail_analysis.groupby(by=[pd.Grouper(level='target')], group_keys=False)['P&L'].apply(
+        #         lambda x: pd.qcut(x, q=10, labels=list(range(1, 11))))
+        # tail_analysis = tail_analysis.reset_index([0, 1, 3, 4]).join(rv_mkt)
+        # tail_analysis = tail_analysis.groupby(
+        #     by=[pd.Grouper(key='P&L decile'), pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
+        #         pd.Grouper(key='target'), pd.Grouper(key='aggregated')], group_keys=True).apply(
+        #     lambda x, ranking, data, targets: run_pnl_decile_ols(x, ranking, data, targets),
+        #     ranking=ranking, data=features, targets=targets).unstack().dropna()
+        # return factor_analysis, tail_analysis
 
 
 
