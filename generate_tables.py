@@ -410,8 +410,7 @@ def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
                 shuffle_single_feature(data[['$\\text{VRP}_{0 \\rightarrow D}$',
                                              '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']], feature)
             tmp['returns_hat'] = \
-                model.fit(shuffled_test,
-                          data['$\\text{returns}_{0 \\rightarrow D}$']).predict(shuffled_test)
+                model.fit(shuffled_test, data['$\\text{returns}_{0 \\rightarrow D}$']).predict(shuffled_test)
             feature_importance[feature] += \
             ((tmp.diff(axis=1).iloc[:, -1] / avg1s.values[0]).abs()).groupby(by=pd.Grouper(level=0)).mean().values[0]
         count += 1
@@ -790,7 +789,7 @@ class FrameworkApplication:
         return pnl
 
     @property
-    def db_connect(self):
+    def db_connect(self) -> sqlite3.Connection:
         return self._db_connect
 
 
@@ -910,7 +909,6 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Feature importance
     ####################################################################################################################
-    # if best_market == 1:
     if os.path.exists(f'{args.target_path}/option_features.csv'):
         option_features = pd.read_csv(f'{args.target_path}/option_features.csv')
     else:
@@ -1113,7 +1111,7 @@ idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['1d', '1w', '1m'])
 sharpe = sharpe_mean.div(sharpe_std).mul(np.sqrt(360)).loc[idx, pairs_order.categories]
 sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
                                                pd.Grouper(level=2, freq='1D')]).mean().stack().stack()
-volatility_regime.index = volatility_regime.index.set_levels(volatility_regime.index.levels[-1].str.lower(), level=0)
+volatility_regime.index = volatility_regime.index.set_levels(volatility_regime.index.levels[0].str.lower(), level=0)
 sharpe_per_volatility_regime = \
     pd.DataFrame(sharpe_per_volatility_regime.rename('P&L')).join(volatility_regime, on=['D', 'timestamp'])
 idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m']))
