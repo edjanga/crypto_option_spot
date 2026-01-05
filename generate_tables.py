@@ -1109,7 +1109,7 @@ sharpe_std = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Groupe
     by=[pd.Grouper(level=0), pd.Grouper(level=1)]).std().stack()
 idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['1d', '1w', '1m']))
                                 + list(product([''], ['returns'], ['1d', '1w', '1m'])),
-                                names=['aggregated', 'target', 'volatility_regime', 'D'])
+                                names=['aggregated', 'target', 'D'])
 sharpe = sharpe_mean.div(sharpe_std).mul(np.sqrt(360)).loc[idx, pairs_order.categories]
 sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
                                                pd.Grouper(level=2, freq='1D')]).mean().stack().stack()
