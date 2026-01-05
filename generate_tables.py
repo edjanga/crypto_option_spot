@@ -1103,19 +1103,22 @@ trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_co
 print(f'[Insertion]: Trading volume has been inserted into the database.')
 
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
-idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m']))
-                                + list(product([''], ['returns'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m'])),
-                                names=['aggregated', 'target', 'volatility_regime', 'D'])
 sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
     by=[pd.Grouper(level=0), pd.Grouper(level=1)]).mean().stack()
 sharpe_std = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
     by=[pd.Grouper(level=0), pd.Grouper(level=1)]).std().stack()
+idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['1d', '1w', '1m']))
+                                + list(product([''], ['returns'], ['1d', '1w', '1m'])),
+                                names=['aggregated', 'target', 'volatility_regime', 'D'])
 sharpe = sharpe_mean.div(sharpe_std).mul(np.sqrt(360)).loc[idx, pairs_order.categories]
 sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
                                                pd.Grouper(level=2, freq='1D')]).mean().stack().stack()
 volatility_regime.index = volatility_regime.index.set_levels(volatility_regime.index.levels[-1].str.lower(), level=0)
 sharpe_per_volatility_regime = \
     pd.DataFrame(sharpe_per_volatility_regime.rename('P&L')).join(volatility_regime, on=['D', 'timestamp'])
+idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m']))
+                                + list(product([''], ['returns'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m'])),
+                                names=['aggregated', 'target', 'volatility_regime', 'D'])
 sharpe_per_volatility_regime = \
     sharpe_per_volatility_regime.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=4),
                                              pd.Grouper(level=3), pd.Grouper(level=-1)]).apply(
