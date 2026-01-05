@@ -817,6 +817,9 @@ if __name__ == '__main__':
                                      underlying_returns=framework_application_obj.underlying_returns)
     top_features = args.top_features
     rv_mkt = framework_application_obj.underlying_rv.set_index('timestamp').stack().swaplevel(0, 1)
+    df_idx = rv_mkt.index.to_frame()
+    df_idx['timestamp'] = df_idx['timestamp'].astype('datetime64[ns, UTC]')
+    rv_mkt.index = pd.MultiIndex.from_frame(df_idx)
     rv_mkt = \
         pd.concat([pd.DataFrame(rv_mkt.groupby(
             by=[pd.Grouper(level=0),
@@ -1071,7 +1074,7 @@ vrp_svix_aggregated = vrp_svix_aggregated.loc[list(product([0, 1], d_order.categ
 with open(f'{args.target_path}/crypto_option_spot/vrp_svix.txt', 'w') as vrp_svix_file:
     vrp_svix_file.writelines(vrp_svix_aggregated.to_latex(escape=False))
 ########################################################################################################################
-## Backtesting + P&L Attribution analysis
+## Backtesting (P&L + Sharpe Ratio) + P&L Attribution analysis
 ########################################################################################################################
 pnl_dd = dict()
 trading_volume_dd = dict()
@@ -1098,8 +1101,29 @@ pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='repl
 print(f'[Insertion]: P&L has been inserted into the database.')
 trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: Trading volume has been inserted into the database.')
+
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
-sharpe = (daily_pnl.mean() / daily_pnl.std())
+idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m']))
+                                + list(product([''], ['returns'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m'])),
+                                names=['aggregated', 'target', 'volatility_regime', 'D'])
+sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
+    by=[pd.Grouper(level=0), pd.Grouper(level=1)]).mean().stack()
+sharpe_std = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
+    by=[pd.Grouper(level=0), pd.Grouper(level=1)]).std().stack()
+sharpe = sharpe_mean.div(sharpe_std).mul(np.sqrt(360)).loc[idx, pairs_order.categories]
+sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
+                                               pd.Grouper(level=2, freq='1D')]).mean().stack().stack()
+volatility_regime.index = volatility_regime.index.set_levels(volatility_regime.index.levels[-1].str.lower(), level=0)
+sharpe_per_volatility_regime = \
+    pd.DataFrame(sharpe_per_volatility_regime.rename('P&L')).join(volatility_regime, on=['D', 'timestamp'])
+sharpe_per_volatility_regime = \
+    sharpe_per_volatility_regime.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=4),
+                                             pd.Grouper(level=3), pd.Grouper(level=-1)]).apply(
+        lambda x: x['P&L'].mean()/x['P&L'].std()).mul(np.sqrt(360))
+sharpe_per_volatility_regime = \
+    sharpe_per_volatility_regime.swaplevel(-1, -3).unstack().loc[idx, pairs_order.categories]
+
+
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                                  ranking=feature_importance_ranking, targets=data.xs('values',
                                                                                                      level=0, axis=1))
