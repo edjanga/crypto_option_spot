@@ -1098,6 +1098,8 @@ pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='repl
 print(f'[Insertion]: P&L has been inserted into the database.')
 trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: Trading volume has been inserted into the database.')
+daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
+sharpe = (daily_pnl.mean() / daily_pnl.std())
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                                  ranking=feature_importance_ranking, targets=data.xs('values',
                                                                                                      level=0, axis=1))
