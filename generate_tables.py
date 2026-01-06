@@ -1099,7 +1099,6 @@ pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='repl
 print(f'[Insertion]: P&L has been inserted into the database.')
 trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: Trading volume has been inserted into the database.')
-
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
 sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
     by=[pd.Grouper(level=0), pd.Grouper(level=1)]).mean().stack()
@@ -1108,28 +1107,56 @@ sharpe_std = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Groupe
 idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['1d', '1w', '1m']))
                                 + list(product([''], ['returns'], ['1d', '1w', '1m'])),
                                 names=['aggregated', 'target', 'D'])
-sharpe = sharpe_mean.div(sharpe_std).mul(np.sqrt(360)).loc[idx, pairs_order.categories]
+sharpe = sharpe_mean.div(sharpe_std.replace(0, np.nan)).mul(np.sqrt(360)).loc[idx, pairs_order.categories]
+for aggregated in [False, True]:
+    if aggregated:
+        tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([0, '']), :].droplevel(axis=0, level=0)
+    else:
+        tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
+    with open(f'{args.target_path}/crypto_option_spot/'
+              f'sharpe{dict[(False, ""), (True, "_aggregated")][aggregated]}.txt', 'w') as sharpe_file:
+        sharpe_file.writelines(tmp_sharpe.to_latex(escape=False))
+os.listdir(f'{args.target_path}/crypto_option_spot')
 sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
                                                pd.Grouper(level=2, freq='1D')]).mean().stack().stack()
 volatility_regime.index = volatility_regime.index.set_levels(volatility_regime.index.levels[0].str.lower(), level=0)
 sharpe_per_volatility_regime = \
-    pd.DataFrame(sharpe_per_volatility_regime.rename('P&L')).join(volatility_regime, on=['D', 'timestamp'])
+    pd.merge_asof(pd.DataFrame(sharpe_per_volatility_regime.rename('P&L')).reset_index().sort_values('timestamp'),
+                  volatility_regime.reset_index().sort_values('timestamp'), on='timestamp', by='D')
+sharpe_per_volatility_regime['volatility_regime'] = sharpe_per_volatility_regime['volatility_regime'].astype('str')
+sharpe_per_volatility_regime_mean = \
+    sharpe_per_volatility_regime.groupby(by=[pd.Grouper(key='aggregated'), pd.Grouper(key='target'),
+                                         pd.Grouper(key='underlying_name'), pd.Grouper(key='D'),
+                                         pd.Grouper(key='volatility_regime')])[['P&L']].mean()
+sharpe_per_volatility_regime_std = \
+    sharpe_per_volatility_regime.groupby(by=[pd.Grouper(key='aggregated'), pd.Grouper(key='target'),
+                                         pd.Grouper(key='underlying_name'), pd.Grouper(key='D'),
+                                         pd.Grouper(key='volatility_regime')])[['P&L']].std()
+sharpe_per_volatility_regime = \
+    sharpe_per_volatility_regime_mean.div(
+        sharpe_per_volatility_regime_std.replace(0, np.nan)).mul(np.sqrt(360)).swaplevel(-1, -3).unstack()
 idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m']))
                                 + list(product([''], ['returns'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m'])),
                                 names=['aggregated', 'target', 'volatility_regime', 'D'])
 sharpe_per_volatility_regime = \
-    sharpe_per_volatility_regime.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=4),
-                                             pd.Grouper(level=3), pd.Grouper(level=-1)]).apply(
-        lambda x: x['P&L'].mean()/x['P&L'].std()).mul(np.sqrt(360))
-sharpe_per_volatility_regime = \
     sharpe_per_volatility_regime.swaplevel(-1, -3).unstack().loc[idx, pairs_order.categories]
-
-
+sharpe_per_volatility_regime = sharpe_per_volatility_regime.droplevel(axis=1, level=0).loc[idx, pairs_order.categories]
+for aggregated in [False, True]:
+    if aggregated:
+        tmp_sharpe_per_volatility_regime = \
+            sharpe_per_volatility_regime.loc[
+            sharpe_per_volatility_regime.index.get_level_values(0).isin([0, '']), :].droplevel(axis=0, level=0)
+    else:
+        tmp_sharpe_per_volatility_regime = \
+            sharpe_per_volatility_regime.loc[
+            sharpe_per_volatility_regime.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
+    with open(f'{args.target_path}/crypto_option_spot/'
+              f'sharpe_per_volatility{dict[(False, ""), (True, "_aggregated")][aggregated]}.txt', 'w') as \
+            sharpe_per_volatility_file:
+        sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex(escape=False))
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                                  ranking=feature_importance_ranking, targets=data.xs('values',
                                                                                                      level=0, axis=1))
 factor_analysis.to_sql(name='factor_analysis', con=framework_application_obj.db_connect, if_exists='replace',
                        index=True)
 print(f'[Insertion]: Factor analysis has been inserted into the database.')
-# tail_analysis.to_sql(name='tail_analysis', con=framework_application_obj.db_connect, if_exists='replace', index=True)
-# print(f'[Insertion]: Tail analysis has been inserted into the database.')
