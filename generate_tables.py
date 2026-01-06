@@ -1138,8 +1138,7 @@ sharpe_per_volatility_regime = \
 idx = pd.MultiIndex.from_tuples(list(product([0, 1], ['RV'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m']))
                                 + list(product([''], ['returns'], ['Low', 'Normal', 'High'], ['1d', '1w', '1m'])),
                                 names=['aggregated', 'target', 'volatility_regime', 'D'])
-sharpe_per_volatility_regime = \
-    sharpe_per_volatility_regime.swaplevel(-1, -3).unstack().loc[idx, pairs_order.categories]
+sharpe_per_volatility_regime = sharpe_per_volatility_regime.swaplevel(-1, -3).unstack()
 sharpe_per_volatility_regime = sharpe_per_volatility_regime.droplevel(axis=1, level=0).loc[idx, pairs_order.categories]
 for aggregated in [False, True]:
     if aggregated:
