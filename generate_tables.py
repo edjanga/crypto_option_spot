@@ -1114,7 +1114,7 @@ for aggregated in [False, True]:
     else:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
     with open(f'{args.target_path}/crypto_option_spot/'
-              f'sharpe{dict[(False, ""), (True, "_aggregated")][aggregated]}.txt', 'w') as sharpe_file:
+              f'sharpe{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as sharpe_file:
         sharpe_file.writelines(tmp_sharpe.to_latex(escape=False))
 os.listdir(f'{args.target_path}/crypto_option_spot')
 sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
@@ -1151,7 +1151,7 @@ for aggregated in [False, True]:
             sharpe_per_volatility_regime.loc[
             sharpe_per_volatility_regime.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
     with open(f'{args.target_path}/crypto_option_spot/'
-              f'sharpe_per_volatility{dict[(False, ""), (True, "_aggregated")][aggregated]}.txt', 'w') as \
+              f'sharpe_per_volatility{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as \
             sharpe_per_volatility_file:
         sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex(escape=False))
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
