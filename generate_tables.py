@@ -1094,6 +1094,7 @@ for target in ['RV', 'returns']:
 pnl = pd.concat(pnl_dd)
 trading_volume = pd.concat(trading_volume_dd)
 pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
+pnl.to_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
 trading_volume.index = trading_volume.index.set_names(['aggregated', 'target', 'timestamp'])
 pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: P&L has been inserted into the database.')
@@ -1154,6 +1155,7 @@ for aggregated in [False, True]:
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                                  ranking=feature_importance_ranking, targets=data.xs('values',
                                                                                                      level=0, axis=1))
+pnl.to_csv(f'{args.target_path}/crypto_option_spot/factor_analysis.csv')
 factor_analysis.to_sql(name='factor_analysis', con=framework_application_obj.db_connect, if_exists='replace',
                        index=True)
 print(f'[Insertion]: Factor analysis has been inserted into the database.')
