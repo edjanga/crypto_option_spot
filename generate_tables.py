@@ -1114,7 +1114,7 @@ for aggregated in [False, True]:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([0, '']), :].droplevel(axis=0, level=0)
     else:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
-    tmp_sharpe = tmp_sharpe.round(2).where(tmp_sharpe.values <= 0, tmp_sharpe.map(lambda x: f'\\textbf{{{x}}}'))
+    tmp_sharpe = tmp_sharpe.round(2).where(tmp_sharpe.values <= 0, tmp_sharpe.map(lambda x: f'$\\mathbf{{{x}}}$'))
     tmp_sharpe = tmp_sharpe.where(tmp_sharpe.values >= 0, tmp_sharpe.map(lambda x: f'${x}$'))
     with open(f'{args.target_path}/crypto_option_spot/'
               f'sharpe{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as sharpe_file:
@@ -1153,7 +1153,7 @@ for aggregated in [False, True]:
     tmp_sharpe_per_volatility_regime = \
         tmp_sharpe_per_volatility_regime.round(2).where(
             tmp_sharpe_per_volatility_regime.values <= 0,
-            tmp_sharpe_per_volatility_regime.map(lambda x: f'\\textbf{{{x}}}'))
+            tmp_sharpe_per_volatility_regime.map(lambda x: f'$\\mathbf{{{x}}}$'))
     tmp_sharpe_per_volatility_regime = \
         tmp_sharpe_per_volatility_regime.where(tmp_sharpe_per_volatility_regime.values >= 0,
                                                tmp_sharpe_per_volatility_regime.map(lambda x: f'${x}$'))
