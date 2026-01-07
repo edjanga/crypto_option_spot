@@ -1114,9 +1114,11 @@ for aggregated in [False, True]:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([0, '']), :].droplevel(axis=0, level=0)
     else:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
+    tmp_sharpe = tmp_sharpe.round(2).where(tmp_sharpe.values <= 0, tmp_sharpe.map(lambda x: f'\\textbf{{{x}}}'))
+    tmp_sharpe = tmp_sharpe.where(tmp_sharpe.values >= 0, tmp_sharpe.map(lambda x: f'${x}$'))
     with open(f'{args.target_path}/crypto_option_spot/'
               f'sharpe{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as sharpe_file:
-        sharpe_file.writelines(tmp_sharpe.to_latex(escape=False))
+        sharpe_file.writelines(tmp_sharpe.to_latex(escape=False, float_format='%.2f'))
 sharpe_per_volatility_regime = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1),
                                                pd.Grouper(level=2, freq='1D')]).mean().stack().stack()
 volatility_regime.index = volatility_regime.index.set_levels(volatility_regime.index.levels[0].str.lower(), level=0)
@@ -1148,14 +1150,22 @@ for aggregated in [False, True]:
         tmp_sharpe_per_volatility_regime = \
             sharpe_per_volatility_regime.loc[
             sharpe_per_volatility_regime.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
+    tmp_sharpe_per_volatility_regime = \
+        tmp_sharpe_per_volatility_regime.round(2).where(
+            tmp_sharpe_per_volatility_regime.values <= 0,
+            tmp_sharpe_per_volatility_regime.map(lambda x: f'\\textbf{{{x}}}'))
+    tmp_sharpe_per_volatility_regime = \
+        tmp_sharpe_per_volatility_regime.where(tmp_sharpe_per_volatility_regime.values >= 0,
+                                               tmp_sharpe_per_volatility_regime.map(lambda x: f'${x}$'))
     with open(f'{args.target_path}/crypto_option_spot/'
               f'sharpe_per_volatility{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as \
             sharpe_per_volatility_file:
-        sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex(escape=False))
+        sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex(escape=False,
+                                                                                        float_format='%.2f'))
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                                  ranking=feature_importance_ranking, targets=data.xs('values',
                                                                                                      level=0, axis=1))
-pnl.to_csv(f'{args.target_path}/crypto_option_spot/factor_analysis.csv')
+factor_analysis.to_csv(f'{args.target_path}/crypto_option_spot/factor_analysis.csv')
 factor_analysis.to_sql(name='factor_analysis', con=framework_application_obj.db_connect, if_exists='replace',
                        index=True)
 print(f'[Insertion]: Factor analysis has been inserted into the database.')
