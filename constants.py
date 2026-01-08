@@ -15,7 +15,7 @@ zeroDTE, SHORT, MID = 1/360, 7/360, 30/360
 MATURITY_BINS = [-np.inf, zeroDTE, SHORT, MID, np.inf]
 MATURITY_LABELS = ['0DTE', 'Short', 'Mid', 'Long']
 DOTM, OTM, ITM, DITM = .85, .95, 1.05, 1.15
-MONEYNESS_BINS = [DOTM, OTM, ITM, DITM] #np.finfo(np.float64).min, ,np.finfo(np.float64).max
+MONEYNESS_BINS = [DOTM, OTM, ITM, DITM]
 MONEYNESS_BINS[1:-1] = list(map(lambda x: np.log(x), MONEYNESS_BINS[1:-1]))
 LABELS = ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM']
 SUPERSCRIPT = {1: 'st', 2: 'nd', 3: 'rd'}
@@ -33,8 +33,10 @@ VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for LSTM
-PARAMS_LSTM = {'hidden_size': [2**n for n in range(1, 4)], 'num_layers': [1],
-               'learning_rate': [0.01, 0.05, 0.1], 'beta': list(np.linspace(0, 1, 11)), 'dropout': [.1, .2]}
+# PARAMS_LSTM = {'hidden_size': [2**n for n in range(1, 4)], 'num_layers': [1],
+#                'learning_rate': [0.01, 0.05, 0.1], 'beta': list(np.linspace(0, 1, 11)), 'dropout': [.1, .2]}
+PARAMS_LSTM = {'hidden_size': [16, 32, 64], 'num_layers': [1, 2], 'learning_rate': [0.001, 0.005, 0.01],
+               'dropout': [0.0, 0.1, 0.2]}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 # Font sizes for plots
 TITLE_FONT_SIZE = 40
