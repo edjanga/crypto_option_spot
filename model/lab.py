@@ -363,8 +363,8 @@ class LSTMRegressor(Regressor):
             print(f'Parameters: {params}')
             model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
                               num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-                              beta=params['beta'], feature_names=train_X.columns.tolist(), positiveness=positiveness,
-                              dropout=params['dropout'])
+                              feature_names=train_X.columns.tolist(), positiveness=positiveness,
+                              dropout=params['dropout']) #beta=params['beta'],
             trainer = \
                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
@@ -509,20 +509,6 @@ class PnLExplained:
             lambda x, data, targets, pnl: run_pnl_ols(x, data, targets, pnl), data=features,
             targets=targets.xs('1D', axis=1, level=-1), pnl=pnl).unstack()
         return factor_analysis
-        # tail_analysis = pnl.stack([0, 1])
-        # tail_analysis.name = 'P&L'
-        # tail_analysis = pd.DataFrame(tail_analysis)
-        # tail_analysis['P&L'] = tail_analysis['P&L']+np.random.uniform(0, 1e-8, tail_analysis.shape[0])
-        # tail_analysis['P&L decile'] = \
-        #     tail_analysis.groupby(by=[pd.Grouper(level='target')], group_keys=False)['P&L'].apply(
-        #         lambda x: pd.qcut(x, q=10, labels=list(range(1, 11))))
-        # tail_analysis = tail_analysis.reset_index([0, 1, 3, 4]).join(rv_mkt)
-        # tail_analysis = tail_analysis.groupby(
-        #     by=[pd.Grouper(key='P&L decile'), pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
-        #         pd.Grouper(key='target'), pd.Grouper(key='aggregated')], group_keys=True).apply(
-        #     lambda x, ranking, data, targets: run_pnl_decile_ols(x, ranking, data, targets),
-        #     ranking=ranking, data=features, targets=targets).unstack().dropna()
-        # return factor_analysis, tail_analysis
 
 
 

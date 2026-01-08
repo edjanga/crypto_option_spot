@@ -24,13 +24,13 @@ class TimeSeriesDataset(Dataset):
 
 class LSTMModel(p_light.LightningModule):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, learning_rate: float,
-                 feature_names: List[str], dropout: float, beta: float = None, output_size: int = 1,
-                 positiveness: bool = False):
+                 feature_names: List[str], dropout: float, output_size: int = 1,
+                 positiveness: bool = False): #beta: float = None,
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.learning_rate = learning_rate
-        self.beta = beta
+        # self.beta = beta
         self.positiveness = positiveness
         self.feature_names = feature_names
         self.dropout = dropout
@@ -56,7 +56,7 @@ class LSTMModel(p_light.LightningModule):
         out = self.layer_norm(out)
         out = self.fc(out)
         if self.positiveness:
-            out = F.softplus(out, beta=self.beta)
+            out = F.softplus(out) #, beta=self.beta
         return out.squeeze(-1)
 
     def training_step(self, batch, batch_idx):
@@ -79,6 +79,6 @@ class LSTMModel(p_light.LightningModule):
 
     def configure_optimizers(self) -> dict:
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
         return {'optimizer': optimizer,
                 'lr_scheduler': {'scheduler': scheduler, 'monitor': 'valid_loss', 'interval': 'epoch', 'frequency': 1}}
