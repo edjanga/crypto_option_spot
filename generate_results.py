@@ -1,9 +1,6 @@
 import argparse
 import itertools
 import os
-import pdb
-import time
-
 import pytz
 import sqlite3
 from constants import *
@@ -12,7 +9,7 @@ from model.lab import FeatureBuilder, LassoRegressor, BoostingRegressor, LSTMReg
     ElasticRegressor
 from dateutil.relativedelta import relativedelta
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
@@ -106,7 +103,8 @@ if __name__ == '__main__':
     for D, freq, options in itertools.product(['1D', '1W', '1M'], ['15min', '30min', '1h'], [0, 1]):
         models = pd.Series(data=np.nan, index=dates)
         features_importance = dict()
-        minmax_scaler = dict([(symbol, MinMaxScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
+        # minmax_scaler = dict([(symbol, MinMaxScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
+        minmax_scaler = dict([(symbol, StandardScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
         features_names = LAGS[LAGS.index(freq):LAGS.index(D) + 1]+[args.target]+\
                          ['is_BTCUSDT', 'is_ETHUSDT', 'is_BNBUSDT', 'is_SOLUSDT', 'is_XRPUSDT']
         features_names = f'{"|".join(features_names)}'
