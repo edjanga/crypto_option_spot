@@ -1,17 +1,19 @@
 import argparse
 import itertools
 import os
+import pdb
+import time
 import pytz
 import sqlite3
 from constants import *
 import pandas as pd
-from model.lab import FeatureBuilder, LassoRegressor, BoostingRegressor, LSTMRegressor, PermutationFeatureImportance, \
-    ElasticRegressor
+from model.lab import FeatureBuilder, LassoRegressor, ElasticRegressor, BoostingRegressor, GRURegressor, LSTMRegressor,\
+    PermutationFeatureImportance
 from dateutil.relativedelta import relativedelta
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), LSTMRegressor()]
+models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), GRURegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
 LAGS = INTRADAY_LAGS+INTERDAY_LAGS
 
@@ -103,8 +105,6 @@ if __name__ == '__main__':
     for D, freq, options in itertools.product(['1D', '1W', '1M'], ['15min', '30min', '1h'], [0, 1]):
         models = pd.Series(data=np.nan, index=dates)
         features_importance = dict()
-        # minmax_scaler = dict([(symbol, MinMaxScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
-        minmax_scaler = dict([(symbol, StandardScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
         features_names = LAGS[LAGS.index(freq):LAGS.index(D) + 1]+[args.target]+\
                          ['is_BTCUSDT', 'is_ETHUSDT', 'is_BNBUSDT', 'is_SOLUSDT', 'is_XRPUSDT']
         features_names = f'{"|".join(features_names)}'
@@ -115,11 +115,12 @@ if __name__ == '__main__':
                                    (features.index.get_level_values(1).date < date), :]
             train_y = train_X.pop(args.target)
             cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in BINARY_PATTERN)]
-            if args.regression in ['lasso', 'elastic', 'lstm']:
+            if args.regression in ['lasso', 'elastic']:
+                standard_scaler = dict([(symbol, StandardScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
                 for symbol in train_X.index.get_level_values(0).unique():
                     train_X.loc[train_X.index.get_level_values(0) == symbol,
                     ~train_X.columns.isin(cols_ignore_in_scaling)] = \
-                        minmax_scaler[symbol].fit_transform(train_X.xs(symbol, drop_level=False).loc[:,
+                        standard_scaler[symbol].fit_transform(train_X.xs(symbol, drop_level=False).loc[:,
                                                             ~train_X.columns.isin(cols_ignore_in_scaling)])
             study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
             if model.name in ['lasso', 'elastic', 'lightgbm']:
@@ -137,8 +138,9 @@ if __name__ == '__main__':
                                   n_trials=N_TRIALS//20, max_epochs=EPOCH, positiveness=args.target == 'RV',
                                   cols_ignore_in_scaling=cols_ignore_in_scaling)
                 models.loc[date] = model
+                standard_scaler = model.standardscaler
         models = models.ffill()
-        models = models.dropna().apply(lambda x: x.model) if args.regression == 'lstm' else models.dropna()
+        models = models.dropna().apply(lambda x: x.model) if args.regression in ['gru', 'lstm'] else models.dropna()
         models.index = pd.to_datetime(models.index, utc=pytz.UTC)
         ################################################################################################################
         ## Performance evaluation
@@ -152,42 +154,46 @@ if __name__ == '__main__':
             test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
                                   (features.index.get_level_values(1).date < end_date_forecast), :]
             test_y = test_X.pop(args.target)
-            if (D != '1D') & (model.name == 'lstm'):
-                ########################################################################################################
-                ## Fine-tuning
-                ########################################################################################################
-                fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0]
-                train_fine_tune_X = \
-                    features.loc[features.index.get_level_values(1).date == date - relativedelta(days=1), :].dropna()
-                train_fine_tune_y = train_fine_tune_X.pop(args.target)
-                for symbol in train_fine_tune_X.index.get_level_values(0).unique():
-                    train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
-                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
-                        minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
-                                                        ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
-                fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=1,
-                                                         train_fine_tune_y=train_fine_tune_y,
-                                                         model=fine_tuned_model, max_epochs=EPOCH//10, date=date,
-                                                         L=args.L, target=args.target)
-                models.loc[pd.to_datetime(date, utc=pytz.UTC)] = fine_tuned_model
-                test_X = test_X.loc[test_X.index.get_level_values(0).isin(
-                    train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
-                test_y = test_y.loc[test_X.index]
-            if model.name in ['lasso', 'elastic', 'lstm']:
-                for symbol in test_X.index.get_level_values(0).unique():
-                    test_X.loc[test_X.index.get_level_values(0) == symbol,
-                    ~test_X.columns.isin(cols_ignore_in_scaling)] = \
-                        minmax_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
-                                                        ~test_X.columns.isin(cols_ignore_in_scaling)])
-                if model.name == 'lstm':
-                    test_X_tensor = \
-                        torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
-                                                                test_X.shape[1])).astype(np.float32))
+            # if (D != '1D') & (model.name in ['gru', 'lstm']):
+            #     ########################################################################################################
+            #     ## Fine-tuning
+            #     ########################################################################################################
+            #     fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0]
+            #     train_fine_tune_X = \
+            #         features.loc[features.index.get_level_values(1).date == date - relativedelta(days=1), :].dropna()
+            #     train_fine_tune_y = train_fine_tune_X.pop(args.target)
+            #     for symbol in train_fine_tune_X.index.get_level_values(0).unique():
+            #         train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
+            #         ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
+            #             minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
+            #                                             ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
+            #     fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=1,
+            #                                              train_fine_tune_y=train_fine_tune_y,
+            #                                              model=fine_tuned_model, max_epochs=EPOCH//10, date=date,
+            #                                              L=args.L, target=args.target)
+            #     models.loc[pd.to_datetime(date, utc=pytz.UTC)] = fine_tuned_model
+            #     test_X = test_X.loc[test_X.index.get_level_values(0).isin(
+            #         train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
+            #     test_y = test_y.loc[test_X.index]
+            # if model.name in ['lasso', 'elastic']:
+            for symbol in test_X.index.get_level_values(0).unique():
+                test_X.loc[test_X.index.get_level_values(0) == symbol,
+                ~test_X.columns.isin(cols_ignore_in_scaling)] = \
+                    standard_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
+                                                      ~test_X.columns.isin(cols_ignore_in_scaling)])
+            if model.name in ['gru', 'lstm']:
+                test_X_tensor = \
+                    torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
+                                                            test_X.shape[1])).astype(np.float32))
             y_hat = \
                 pd.Series(index=test_y.index,
                           data=models.loc[models.index.date == date].iloc[0](test_X_tensor).detach().numpy().reshape(
-                              test_X_tensor.shape[0]) if model.name == 'lstm' else
+                              test_X_tensor.shape[0]) if model.name in ['gru', 'lstm'] else
                           models.loc[models.index.date == date].iloc[0].predict(test_X))
+            for symbol in test_X.index.get_level_values(0).unique():
+                y_hat.loc[y_hat.index.get_level_values(0) == symbol] = \
+                    standard_scaler[symbol].var_[0] ** .5 * y_hat.loc[y_hat.index.get_level_values(0) == symbol] + \
+                    standard_scaler[symbol].mean_[0]
             ############################################################################################################
             ## Model assessement
             ############################################################################################################

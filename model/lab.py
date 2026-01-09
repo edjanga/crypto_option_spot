@@ -13,8 +13,8 @@ from optuna.samplers import RandomSampler
 from functools import partial
 import lightgbm as lgb
 from torch.utils.data import DataLoader
-from .lstm_room import TimeSeriesDataset, LSTMModel
-from sklearn.preprocessing import MinMaxScaler
+from .dl_room import TimeSeriesDataset, LSTMModel, GRUModel
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from datetime import datetime
 from sklearn.model_selection import ParameterSampler
 import polars as pl
@@ -62,27 +62,6 @@ def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
     params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
     params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
     return params
-
-
-# def run_pnl_decile_ols(x, ranking, data, targets) -> pd.Series:
-#     ranking = ranking.query(f'(volatility_regime == "{x.name[1]}") & (D == "{x.name[2]}") & (target == "{x.name[3]}")')
-#     list_factors = ranking.features.unique().tolist()
-#     data = data.filter(regex='|'.join(list_factors))
-#     target = targets.xs(x.name[3], axis=1, level=1).xs(x.name[2].upper(), axis=1,
-#                                                        level=1).filter(regex='|'.join(list_factors))
-#     if not target.empty:
-#         pdb.set_trace()
-#     try:
-#         x = x.drop(['aggregated', 'target', 'D', 'volatility_regime', 'P&L decile'], axis=1)
-#     except KeyError:
-#         pdb.set_trace()
-#     X = x.set_index('underlying_name', append=True).swaplevel(0, 1).join(data, on=['underlying_name', 'timestamp'])
-#     X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
-#     X = X.groupby(by=[pd.Grouper(level='underlying_name')], group_keys=False).apply(
-#         lambda x: (x - x.min()).div(x.max() - x.min())).dropna()
-#     params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
-#     params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
-#     return params
 
 
 class FeatureBuilder:
@@ -317,38 +296,38 @@ class BoostingRegressor(Regressor):
         super(BoostingRegressor, self).__init__(name=name)
 
 
-class LSTMRegressor(Regressor):
-    def __init__(self, name: str = 'lstm', **kwargs):
-        super(LSTMRegressor, self).__init__(name=name)
+class DLRegressor(Regressor):
+    def __init__(self, name: str, **kwargs):
+        super(DLRegressor, self).__init__(name=name)
         if len(kwargs) > 0:
-            self._model = LSTMModel(**kwargs)
-        self._minmaxscaler = dict()
+            self._model = DLRegressor(**kwargs)
+        self._standardscaler = dict()
 
     @property
-    def minmaxscaler(self) -> Dict[(str, MinMaxScaler)]:
-        return self._minmaxscaler
+    def standardscaler(self) -> Dict[(str, StandardScaler)]:
+        return self._standardscaler
 
     @property
-    def model(self) -> LSTMModel:
+    def model(self) -> Union[LSTMModel, GRUModel]:
         return self._model
 
     @model.setter
-    def model(self, model: LSTMModel) -> None:
+    def model(self, model: Union[LSTMModel, GRUModel]) -> None:
         self._model = model
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
                     positiveness: bool,  cols_ignore_in_scaling: List[str], n_trials: int = N_TRIALS,
                     max_epochs: int = EPOCH) -> None:
-        params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
+        params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
         for symbol in train_X.index.get_level_values(0).unique():
-            self._minmaxscaler[symbol] = MinMaxScaler().set_output(transform='pandas')
+            self._standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
             train_X.loc[
                 train_X.index.get_level_values(0) == symbol, ~train_X.columns.isin(cols_ignore_in_scaling)] = \
-                self._minmaxscaler[symbol].fit_transform(X=train_X.loc[train_X.index.get_level_values(0) == symbol,
+                self._standardscaler[symbol].fit_transform(X=train_X.loc[train_X.index.get_level_values(0) == symbol,
                 ~train_X.columns.isin(cols_ignore_in_scaling)])
             valid_X.loc[
                 valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
-                self._minmaxscaler[symbol].transform(
+                self._standardscaler[symbol].transform(
                     X=valid_X.loc[
                         valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)])
         train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
@@ -361,10 +340,16 @@ class LSTMRegressor(Regressor):
         for trial, params in enumerate(params_list):
             print(f'\nTrial {trial + 1}/{n_trials}')
             print(f'Parameters: {params}')
-            model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
-                              num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-                              feature_names=train_X.columns.tolist(), positiveness=positiveness,
-                              dropout=params['dropout']) #beta=params['beta'],
+            if isinstance(self, LSTMRegressor):
+                model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
+                                  num_layers=params['num_layers'], learning_rate=params['learning_rate'],
+                                  feature_names=train_X.columns.tolist(), positiveness=positiveness,
+                                  dropout=params['dropout'], beta=params['beta'])
+            elif isinstance(self, GRURegressor):
+                model = GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
+                                 num_layers=params['num_layers'], learning_rate=params['learning_rate'],
+                                 feature_names=train_X.columns.tolist(), positiveness=positiveness,
+                                 dropout=params['dropout'], beta=params['beta'])
             trainer = \
                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
@@ -395,12 +380,12 @@ class LSTMRegressor(Regressor):
         best_train_loss = float('inf')
         best_params = None
         best_model = None
-        params_list = list(ParameterSampler(PARAMS_LSTM, n_iter=n_trials, random_state=123))
+        params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
         for trial, params in enumerate(params_list):
             print(f"\nTrial {trial + 1}/{n_trials}")
             print(f"Parameters: {params}")
             train_loader = \
-                DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=7, persistent_workers=True)
+                DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=7, persistent_workers=True)
             trainer = \
                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
@@ -416,6 +401,16 @@ class LSTMRegressor(Regressor):
         print(f'Best training loss: {best_train_loss:.2f}')
         print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} completed.')
         return best_model
+
+
+class GRURegressor(DLRegressor):
+    def __init__(self, name: str = 'gru'):
+        super(GRURegressor, self).__init__(name=name)
+
+
+class LSTMRegressor(DLRegressor):
+    def __init__(self, name: str = 'lstm'):
+        super(LSTMRegressor, self).__init__(name=name)
 
 
 class PermutationFeatureImportance:
@@ -471,7 +466,7 @@ class PermutationFeatureImportance:
             for feature in self._test.columns:
                 shuffled_test, feature = shuffle_single_feature(self._test, feature)
                 self._test_y.iloc[:, 1] = \
-                    self.model.predict(shuffled_test) if not isinstance(self.model, LSTMModel) else \
+                    self.model.predict(shuffled_test) if not isinstance(self.model, Union[GRUModel, LSTMModel]) else \
                         self.model(torch.from_numpy(
                             shuffled_test.values.reshape(1, shuffled_test.values.shape[0],
                                                          shuffled_test.values.shape[1])).to(torch.float32)

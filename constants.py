@@ -32,11 +32,9 @@ INTERDAY_LAGS = ['1W', '1M']
 VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
-# Params for LSTM
-# PARAMS_LSTM = {'hidden_size': [2**n for n in range(1, 4)], 'num_layers': [1],
-#                'learning_rate': [0.01, 0.05, 0.1], 'beta': list(np.linspace(0, 1, 11)), 'dropout': [.1, .2]}
-PARAMS_LSTM = {'hidden_size': [16, 32, 64], 'num_layers': [1, 2], 'learning_rate': [0.001, 0.005, 0.01],
-               'dropout': [0.0, 0.1, 0.2]}
+# Params for DL architecture
+PARAMS_DL = {'hidden_size': [2**n for n in range(1, 4)], 'num_layers': [1],
+             'learning_rate': [0.01, 0.05, 0.1], 'beta': list(np.linspace(0, 1, 11)), 'dropout': [.1, .2]}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 # Font sizes for plots
 TITLE_FONT_SIZE = 40

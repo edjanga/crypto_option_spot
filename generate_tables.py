@@ -408,9 +408,9 @@ def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
             tmp = data.copy()
             shuffled_test, feature = \
                 shuffle_single_feature(data[['$\\text{VRP}_{0 \\rightarrow D}$',
-                                             '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']], feature)
+                                             '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']].shift(), feature)
             tmp['returns_hat'] = \
-                model.fit(shuffled_test, data['$\\text{returns}_{0 \\rightarrow D}$']).predict(shuffled_test)
+                model.fit(shuffled_test, data['$\\text{returns}_{0 \\rightarrow D}$'].iloc[1:]).predict(shuffled_test)
             feature_importance[feature] += \
             ((tmp.diff(axis=1).iloc[:, -1] / avg1s.values[0]).abs()).groupby(by=pd.Grouper(level=0)).mean().values[0]
         count += 1
@@ -970,6 +970,9 @@ if __name__ == '__main__':
                        index='timestamp')
     data.index = pd.to_datetime(data.index, utc=True)
     framework_application_obj.data = data.resample(best_model_tags[-1]).sum().dropna()
+    scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags[-1])
+    rv_idx = pd.IndexSlice
+    data.loc[:, rv_idx[:, 'RV', :]] = data.loc[:, rv_idx[:, 'RV', :]].pow(.5).mul(scaling_factor)
     framework_application_obj.symbol = framework_application_obj.data.columns.get_level_values(1).unique().tolist()
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
     framework_application_obj.process_daily_option_chain(best_model_tags[-1], f'{args.target_path}', date_range)
@@ -979,7 +982,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     for aggregated in [True, False]:
         svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
-        svix = (svix2 ** .5).unstack()
+        svix = (scaling_factor * svix2 ** .5).unstack()
         svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
             svix.index.set_names(['D', 'underlying_name', 'timestamp'])
         svix.name = 'svix'
@@ -993,16 +996,15 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## VRP
     ####################################################################################################################
-    returns = data.xs('forecast', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
+    returns = data.xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
     returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
     rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
-    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
+    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan).pow(.5).mul(scaling_factor)
     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
     svix = pd.read_sql(sql='SELECT * FROM svix', con=framework_application_obj.db_connect)
     svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
     svix = svix.set_index(['aggregated', 'timestamp'])
     vrp = dict()
-    scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags[-1])
     for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
         tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
         if aggregated:
@@ -1010,13 +1012,11 @@ if __name__ == '__main__':
                 agg_svix = tmp_svix.drop('underlying_name', axis=1)
                 agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
                 agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
-            vrp[(aggregated, underlying_name)] = \
-                agg_svix.subtract((rv[underlying_name] ** .5)).mul(scaling_factor ** .5)
+            vrp[(aggregated, underlying_name)] = agg_svix.subtract(rv[underlying_name])
         else:
             tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns='D', values='svix', index='timestamp')
             tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
-            vrp[(aggregated, underlying_name)] = \
-                tmp_svix.subtract((rv[underlying_name] ** .5)).mul(scaling_factor ** .5)
+            vrp[(aggregated, underlying_name)] = tmp_svix.subtract(rv[underlying_name])
         vrp[(aggregated, underlying_name)] = vrp[(aggregated, underlying_name)].dropna(axis=1, how='all').dropna()
         vrp[(aggregated, underlying_name)] = pd.DataFrame(vrp[(aggregated, underlying_name)].unstack()).assign(
             underlying_name=underlying_name, aggregated=int(aggregated)).rename(columns={0: 'vrp'})
@@ -1049,7 +1049,7 @@ if __name__ == '__main__':
                                     '$\\text{returns}_{0 \\rightarrow D}$']]
         vrp_svix = \
             vrp_svix.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1)],
-                             group_keys=False).apply(lambda x: (x - x.min()) / (x.max() - x.min()))
+                             group_keys=False).apply(lambda x: (x - x.mean()) / x.std())
         vrp_svix = vrp_svix.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1)], group_keys=False).apply(
             vrp_svix_effect)
         vrp_svix = vrp_svix.reset_index().assign(aggregated=int(aggregated))
@@ -1069,8 +1069,10 @@ if __name__ == '__main__':
         vrp_svix_aggregated[(aggregated, underlying_name)] = vrp_svix
 vrp_svix_aggregated = pd.concat(vrp_svix_aggregated.values())
 vrp_svix_aggregated = vrp_svix_aggregated.loc[list(product([0, 1], d_order.categories)), :]
-with open(f'{args.target_path}/crypto_option_spot/vrp_svix.txt', 'w') as vrp_svix_file:
-    vrp_svix_file.writelines(vrp_svix_aggregated.to_latex(escape=False))
+for aggregated in [False, True]:
+    with open(f'{args.target_path}/crypto_option_spot/vrp_svix{"_aggregated" if aggregated else ""}.txt', 'w') as \
+            vrp_svix_file:
+        vrp_svix_file.writelines(vrp_svix_aggregated.xs(int(aggregated), axis=0, level=0).to_latex(escape=False))
 ########################################################################################################################
 ## Backtesting (P&L + Sharpe Ratio) + P&L Attribution analysis
 ########################################################################################################################
@@ -1079,13 +1081,13 @@ trading_volume_dd = dict()
 for target in ['RV', 'returns']:
     if target == 'RV':
         for aggregated in [True, False]:
-            pnl, trading_volume = \
+            pnl, _ = \
                 framework_application_obj.backtest(vrp=vrp.xs(int(aggregated), 0, 0), transaction_cost=True,
                                                    spread=True, freq=best_model_tags[-1], target=target)
-            pnl.index, trading_volume.index = \
-                pnl.index.set_names(['timestamp']), trading_volume.index.set_names(['timestamp'])
+            pnl.index = pnl.index.set_names(['timestamp'])
             pnl_dd[(int(aggregated), target)] = pnl
-            trading_volume_dd[(int(aggregated), target)] = trading_volume
+            # trading_volume_dd[(int(aggregated), target)] = trading_volume
+            # trading_volume.index = trading_volume.index.set_names(['timestamp'])
     else:
         pnl = framework_application_obj.backtest(transaction_cost=True, spread=True, freq=best_model_tags[-1],
                                                  target=target)
@@ -1095,10 +1097,10 @@ pnl = pd.concat(pnl_dd)
 trading_volume = pd.concat(trading_volume_dd)
 pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
 pnl.to_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
-trading_volume.index = trading_volume.index.set_names(['aggregated', 'target', 'timestamp'])
+# trading_volume.index = trading_volume.index.set_names(['aggregated', 'target', 'timestamp'])
 pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: P&L has been inserted into the database.')
-trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
+# trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: Trading volume has been inserted into the database.')
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
 sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
@@ -1114,8 +1116,11 @@ for aggregated in [False, True]:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([0, '']), :].droplevel(axis=0, level=0)
     else:
         tmp_sharpe = sharpe.loc[sharpe.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
-    tmp_sharpe = tmp_sharpe.round(2).where(tmp_sharpe.values <= 0, tmp_sharpe.map(lambda x: f'$\\mathbf{{{x}}}$'))
-    tmp_sharpe = tmp_sharpe.where(tmp_sharpe.values >= 0, tmp_sharpe.map(lambda x: f'${x}$'))
+    tmp_sharpe = tmp_sharpe.round(2)
+    pos, neg = tmp_sharpe > 0, tmp_sharpe <= 0
+    tmp_sharpe = tmp_sharpe.astype(str)
+    tmp_sharpe[pos], tmp_sharpe[neg] = tmp_sharpe[pos].applymap(lambda x: f'$\\mathbf{{{x}}}$'),\
+        tmp_sharpe[neg].applymap(lambda x: f'${x}$')
     with open(f'{args.target_path}/crypto_option_spot/'
               f'sharpe{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as sharpe_file:
         sharpe_file.writelines(tmp_sharpe.to_latex(escape=False, float_format='%.2f'))
@@ -1150,13 +1155,12 @@ for aggregated in [False, True]:
         tmp_sharpe_per_volatility_regime = \
             sharpe_per_volatility_regime.loc[
             sharpe_per_volatility_regime.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
-    tmp_sharpe_per_volatility_regime = \
-        tmp_sharpe_per_volatility_regime.round(2).where(
-            tmp_sharpe_per_volatility_regime.values <= 0,
-            tmp_sharpe_per_volatility_regime.map(lambda x: f'$\\mathbf{{{x}}}$'))
-    tmp_sharpe_per_volatility_regime = \
-        tmp_sharpe_per_volatility_regime.where(tmp_sharpe_per_volatility_regime.values >= 0,
-                                               tmp_sharpe_per_volatility_regime.map(lambda x: f'${x}$'))
+    tmp_sharpe_per_volatility_regime = tmp_sharpe_per_volatility_regime.round(2)
+    pos, neg = tmp_sharpe_per_volatility_regime > 0, tmp_sharpe_per_volatility_regime <= 0
+    tmp_sharpe_per_volatility_regime = tmp_sharpe_per_volatility_regime.astype(str)
+    tmp_sharpe_per_volatility_regime[pos], tmp_sharpe_per_volatility_regime[neg] = \
+        tmp_sharpe_per_volatility_regime[pos].applymap(lambda x: f'$\\mathbf{{{x}}}$'), \
+        tmp_sharpe_per_volatility_regime[neg].applymap(lambda x: f'${x}$')
     with open(f'{args.target_path}/crypto_option_spot/'
               f'sharpe_per_volatility{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as \
             sharpe_per_volatility_file:
