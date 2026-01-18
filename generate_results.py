@@ -2,7 +2,7 @@ import argparse
 import itertools
 import os
 import pdb
-import time
+
 import pytz
 import sqlite3
 from constants import *
@@ -23,6 +23,7 @@ if __name__ == '__main__':
                                                  'Results are computed model by model.')
     parser.add_argument('--regression', type=str, help='Regression technique to be used for modelling.')
     parser.add_argument('--L', type=str, help='Parameter controlling the size of the training set size.')
+    parser.add_argument('--freq', type=str, help='Parameter controlling forcasting horizon.')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target', type=str, help='RV or returns.', default='returns')
@@ -41,7 +42,8 @@ if __name__ == '__main__':
     SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
     SYMBOLS_QUERY = f'({",".join(SYMBOLS_QUERY)})'
     features_query = f'WITH base AS(SELECT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
-    f'AND "target" = "{args.target}") SELECT underlying_name, timestamp, features, features_values FROM base ' \
+    f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
+                     f'features_values FROM base ' \
     f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
     f'FROM base;'
     features = pd.read_sql(sql=features_query, con=db_connect, chunksize=100_000)
@@ -61,30 +63,33 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Options
     ####################################################################################################################
-    options_features_query = \
-        f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
-        f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
-    tmp_options_features = list()
-    options_features = \
-        pd.read_sql(sql=options_features_query, con=db_connect, chunksize=100_000)
-    while True:
-        try:
-            tmp_options_features.append(next(options_features))
-        except StopIteration:
-            break
-    options_features = pd.concat(tmp_options_features)
-    options_features['timestamp'] = pd.to_datetime(options_features['timestamp'], utc=pytz.UTC)
-    options_features = \
-        options_features[(options_features['timestamp'] >= args.start_date) &
-                         (options_features['timestamp'] < args.end_date)]
-    options_features['features_values'] = \
-        pd.to_numeric(options_features['features_values'], errors='coerce').astype('float32')
-    options_features = pd.pivot_table(data=options_features, values='features_values', columns='features',
-                                      index=['underlying_name', 'timestamp'])
-    options_features = \
-        options_features.groupby(by=pd.Grouper(level='underlying_name'),
-                                 group_keys=False).apply(lambda x: x.ffill())
-    main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
+    try:
+        options_features_query = \
+            f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
+            f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
+        tmp_options_features = list()
+        options_features = \
+            pd.read_sql(sql=options_features_query, con=db_connect, chunksize=100_000)
+        while True:
+            try:
+                tmp_options_features.append(next(options_features))
+            except StopIteration:
+                break
+        options_features = pd.concat(tmp_options_features)
+        options_features['timestamp'] = pd.to_datetime(options_features['timestamp'], utc=pytz.UTC)
+        options_features = \
+            options_features[(options_features['timestamp'] >= args.start_date) &
+                             (options_features['timestamp'] < args.end_date)]
+        options_features['features_values'] = \
+            pd.to_numeric(options_features['features_values'], errors='coerce').astype('float32')
+        options_features = pd.pivot_table(data=options_features, values='features_values', columns='features',
+                                          index=['underlying_name', 'timestamp'])
+        options_features = \
+            options_features.groupby(by=pd.Grouper(level='underlying_name'),
+                                     group_keys=False).apply(lambda x: x.ffill())
+        main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
+    except Exception:
+        main_features = features
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     ####################################################################################################################
@@ -102,10 +107,10 @@ if __name__ == '__main__':
     model = models_factory_dd[args.regression]
     start_idx = dates.index(dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
     permutation_feature_importance_obj = PermutationFeatureImportance()
-    for D, freq, options in itertools.product(['1D', '1W', '1M'], ['15min', '30min', '1h'], [0, 1]):
+    for D, options in itertools.product(['1D', '1W', '1M'], [0, 1]):
         models = pd.Series(data=np.nan, index=dates)
         features_importance = dict()
-        features_names = LAGS[LAGS.index(freq):LAGS.index(D) + 1]+[args.target]+\
+        features_names = LAGS[LAGS.index(args.freq):LAGS.index(D) + 1]+[args.target]+\
                          ['is_BTCUSDT', 'is_ETHUSDT', 'is_BNBUSDT', 'is_SOLUSDT', 'is_XRPUSDT']
         features_names = f'{"|".join(features_names)}'
         features = main_features.filter(regex=features_names)
@@ -147,34 +152,34 @@ if __name__ == '__main__':
         ################################################################################################################
         forecasts = list()
         mase = list()
-        permutation_feature_importance_obj.freq = freq
+        permutation_feature_importance_obj.freq = args.freq
         for start_date_forecast in dates[start_idx::pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days]:
             end_date_forecast = \
                 (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days))
             test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
                                   (features.index.get_level_values(1).date < end_date_forecast), :]
             test_y = test_X.pop(args.target)
-            # if (D != '1D') & (model.name in ['gru', 'lstm']):
-            #     ########################################################################################################
-            #     ## Fine-tuning
-            #     ########################################################################################################
-            #     fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0]
-            #     train_fine_tune_X = \
-            #         features.loc[features.index.get_level_values(1).date == date - relativedelta(days=1), :].dropna()
-            #     train_fine_tune_y = train_fine_tune_X.pop(args.target)
-            #     for symbol in train_fine_tune_X.index.get_level_values(0).unique():
-            #         train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
-            #         ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
-            #             minmax_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
-            #                                             ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
-            #     fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=1,
-            #                                              train_fine_tune_y=train_fine_tune_y,
-            #                                              model=fine_tuned_model, max_epochs=EPOCH//10, date=date,
-            #                                              L=args.L, target=args.target)
-            #     models.loc[pd.to_datetime(date, utc=pytz.UTC)] = fine_tuned_model
-            #     test_X = test_X.loc[test_X.index.get_level_values(0).isin(
-            #         train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
-            #     test_y = test_y.loc[test_X.index]
+            if (D != '1D') & (model.name in ['gru', 'lstm']):
+                ########################################################################################################
+                ## Fine-tuning
+                ########################################################################################################
+                fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0]
+                train_fine_tune_X = \
+                    features.loc[features.index.get_level_values(1).date == date - relativedelta(days=1), :].dropna()
+                train_fine_tune_y = train_fine_tune_X.pop(args.target)
+                for symbol in train_fine_tune_X.index.get_level_values(0).unique():
+                    train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
+                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
+                        standard_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
+                                                          ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
+                fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=1,
+                                                         train_fine_tune_y=train_fine_tune_y,
+                                                         model=fine_tuned_model, max_epochs=EPOCH//10, date=date,
+                                                         L=args.L, target=args.target)
+                models.loc[pd.to_datetime(date, utc=pytz.UTC)] = fine_tuned_model
+                test_X = test_X.loc[test_X.index.get_level_values(0).isin(
+                    train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
+                test_y = test_y.loc[test_X.index]
             # if model.name in ['lasso', 'elastic']:
             for symbol in test_X.index.get_level_values(0).unique():
                 test_X.loc[test_X.index.get_level_values(0) == symbol,
@@ -210,7 +215,7 @@ if __name__ == '__main__':
                                               y_pred=symbol_test_y.iloc[:, 1].values,
                                               y_train=symbol_train_y.values))
             mase.append([sum(mase_metric)/len(mase_metric),
-                         start_date_forecast, model.name.lower(), args.target, D, options, freq])
+                         start_date_forecast, model.name.lower(), args.target, D, options, args.freq])
             ############################################################################################################
             ## Feature importance
             ############################################################################################################
@@ -228,7 +233,7 @@ if __name__ == '__main__':
             pd.DataFrame(mase, columns=['MASE', 'timestamp', 'regression', 'target', 'D',
                                         'market', 'freq']).set_index('timestamp')
         forecasts = pd.concat(forecasts).reset_index('underlying_name').assign(
-            regression=model.name.lower(), target=args.target, D=D, market=options, freq=freq)
+            regression=model.name.lower(), target=args.target, D=D, market=options, freq=args.freq)
         metric.index = pd.to_datetime(metric.index, utc=True)
         metric.index.name = 'timestamp'
         underlying_rv = pd.read_sql(sql='SELECT "underlying_name", "timestamp", "target", "target_values" '
@@ -238,7 +243,7 @@ if __name__ == '__main__':
         underlying_rv['target_values'] = pd.to_numeric(underlying_rv['target_values'], errors='coerce').astype(
             'float32')
         underlying_rv = underlying_rv.groupby(by=pd.Grouper(key='timestamp'))['target_values'].mean()
-        volatility_regime = underlying_rv.resample(freq).sum()
+        volatility_regime = underlying_rv.resample(args.freq).sum()
         volatility_regime = \
             volatility_regime.loc[(volatility_regime.index.date >= dates[start_idx]) &
                                   (volatility_regime.index.date <= dates[-1])]
@@ -247,7 +252,8 @@ if __name__ == '__main__':
         metric = metric.join(volatility_regime)
         features_importance = features_importance.join(volatility_regime, how='left')
         features_importance = \
-            features_importance.assign(regression=args.regression, D=D, freq=freq, market=options, target=args.target)
+            features_importance.assign(regression=args.regression, D=D, freq=args.freq, market=options,
+                                       target=args.target)
         ################################################################################################################
         ## Database insertion or exporting to .csv files
         ################################################################################################################

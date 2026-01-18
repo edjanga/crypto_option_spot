@@ -49,8 +49,8 @@ if __name__ == '__main__':
     ####################################################################################################################
     if args.options == 0:
         spot = \
-            pl.scan_parquet(f'{args.target_path}/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
-                                                                        pl.col('timestamp'), pl.col('mid_price[0]')])
+            pl.scan_parquet(f'{args.target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
+                                                                          pl.col('timestamp'), pl.col('mid_price[0]')])
         spot = spot.sort(by=[pl.col('underlying_name'), pl.col('timestamp')])
         spot = spot.group_by_dynamic(index_column='timestamp', every=args.freq.replace('in', ''),
                                      group_by='underlying_name').agg(
@@ -70,7 +70,8 @@ if __name__ == '__main__':
         spot = spot.join(features_spot, on=['target', 'underlying_name', 'timestamp']).to_pandas()
         spot['lag'] = [feature[-1] if feature[-1] in LAGS else 'contemporaneous' for feature in
                        spot.features.str.split('_')]
-        spot.to_sql(name='spot_features', con=db_connect, index=False)
+        spot['freq'] = args.freq
+        spot.to_sql(name='spot_features', con=db_connect, index=False, if_exists='append')
         print(f'[Insertion]: Spot features have been inserted into the database.')
     ####################################################################################################################
     ## Options market based features
@@ -143,10 +144,10 @@ if __name__ == '__main__':
                         agg_option_chain_data.unpivot(index=['underlying_name', 'timestamp'], variable_name='features',
                                                       value_name='features_values')
                     agg_option_chain_data = agg_option_chain_data.with_columns(
-                        pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
+                        [pl.when(pl.col('features').str.split('_').list.last().is_in(list(LAGS)))
                         .then(pl.col('features').str.split('_').list.last())
                         .otherwise(pl.lit('contemporaneous'))
-                        .alias('lag')
+                        .alias('lag'), pl.lit(args.freq).alias('freq')]
                     )
                     agg_option_chain_data = agg_option_chain_data.collect(engine=ENGINE).to_pandas()
                     agg_option_chain_data.to_sql(name='option_features', con=db_connect, if_exists='append',
