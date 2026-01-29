@@ -35,16 +35,8 @@ class GRUModel(p_light.LightningModule):
         self.feature_names = feature_names
         self.dropout = dropout
         self.input_size = input_size
-
-        # GRU instead of LSTM
-        self.gru = nn.GRU(
-            input_size=self.input_size,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            batch_first=True,
-            dropout=self.dropout if num_layers > 1 else 0.0
-        )
-
+        self.gru = nn.GRU(input_size=self.input_size, hidden_size=self.hidden_size, num_layers=self.num_layers,
+                          batch_first=True, dropout=self.dropout if num_layers > 1 else 0.0)
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.fc = nn.Linear(hidden_size, output_size)
         self.criterion = nn.MSELoss(reduction='mean')
@@ -80,9 +72,11 @@ class GRUModel(p_light.LightningModule):
 
     def configure_optimizers(self) -> dict:
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-        return {'optimizer': optimizer,
-                'lr_scheduler': {'scheduler': scheduler, 'monitor': 'valid_loss', 'interval': 'epoch', 'frequency': 1}}
+        return optimizer
+        # optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        # return {'optimizer': optimizer,
+        #         'lr_scheduler': {'scheduler': scheduler, 'monitor': 'valid_loss', 'interval': 'epoch', 'frequency': 1}}
 
 
 class LSTMModel(p_light.LightningModule):
