@@ -405,7 +405,7 @@ def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
     model = LinearRegression()
     while count < 50:
         for feature in data.columns[:-1]:
-            tmp = data.copy()
+            tmp = data.copy().dropna()
             shuffled_test, feature = \
                 shuffle_single_feature(data[['$\\text{VRP}_{0 \\rightarrow D}$',
                                              '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']].shift(), feature)
@@ -971,7 +971,7 @@ if __name__ == '__main__':
     framework_application_obj.data = data.resample(best_model_tags[-1]).sum().dropna()
     scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags[-1])
     rv_idx = pd.IndexSlice
-    data.loc[:, rv_idx[:, 'RV', :]] = data.loc[:, rv_idx[:, 'RV', :]].pow(.5).mul(scaling_factor)
+    data.loc[:, rv_idx[:, :, 'RV', :]] = data.loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor)
     framework_application_obj.symbol = framework_application_obj.data.columns.get_level_values(1).unique().tolist()
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
     framework_application_obj.process_daily_option_chain(best_model_tags[-1], f'{args.target_path}', date_range)
@@ -979,19 +979,22 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## SVIX
     ####################################################################################################################
-    for aggregated in [True, False]:
-        svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
-        svix = (scaling_factor * svix2 ** .5).unstack()
-        svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
-            svix.index.set_names(['D', 'underlying_name', 'timestamp'])
-        svix.name = 'svix'
-        svix = pd.DataFrame(svix.reset_index())
-        if aggregated:
-            svix = svix.assign(underlying_name=None)
-        svix.assign(aggregated={True: 1, False: 0}[aggregated]).to_sql(
-            con=framework_application_obj.db_connect, name=f'svix', if_exists='append')
-        print(f'[Insertion]: SVIX {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
-              f'into the database.')
+    if os.path.exists(f'{args.target_path}/crypto_option_spot/svix.csv'):
+        svix = pd.read_csv(f'{args.target_path}/crypto_option_spot/svix.csv')
+    else:
+        for aggregated in [True, False]:
+            svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
+            svix = (scaling_factor * svix2 ** .5).unstack()
+            svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
+                svix.index.set_names(['D', 'underlying_name', 'timestamp'])
+            svix.name = 'svix'
+            svix = pd.DataFrame(svix.reset_index())
+            if aggregated:
+                svix = svix.assign(underlying_name=None)
+            svix.assign(aggregated={True: 1, False: 0}[aggregated]).to_sql(
+                con=framework_application_obj.db_connect, name=f'svix', if_exists='append')
+            print(f'[Insertion]: SVIX {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
+                  f'into the database.')
     ####################################################################################################################
     ## VRP
     ####################################################################################################################
@@ -1000,28 +1003,31 @@ if __name__ == '__main__':
     rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
     rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan).pow(.5).mul(scaling_factor)
     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
-    svix = pd.read_sql(sql='SELECT * FROM svix', con=framework_application_obj.db_connect)
-    svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
-    svix = svix.set_index(['aggregated', 'timestamp'])
-    vrp = dict()
-    for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
-        tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
-        if aggregated:
-            if 'agg_svix' not in vars():
-                agg_svix = tmp_svix.drop('underlying_name', axis=1)
-                agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
-                agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
-            vrp[(aggregated, underlying_name)] = agg_svix.subtract(rv[underlying_name])
-        else:
-            tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns='D', values='svix', index='timestamp')
-            tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
-            vrp[(aggregated, underlying_name)] = tmp_svix.subtract(rv[underlying_name])
-        vrp[(aggregated, underlying_name)] = vrp[(aggregated, underlying_name)].dropna(axis=1, how='all').dropna()
-        vrp[(aggregated, underlying_name)] = pd.DataFrame(vrp[(aggregated, underlying_name)].unstack()).assign(
-            underlying_name=underlying_name, aggregated=int(aggregated)).rename(columns={0: 'vrp'})
-        pd.concat(vrp.values()).to_sql(name='vrp', con=framework_application_obj.db_connect, if_exists='replace')
-        print(f'[Insertion]: VRP {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
-              f'into the database.')
+    if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
+        vrp = pd.read_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
+    else:
+        svix = pd.read_sql(sql='SELECT * FROM svix', con=framework_application_obj.db_connect)
+        svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
+        svix = svix.set_index(['aggregated', 'timestamp'])
+        vrp = dict()
+        for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
+            tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
+            if aggregated:
+                if 'agg_svix' not in vars():
+                    agg_svix = tmp_svix.drop('underlying_name', axis=1)
+                    agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
+                    agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
+                vrp[(aggregated, underlying_name)] = agg_svix.subtract(rv[underlying_name])
+            else:
+                tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns='D', values='svix', index='timestamp')
+                tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
+                vrp[(aggregated, underlying_name)] = tmp_svix.subtract(rv[underlying_name])
+            vrp[(aggregated, underlying_name)] = vrp[(aggregated, underlying_name)].dropna(axis=1, how='all').dropna()
+            vrp[(aggregated, underlying_name)] = pd.DataFrame(vrp[(aggregated, underlying_name)].unstack()).assign(
+                underlying_name=underlying_name, aggregated=int(aggregated)).rename(columns={0: 'vrp'})
+            pd.concat(vrp.values()).to_sql(name='vrp', con=framework_application_obj.db_connect, if_exists='replace')
+            print(f'[Insertion]: VRP {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
+                  f'into the database.')
     ####################################################################################################################
     ## VRP vs SVIX
     ####################################################################################################################
