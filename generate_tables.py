@@ -31,7 +31,7 @@ import argparse
 
 
 def process_daily_option_chain_date(date: datetime.datetime, directory: str,
-                                    freq: str) -> Tuple[datetime, pl.LazyFrame]:
+                                    freq: str) -> Tuple[datetime.datetime, pl.LazyFrame]:
     print(f'Option chain data for {date.strftime(DATE_FORMAT)} is being generated.........')
     option_chain_data = pl.scan_parquet(f'{directory}/*/{date.year}/options/{date.strftime(DATE_FORMAT)}')
     option_chain_data = option_chain_data.sort(['underlying_name', 'timestamp'])
@@ -435,7 +435,7 @@ class FrameworkApplication:
             pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
                                                                      pl.col('timestamp'), pl.col('mid_price[0]'),
                                                                      pl.col('spreads[0]')])
-        self._underlying_prices = self._underlying_prices.collect(engine=ENGINE)
+        self._underlying_prices = self._underlying_prices.collect()
         self._underlying_spreads = self._underlying_prices.pivot(
             index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
         self._underlying_prices = self._underlying_prices.pivot(
@@ -833,8 +833,8 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Model selection
     ####################################################################################################################
-    if os.path.exists(f'{args.target_path}/metric.csv'):
-        mase = pd.read_csv(f'{args.target_path}/metric.csv')
+    if os.path.exists(f'{args.target_path}/crypto_option_spot/metric.csv'):
+        mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
     else:
         mase = \
             pd.read_sql(con=framework_application_obj.db_connect,
@@ -842,7 +842,9 @@ if __name__ == '__main__':
                             'FROM metric;')
     mase['timestamp'] = pd.to_datetime(mase['timestamp'], utc=True)
     mase = mase.set_index(['D', 'timestamp'])
+    pdb.set_trace()
     model_ranking = mase.groupby(by=[pd.Grouper(key='regression'), pd.Grouper(key='freq')])[['MASE']].mean()
+    pdb.set_trace()
     with open(f'{args.target_path}/crypto_option_spot/mase_per_regression_freq_pair.txt', 'w') as \
             mase_per_regression_freq_pair_file:
         mase_per_regression_freq_pair_file.writelines(model_ranking.unstack(0).droplevel(axis=1, level=0).loc[
@@ -851,8 +853,8 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## MASE Reporting
     ####################################################################################################################
-    if os.path.exists(f'{args.target_path}/metric.csv'):
-        mase_comparison = pd.read_csv(f'{args.target_path}/metric.csv')
+    if os.path.exists(f'{args.target_path}/crypto_option_spot/metric.csv'):
+        mase_comparison = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
         mase_comparison = \
             mase_comparison.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
     else:
@@ -889,7 +891,6 @@ if __name__ == '__main__':
         mase_per_volatility.loc[:, mase_per_volatility.columns.get_level_values(2) == 1].round(2)
     mase_per_volatility.columns = mase_per_volatility.columns.set_names('Market Regimes', level=0)
     mase_per_volatility = mase_per_volatility.style.format(decimal='.', thousands=',', precision=4)
-    os.makedirs(f'{args.target_path}/crypto_option_spot', exist_ok=True)
     with open(f'{args.target_path}/crypto_option_spot/mase_per_volatility.txt', 'w') as mase_per_volatility_file:
         mase_per_volatility_file.writelines(mase_per_volatility.to_latex())
     ####################################################################################################################
@@ -918,8 +919,8 @@ if __name__ == '__main__':
     option_features = pd.pivot_table(option_features, index=['underlying_name', 'timestamp'], columns='features',
                                      values='features_values')
     features = features.join(option_features)
-    if os.path.exists(f'{args.target_path}/features_importance.csv'):
-        feature_importance = pd.read_csv(f'{args.target_path}/features_importance.csv')
+    if os.path.exists(f'{args.target_path}/crypto_option_spot/features_importance.csv'):
+        feature_importance = pd.read_csv(f'{args.target_path}/crypto_option_spot/features_importance.csv')
         feature_importance = \
             feature_importance.query(
                 f'regression == "{best_model_tags[0].lower()}" & '
@@ -953,8 +954,8 @@ if __name__ == '__main__':
         feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
                                                         regex=True)
     feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
-    if os.path.exists(f'{args.target_path}/forecasts.csv'):
-        chunks = pd.read_csv(f'{args.target_path}/forecasts.csv', chunksize=1_000_000)
+    if os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts.csv'):
+        chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
         data = pd.concat(chunk.query('regression == @best_model_tags[0].lower() and freq == @best_model_tags[-1] '
                                      'and market == @best_market') for chunk in chunks)
     else:
