@@ -842,13 +842,11 @@ if __name__ == '__main__':
                             'FROM metric;')
     mase['timestamp'] = pd.to_datetime(mase['timestamp'], utc=True)
     mase = mase.set_index(['D', 'timestamp'])
-    pdb.set_trace()
     model_ranking = mase.groupby(by=[pd.Grouper(key='regression'), pd.Grouper(key='freq')])[['MASE']].mean()
-    pdb.set_trace()
     with open(f'{args.target_path}/crypto_option_spot/mase_per_regression_freq_pair.txt', 'w') as \
             mase_per_regression_freq_pair_file:
         mase_per_regression_freq_pair_file.writelines(model_ranking.unstack(0).droplevel(axis=1, level=0).loc[
-            ['15min', '30min', '1h'], ['lasso', 'elastic', 'lightgbm', 'lstm']].to_latex())
+            ['15min', '30min', '1h'], ['lasso', 'lightgbm', 'gru']].to_latex())
     best_model_tags = list(model_ranking.idxmin().iloc[0])
     ####################################################################################################################
     ## MASE Reporting
