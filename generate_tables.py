@@ -140,10 +140,23 @@ def svix_daily(date: datetime, option_chain: pd.DataFrame, iv_interpolation: pd.
     X[:, :, 2] = X[:, :, 2] * ATM_MONEYNESSES.reshape(-1, 1) ** 2
     X[:, :, 3] = T ** 2
     X[:, :, 4] = X[:, :, 4] * ATM_MONEYNESSES.reshape(-1, 1) * T
+    # for sym_option_type in symbol_option_type:
+    #     X = np.zeros(shape=(time_bucket, 5))
+    #     # X[:, 2] = X[:, 2] * T
+    #     # X[:, 4] = T ** 2
+    #     iv_interpolation_coef = iv_interpolation.xs((sym_option_type[0], sym_option_type[1]), axis=1)
+    #     iv_interpolation_coef = iv_interpolation_coef.reindex(pd.date_range(start=date, end=date+relativedelta(days=1),
+    #                                                                         freq=freq, inclusive='left', tz=pytz.UTC))
+    #     iv_interpolation_coef.ffill(inplace=True)
+    #     iv_interpolation_coef = iv_interpolation_coef.values
+    #     iv = np.sum(iv_interpolation_coef[:, 1:] * X, axis=1) + iv_interpolation_coef[:, 0]
+    #     iv = np.where(iv >= .01, iv, .01)
+    #     iv_option_type[sym_option_type[0]][sym_option_type[1]] = iv
     for sym_option_type in symbol_option_type:
         iv_interpolation_coef = iv_interpolation.xs((sym_option_type[0], sym_option_type[1]), axis=1)
-        iv_interpolation_coef = iv_interpolation_coef.reindex(pd.date_range(start=date, end=date+relativedelta(days=1),
-                                                                            freq=freq, inclusive='left', tz=pytz.UTC))
+        iv_interpolation_coef = iv_interpolation_coef.reindex(
+            pd.date_range(start=date, end=date + relativedelta(days=1),
+                          freq=freq, inclusive='left', tz=pytz.UTC))
         iv_interpolation_coef.ffill(inplace=True)
         iv_interpolation_coef = iv_interpolation_coef.values
         iv = np.sum(iv_interpolation_coef[:, 1:] * X, axis=2).T + iv_interpolation_coef[:, 0].reshape(-1, 1)
@@ -179,13 +192,15 @@ def svix_daily(date: datetime, option_chain: pd.DataFrame, iv_interpolation: pd.
         d1 /= (iv * T ** .5)
         d2 = d1 - iv * T ** .5
         if option_type == 'call':
-            otm = strikes.le(fwd_price_sym).values
+            otm = strikes.ge(fwd_price_sym).values
             prices = - (strikes.values * norm.cdf(d2)) + norm.cdf(d1) * fwd_price_sym
         else:
-            otm = strikes.gt(fwd_price_sym).values
+            otm = strikes.lt(fwd_price_sym).values
             prices = strikes.values * norm.cdf(-d2) - norm.cdf(-d1) * fwd_price_sym
-        svix[sym][option_type] = 2 * (np.nan_to_num((prices * otm * strikes_grid.values)).sum(axis=1) /
-                                      fwd_price_sym.reshape(fwd_price_sym.shape[0]) ** 2)
+        # svix[sym][option_type] = 2 * (np.nan_to_num((prices * otm * strikes_grid.values)).sum(axis=1) /
+        #                               fwd_price_sym.reshape(fwd_price_sym.shape[0]) ** 2)
+        svix[sym][option_type] = np.sqrt((2 / T) * (np.nan_to_num((prices * otm * strikes_grid.values)).sum(axis=1) /
+                                                    fwd_price_sym.reshape(fwd_price_sym.shape[0]) ** 2))
         if aggregated:
             volume = option_chain_sym_type.groupby(by=pd.Grouper(key='timestamp', freq=freq))['volume'].sum().values
             svix[sym][option_type] = pd.concat([pd.Series(svix[sym][option_type]).dropna(how='all', axis=0),
@@ -398,6 +413,7 @@ def export_returns_regression_latex(res: sm.OLS, symbol: str, D: str):
 
 
 def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
+    pdb.set_trace()
     avg1s = data[['$\\text{returns}_{0 \\rightarrow D}$']].groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1)])
     avg1s = avg1s.apply(lambda x: (x - x.shift()).abs().sum() / (x.shape[0] - 1))
     feature_importance = dict([(feature, 0) for feature in data.columns[:-1]])
@@ -407,10 +423,31 @@ def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
         for feature in data.columns[:-1]:
             tmp = data.copy().dropna()
             shuffled_test, feature = \
-                shuffle_single_feature(data[['$\\text{VRP}_{0 \\rightarrow D}$',
+                shuffle_single_feature(tmp[['$\\text{VRP}_{0 \\rightarrow D}$',
                                              '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']].shift(), feature)
             tmp['returns_hat'] = \
-                model.fit(shuffled_test, data['$\\text{returns}_{0 \\rightarrow D}$'].iloc[1:]).predict(shuffled_test)
+                model.fit(shuffled_test, tmp['$\\text{returns}_{0 \\rightarrow D}$'].iloc[1:]).predict(shuffled_test)
+            feature_importance[feature] += \
+            ((tmp.diff(axis=1).iloc[:, -1] / avg1s.values[0]).abs()).groupby(by=pd.Grouper(level=0)).mean().values[0]
+        count += 1
+    feature_importance = pd.Series(feature_importance) / 50
+    return feature_importance
+def vrp_svix_effect(data: pd.DataFrame) -> pd.DataFrame:
+    avg1s = data[['$\\text{returns}_{0 \\rightarrow D}$']].groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1)])
+    avg1s = avg1s.apply(lambda x: (x - x.shift()).abs().sum() / (x.shape[0] - 1))
+    feature_importance = dict([(feature, 0) for feature in data.columns[:-1]])
+    count = 0
+    model = LinearRegression()
+    while count < 50:
+        for feature in data.columns[:-1]:
+            tmp = data.copy()
+            tmp.iloc[:, :-1] = tmp.iloc[:, :-1].shift()
+            tmp.dropna(inplace=True)
+            shuffled_test, feature = \
+                shuffle_single_feature(tmp[['$\\text{VRP}_{0 \\rightarrow D}$',
+                                            '$\\text{Crypto SVIX}_{0 \\rightarrow D}$']], feature)
+            tmp['returns_hat'] = \
+                model.fit(shuffled_test, tmp['$\\text{returns}_{0 \\rightarrow D}$']).predict(shuffled_test)
             feature_importance[feature] += \
             ((tmp.diff(axis=1).iloc[:, -1] / avg1s.values[0]).abs()).groupby(by=pd.Grouper(level=0)).mean().values[0]
         count += 1
@@ -503,7 +540,7 @@ class FrameworkApplication:
         FrameworkApplication._iv_interpolation_coef = \
             FrameworkApplication._iv_interpolation_coef.groupby(
                 FrameworkApplication._iv_interpolation_coef.index).last()
-        return pd.concat(iv_interpolation_data, axis=1)
+        return pd.concat(iv_interpolation_data, axis=1).ffill()
 
     @staticmethod
     def svix(freq: str, aggregated: bool = True) -> pd.DataFrame:
@@ -723,8 +760,12 @@ class FrameworkApplication:
             spot_prices = spot_prices.agg(pl.all().last()).to_pandas().set_index('timestamp')
             dates = list(np.unique(spot_returns.index.date))
         if kwargs['target'] == 'RV':
-            vrp = pd.pivot(vrp.reset_index([0, 1]), columns=['underlying_name', 'D'],
-                           values='$\\text{VRP}_{0 \\rightarrow D}$')
+            try:
+                vrp = pd.pivot(vrp.reset_index([0, 1]), columns=['underlying_name', 'D'],
+                               values='$\\text{VRP}_{0 \\rightarrow D}$')
+            except ValueError:
+                vrp = pd.pivot(kwargs['vrp'].loc[~kwargs['vrp'].index.duplicated()].reset_index([0, 1]),
+                               columns=['underlying_name', 'D'],values='$\\text{VRP}_{0 \\rightarrow D}$')
             mean_bar = self._data.xs('RV', axis=1, level=2)['values'].apply(
                 lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean()).shift().ffill()
             mean_bar = mean_bar.reindex(self._data.index).ffill()
@@ -903,8 +944,8 @@ if __name__ == '__main__':
     targets = pd.pivot_table(targets, index=['target', 'timestamp'], columns='underlying_name',
                              values='target_values')
     features = features.drop(['target', 'target_values'], axis=1)
-    features = pd.pivot(features, index=['underlying_name', 'timestamp'], columns='features',
-                        values='features_values')
+    features = pd.pivot_table(features, index=['underlying_name', 'timestamp'], columns='features',
+                              values='features_values')
     ####################################################################################################################
     ## Feature importance
     ####################################################################################################################
@@ -971,20 +1012,20 @@ if __name__ == '__main__':
     framework_application_obj.data = data.resample(best_model_tags[-1]).sum().dropna()
     scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags[-1])
     rv_idx = pd.IndexSlice
-    data.loc[:, rv_idx[:, :, 'RV', :]] = data.loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor)
+    data.loc[:, rv_idx[:, :, 'RV', :]] = data.loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor ** .5)
     framework_application_obj.symbol = framework_application_obj.data.columns.get_level_values(1).unique().tolist()
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
     framework_application_obj.process_daily_option_chain(best_model_tags[-1], f'{args.target_path}', date_range)
-    framework_application_obj.iv_regression(best_model_tags[-1])
     ####################################################################################################################
     ## SVIX
     ####################################################################################################################
     if os.path.exists(f'{args.target_path}/crypto_option_spot/svix.csv'):
         svix = pd.read_csv(f'{args.target_path}/crypto_option_spot/svix.csv')
     else:
+        framework_application_obj.iv_regression(best_model_tags[-1])
         for aggregated in [True, False]:
             svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
-            svix = (scaling_factor * svix2 ** .5).unstack()
+            svix = ((scaling_factor * svix2) ** .5).unstack()
             svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
                 svix.index.set_names(['D', 'underlying_name', 'timestamp'])
             svix.name = 'svix'
@@ -1001,12 +1042,11 @@ if __name__ == '__main__':
     returns = data.xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
     returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
     rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
-    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan).pow(.5).mul(scaling_factor)
+    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan).pow(.5).mul(scaling_factor ** .5)
     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
     if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
         vrp = pd.read_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
     else:
-        svix = pd.read_sql(sql='SELECT * FROM svix', con=framework_application_obj.db_connect)
         svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
         svix = svix.set_index(['aggregated', 'timestamp'])
         vrp = dict()
@@ -1017,22 +1057,30 @@ if __name__ == '__main__':
                     agg_svix = tmp_svix.drop('underlying_name', axis=1)
                     agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
                     agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
-                vrp[(aggregated, underlying_name)] = agg_svix.subtract(rv[underlying_name])
+                vrp[(int(aggregated), underlying_name)] = \
+                    agg_svix.reindex(rv.index).subtract(rv[underlying_name].values).dropna()
             else:
-                tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns='D', values='svix', index='timestamp')
+                tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns=['underlying_name', 'D'], values='svix',
+                                          index='timestamp')
                 tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
-                vrp[(aggregated, underlying_name)] = tmp_svix.subtract(rv[underlying_name])
-            vrp[(aggregated, underlying_name)] = vrp[(aggregated, underlying_name)].dropna(axis=1, how='all').dropna()
-            vrp[(aggregated, underlying_name)] = pd.DataFrame(vrp[(aggregated, underlying_name)].unstack()).assign(
-                underlying_name=underlying_name, aggregated=int(aggregated)).rename(columns={0: 'vrp'})
-            pd.concat(vrp.values()).to_sql(name='vrp', con=framework_application_obj.db_connect, if_exists='replace')
-            print(f'[Insertion]: VRP {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
-                  f'into the database.')
+                vrp[(int(aggregated), underlying_name)] = \
+                    tmp_svix.reindex(rv.index).subtract(rv[underlying_name].values)
+            vrp[(int(aggregated), underlying_name)] = \
+                vrp[(int(aggregated), underlying_name)].dropna(axis=1, how='all').dropna()
+            vrp[(int(aggregated), underlying_name)] = \
+                pd.DataFrame(vrp[(int(aggregated), underlying_name)].unstack()).rename(columns={0: 'vrp'})
+            vrp[(int(aggregated), underlying_name)] = \
+                vrp[(int(aggregated), underlying_name)].assign(underlying_name=underlying_name,
+                                                               aggregated=int(aggregated))
+        vrp_0 = pd.concat([vrp[(0, symbol)] for symbol in pairs_order.categories]).droplevel(axis=0, level=0)
+        vrp_1 = pd.concat([vrp[(1, symbol)] for symbol in pairs_order.categories])
+        vrp = pd.concat([vrp_0, vrp_1])
+        vrp.to_sql(name='vrp', con=framework_application_obj.db_connect, if_exists='replace')
+        print(f'[Insertion]: VRP has been inserted into the database.')
     ####################################################################################################################
     ## VRP vs SVIX
     ####################################################################################################################
     vrp_svix_aggregated = dict()
-    vrp = pd.concat(vrp.values())
     vrp = vrp.set_index(['aggregated', 'underlying_name'],
                         append=True).swaplevel(2, 0).swaplevel(2, 1).swaplevel(-1, 1).swaplevel(-1, -2)
     vrp = vrp.rename(columns={'vrp': '$\\text{VRP}_{0 \\rightarrow D}$'})
@@ -1082,7 +1130,6 @@ for aggregated in [False, True]:
 ## Backtesting (P&L + Sharpe Ratio) + P&L Attribution analysis
 ########################################################################################################################
 pnl_dd = dict()
-trading_volume_dd = dict()
 for target in ['RV', 'returns']:
     if target == 'RV':
         for aggregated in [True, False]:
@@ -1091,21 +1138,16 @@ for target in ['RV', 'returns']:
                                                    spread=True, freq=best_model_tags[-1], target=target)
             pnl.index = pnl.index.set_names(['timestamp'])
             pnl_dd[(int(aggregated), target)] = pnl
-            # trading_volume_dd[(int(aggregated), target)] = trading_volume
-            # trading_volume.index = trading_volume.index.set_names(['timestamp'])
     else:
         pnl = framework_application_obj.backtest(transaction_cost=True, spread=True, freq=best_model_tags[-1],
                                                  target=target)
         pnl.columns = pnl.columns.set_levels(pnl.columns.levels[-1].str.lower(), level=1)
         pnl_dd[('', target)] = pnl
 pnl = pd.concat(pnl_dd)
-trading_volume = pd.concat(trading_volume_dd)
 pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
 pnl.to_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
-# trading_volume.index = trading_volume.index.set_names(['aggregated', 'target', 'timestamp'])
 pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: P&L has been inserted into the database.')
-# trading_volume.to_sql(name='trading_volume', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: Trading volume has been inserted into the database.')
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
 sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
