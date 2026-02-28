@@ -466,21 +466,20 @@ class FrameworkApplication:
     _iv_interpolation_coef = None
 
     def __init__(self, target_path: str, data: pd.DataFrame = None):
-        # chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
         self._db_connect = sqlite3.connect(f'{target_path}/crypto_option_spot.db')
-        # self._underlying_prices = \
-        #     pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
-        #                                                              pl.col('timestamp'), pl.col('mid_price[0]'),
-        #                                                              pl.col('spreads[0]')])
-        # self._underlying_prices = self._underlying_prices.collect()
-        # self._underlying_spreads = self._underlying_prices.pivot(
-        #     index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
-        # self._underlying_prices = self._underlying_prices.pivot(
-        #     index='timestamp', on='underlying_name', values='mid_price[0]')
-        # self._underlying_rv = self._underlying_prices.select(['timestamp'] + [
-        #     (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS]).to_pandas()
-        # self._underlying_returns = self._underlying_prices.select(['timestamp'] + [
-        #     (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS]).to_pandas()
+        self._underlying_prices = \
+            pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
+                                                                     pl.col('timestamp'), pl.col('mid_price[0]'),
+                                                                     pl.col('spreads[0]')])
+        self._underlying_prices = self._underlying_prices.collect()
+        self._underlying_spreads = self._underlying_prices.pivot(
+            index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
+        self._underlying_prices = self._underlying_prices.pivot(
+            index='timestamp', on='underlying_name', values='mid_price[0]')
+        self._underlying_rv = self._underlying_prices.select(['timestamp'] + [
+            (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS]).to_pandas()
+        self._underlying_returns = self._underlying_prices.select(['timestamp'] + [
+            (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS]).to_pandas()
 
     @property
     def data(self) -> pd.DataFrame:
