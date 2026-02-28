@@ -1094,7 +1094,7 @@ if __name__ == '__main__':
                                           index='timestamp')
                 tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
                 vrp[(int(aggregated), underlying_name)] = \
-                    tmp_svix.reindex(rv.index).subtract(rv[underlying_name].values)
+                    tmp_svix.xs(underlying_name, axis=1, level=0).reindex(rv.index).subtract(rv[underlying_name].values)
             vrp[(int(aggregated), underlying_name)] = \
                 vrp[(int(aggregated), underlying_name)].dropna(axis=1, how='all').dropna()
             vrp[(int(aggregated), underlying_name)] = \
@@ -1159,25 +1159,28 @@ for aggregated in [False, True]:
 ########################################################################################################################
 ## Backtesting (P&L + Sharpe Ratio) + P&L Attribution analysis
 ########################################################################################################################
-pnl_dd = dict()
-for target in ['RV', 'returns']:
-    if target == 'RV':
-        for aggregated in [True, False]:
-            pnl, _ = \
-                framework_application_obj.backtest(vrp=vrp.xs(int(aggregated), 0, 0), transaction_cost=True,
-                                                   spread=True, freq=best_model_tags[-1], target=target)
-            pnl.index = pnl.index.set_names(['timestamp'])
-            pnl_dd[(int(aggregated), target)] = pnl
-    else:
-        pnl = framework_application_obj.backtest(transaction_cost=True, spread=True, freq=best_model_tags[-1],
-                                                 target=target)
-        pnl.columns = pnl.columns.set_levels(pnl.columns.levels[-1].str.lower(), level=1)
-        pnl_dd[('', target)] = pnl
-pnl = pd.concat(pnl_dd)
+if os.path.exists(f'{args.target_path}/crypto_option_spot/pnl.csv'):
+    pnl = pd.read_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
+else:
+    pnl_dd = dict()
+    for target in ['RV', 'returns']:
+        if target == 'RV':
+            for aggregated in [True, False]:
+                pnl, _ = \
+                    framework_application_obj.backtest(vrp=vrp.xs(int(aggregated), 0, 0), transaction_cost=True,
+                                                       spread=True, freq=best_model_tags[-1], target=target)
+                pnl.index = pnl.index.set_names(['timestamp'])
+                pnl_dd[(int(aggregated), target)] = pnl
+        else:
+            pnl = framework_application_obj.backtest(transaction_cost=True, spread=True, freq=best_model_tags[-1],
+                                                     target=target)
+            pnl.columns = pnl.columns.set_levels(pnl.columns.levels[-1].str.lower(), level=1)
+            pnl_dd[('', target)] = pnl
+    pnl = pd.concat(pnl_dd)
+    pnl.to_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
+    pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='replace', index=True)
+    print(f'[Insertion]: P&L has been inserted into the database.')
 pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
-pnl.to_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
-pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='replace', index=True)
-print(f'[Insertion]: P&L has been inserted into the database.')
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
 sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
     by=[pd.Grouper(level=0), pd.Grouper(level=1)]).mean().stack()
@@ -1231,17 +1234,29 @@ for aggregated in [False, True]:
         tmp_sharpe_per_volatility_regime = \
             sharpe_per_volatility_regime.loc[
             sharpe_per_volatility_regime.index.get_level_values(0).isin([1]), :].droplevel(axis=0, level=0)
-    tmp_sharpe_per_volatility_regime = tmp_sharpe_per_volatility_regime.round(2)
+    # tmp_sharpe_per_volatility_regime = tmp_sharpe_per_volatility_regime.round(2)
     pos, neg = tmp_sharpe_per_volatility_regime > 0, tmp_sharpe_per_volatility_regime <= 0
     tmp_sharpe_per_volatility_regime = tmp_sharpe_per_volatility_regime.astype(str)
     tmp_sharpe_per_volatility_regime[pos], tmp_sharpe_per_volatility_regime[neg] = \
         tmp_sharpe_per_volatility_regime[pos].applymap(lambda x: f'$\\mathbf{{{x}}}$'), \
         tmp_sharpe_per_volatility_regime[neg].applymap(lambda x: f'${x}$')
+    # with open(f'{args.target_path}/crypto_option_spot/'
+    #           f'sharpe_per_volatility{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as \
+    #         sharpe_per_volatility_file:
+    #     sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex(escape=False,
+    #                                                                                     float_format='%.2f'))
+    sharpe_per_volatility_file = tmp_sharpe_per_volatility_regime.style.format(decimal='.', thousands=',', precision=4)
     with open(f'{args.target_path}/crypto_option_spot/'
               f'sharpe_per_volatility{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as \
             sharpe_per_volatility_file:
-        sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex(escape=False,
-                                                                                        float_format='%.2f'))
+        sharpe_per_volatility_file.writelines(tmp_sharpe_per_volatility_regime.to_latex())
+
+    sharpe_per_volatility = tmp_sharpe_per_volatility_regime.style.format(decimal='.', thousands=',', precision=4)
+    with open(f'{args.target_path}/crypto_option_spot/'
+              f'sharpe_per_volatility{dict([(False, ""), (True, "_aggregated")])[aggregated]}.txt', 'w') as \
+            sharpe_per_volatility_file:
+        sharpe_per_volatility_file.writelines(sharpe_per_volatility.to_latex())
+
 factor_analysis = pnl_explained_obj.pnl_analysis(pnl=pnl, features=features, freq=best_model_tags[-1],
                                                  ranking=feature_importance_ranking, targets=data.xs('values',
                                                                                                      level=0, axis=1))
