@@ -466,21 +466,21 @@ class FrameworkApplication:
     _iv_interpolation_coef = None
 
     def __init__(self, target_path: str, data: pd.DataFrame = None):
-        self._data = data
+        # chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
         self._db_connect = sqlite3.connect(f'{target_path}/crypto_option_spot.db')
-        self._underlying_prices = \
-            pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
-                                                                     pl.col('timestamp'), pl.col('mid_price[0]'),
-                                                                     pl.col('spreads[0]')])
-        self._underlying_prices = self._underlying_prices.collect()
-        self._underlying_spreads = self._underlying_prices.pivot(
-            index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
-        self._underlying_prices = self._underlying_prices.pivot(
-            index='timestamp', on='underlying_name', values='mid_price[0]')
-        self._underlying_rv = self._underlying_prices.select(['timestamp'] + [
-            (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS]).to_pandas()
-        self._underlying_returns = self._underlying_prices.select(['timestamp'] + [
-            (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS]).to_pandas()
+        # self._underlying_prices = \
+        #     pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
+        #                                                              pl.col('timestamp'), pl.col('mid_price[0]'),
+        #                                                              pl.col('spreads[0]')])
+        # self._underlying_prices = self._underlying_prices.collect()
+        # self._underlying_spreads = self._underlying_prices.pivot(
+        #     index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
+        # self._underlying_prices = self._underlying_prices.pivot(
+        #     index='timestamp', on='underlying_name', values='mid_price[0]')
+        # self._underlying_rv = self._underlying_prices.select(['timestamp'] + [
+        #     (pl.col(sym) / pl.col(sym).shift(1)).log() ** 2 for sym in SYMBOLS]).to_pandas()
+        # self._underlying_returns = self._underlying_prices.select(['timestamp'] + [
+        #     (pl.col(sym) / pl.col(sym).shift(1)).log() for sym in SYMBOLS]).to_pandas()
 
     @property
     def data(self) -> pd.DataFrame:
@@ -888,7 +888,7 @@ if __name__ == '__main__':
             mase_per_regression_freq_pair_file:
         mase_per_regression_freq_pair_file.writelines(model_ranking.unstack(0).droplevel(axis=1, level=0).loc[
             ['15min', '30min', '1h'], ['lasso', 'lightgbm', 'gru']].to_latex())
-    best_model_tags = list(model_ranking.idxmin().iloc[0])
+    best_model_tags = list(model_ranking.sort_values(by='MASE').index[1])#list(model_ranking.idxmin().iloc[0])
     ####################################################################################################################
     ## MASE Reporting
     ####################################################################################################################
@@ -911,27 +911,59 @@ if __name__ == '__main__':
                                pd.Grouper(key='market')])[['MASE']].mean().reset_index()
     mase_global['D'] = mase_global['D'].transform(lambda x: f'<i>{x.lower()}</i>')
     mase_global['market'] = np.where(mase_global['market'] == 1, '<i>X<sup>(S,O)</sup></i>', '<i>X<sup>S</sup></i>')
-    mase_per_volatility = \
+    # mase_per_volatility = \
+    #     best_model.groupby(by=[pd.Grouper(level='D'),
+    #                            pd.Grouper(key='volatility_regime'), pd.Grouper(key='market')])[['MASE']].mean()
+    # mase_per_volatility_copy = mase_per_volatility.copy()
+    # mase_per_volatility_copy = \
+    #     mase_per_volatility.groupby(by=[pd.Grouper(level='D'),
+    #                                     pd.Grouper(level='volatility_regime')],
+    #                                 group_keys=False).apply(lambda x: 100 * x.pct_change()).round(4)
+    # mase_per_volatility = mase_per_volatility_copy.fillna(mase_per_volatility)
+    # mase_per_volatility = mase_per_volatility.unstack([1, -1])
+    # mase_per_volatility = mase_per_volatility.loc[:, [('MASE', 'Low', 0), ('MASE', 'Low', 1),
+    #                                                   ('MASE', 'Normal', 0), ('MASE', 'Normal', 1),
+    #                                                   ('MASE', 'High', 0), ('MASE', 'High', 1)]]
+    # mase_per_volatility.index = mase_per_volatility.index.str.lower()
+    # mase_per_volatility = mase_per_volatility.loc[d_order.categories, :]
+    # mase_per_volatility.loc[:, mase_per_volatility.columns.get_level_values(2) == 1] = \
+    #     mase_per_volatility.loc[:, mase_per_volatility.columns.get_level_values(2) == 1].round(2)
+    # mase_per_volatility.columns = mase_per_volatility.columns.set_names('Market Regimes', level=0)
+    # mase_per_volatility = mase_per_volatility.style.format(decimal='.', thousands=',', precision=4)
+    # with open(f'{args.target_path}/crypto_option_spot/mase_per_volatility.txt', 'w') as mase_per_volatility_file:
+    #     mase_per_volatility_file.writelines(mase_per_volatility.to_latex())
+    mase_conditional = \
         best_model.groupby(by=[pd.Grouper(level='D'),
                                pd.Grouper(key='volatility_regime'), pd.Grouper(key='market')])[['MASE']].mean()
-    mase_per_volatility_copy = mase_per_volatility.copy()
-    mase_per_volatility_copy = \
-        mase_per_volatility.groupby(by=[pd.Grouper(level='D'),
-                                        pd.Grouper(level='volatility_regime')],
-                                    group_keys=False).apply(lambda x: 100 * x.pct_change()).round(4)
-    mase_per_volatility = mase_per_volatility_copy.fillna(mase_per_volatility)
-    mase_per_volatility = mase_per_volatility.unstack([1, -1])
-    mase_per_volatility = mase_per_volatility.loc[:, [('MASE', 'Low', 0), ('MASE', 'Low', 1),
-                                                      ('MASE', 'Normal', 0), ('MASE', 'Normal', 1),
-                                                      ('MASE', 'High', 0), ('MASE', 'High', 1)]]
-    mase_per_volatility.index = mase_per_volatility.index.str.lower()
-    mase_per_volatility = mase_per_volatility.loc[d_order.categories, :]
-    mase_per_volatility.loc[:, mase_per_volatility.columns.get_level_values(2) == 1] = \
-        mase_per_volatility.loc[:, mase_per_volatility.columns.get_level_values(2) == 1].round(2)
-    mase_per_volatility.columns = mase_per_volatility.columns.set_names('Market Regimes', level=0)
-    mase_per_volatility = mase_per_volatility.style.format(decimal='.', thousands=',', precision=4)
-    with open(f'{args.target_path}/crypto_option_spot/mase_per_volatility.txt', 'w') as mase_per_volatility_file:
-        mase_per_volatility_file.writelines(mase_per_volatility.to_latex())
+    mase_conditional_copy = mase_conditional.copy()
+    mase_conditional_copy = \
+        mase_conditional.groupby(by=[pd.Grouper(level='D'),
+                                     pd.Grouper(level='volatility_regime')],
+                                 group_keys=False).apply(lambda x: 100 * x.pct_change()).round(4)
+    mase_conditional = mase_conditional_copy.fillna(mase_conditional)
+    mase_conditional = mase_conditional.unstack([1, -1])
+    mase_conditional = mase_conditional.loc[:, [('MASE', 'Low', 0), ('MASE', 'Low', 1),
+                                                ('MASE', 'Normal', 0), ('MASE', 'Normal', 1),
+                                                ('MASE', 'High', 0), ('MASE', 'High', 1)]]
+    mase_conditional.index = mase_conditional.index.str.lower()
+    mase_conditional = mase_conditional.loc[d_order.categories, :]
+    mase_conditional.loc[:, mase_conditional.columns.get_level_values(2) == 1] = \
+        mase_conditional.loc[:, mase_conditional.columns.get_level_values(2) == 1].round(2)
+    mase_conditional.columns = mase_conditional.columns.set_names('Market Regimes', level=0)
+    mase_unconditional = best_model.groupby(by=[pd.Grouper(level='D'), pd.Grouper(key='market')])[['MASE']].mean()
+    mase_unconditional_copy = mase_unconditional.copy()
+    mase_unconditional = mase_unconditional.groupby(by=pd.Grouper(level='D'), group_keys=False).apply(
+        lambda x: 100 * x.pct_change()).round(4)
+    mase_unconditional = mase_unconditional.fillna(mase_unconditional_copy)
+    mase_unconditional = mase_unconditional.unstack(-1)
+    mase_unconditional.index = mase_unconditional.index.str.lower()
+    mase_unconditional = mase_unconditional.loc[d_order.categories, :]
+    mase_unconditional.columns = pd.MultiIndex.from_product([['MASE'], [''], [0, 1]],
+                                                            names=['Market Regimes', 'volatility_regime', 'market'])
+    mase_performance = pd.concat([mase_unconditional, mase_conditional], axis=1)
+    mase_performance = mase_performance.style.format(decimal='.', thousands=',', precision=4)
+    with open(f'{args.target_path}/crypto_option_spot/mase_performance.txt', 'w') as mase_performance_file:
+        mase_performance_file.writelines(mase_performance.to_latex())
     ####################################################################################################################
     ## Features and target values
     ####################################################################################################################
@@ -1008,7 +1040,6 @@ if __name__ == '__main__':
     data = \
         pd.pivot_table(data=data, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
                        index='timestamp')
-    data.index = pd.to_datetime(data.index, utc=True)
     framework_application_obj.data = data.resample(best_model_tags[-1]).sum().dropna()
     scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags[-1])
     rv_idx = pd.IndexSlice
@@ -1042,7 +1073,7 @@ if __name__ == '__main__':
     returns = data.xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
     returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
     rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
-    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan).pow(.5).mul(scaling_factor ** .5)
+    rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
     if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
         vrp = pd.read_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
@@ -1148,7 +1179,6 @@ pnl.index = pnl.index.set_names(['aggregated', 'target', 'timestamp'])
 pnl.to_csv(f'{args.target_path}/crypto_option_spot/pnl.csv')
 pnl.to_sql(name='pnl', con=framework_application_obj.db_connect, if_exists='replace', index=True)
 print(f'[Insertion]: P&L has been inserted into the database.')
-print(f'[Insertion]: Trading volume has been inserted into the database.')
 daily_pnl = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean()
 sharpe_mean = pnl.groupby(by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=2, freq='1D')]).mean().groupby(
     by=[pd.Grouper(level=0), pd.Grouper(level=1)]).mean().stack()
