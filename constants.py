@@ -33,8 +33,8 @@ VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for DL architecture
-PARAMS_DL = {'hidden_size': [2**n for n in range(1, 4)], 'num_layers': [1],
-             'learning_rate': [0.01, 0.05, 0.1], 'beta': list(np.linspace(0, 1, 11)), 'dropout': [.1, .2]}
+PARAMS_DL = {'hidden_size': [32, 64, 128, 256], 'num_layers': [1, 2],
+             'learning_rate': [1e-4, 5e-4, 1e-3, 5e-3], 'beta': list(np.linspace(1, 10, 10)), 'dropout': [.1, .2]}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
 # Font sizes for plots
 TITLE_FONT_SIZE = 40
