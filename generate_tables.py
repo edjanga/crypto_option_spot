@@ -241,10 +241,10 @@ def objective_daily(trial: optuna.trial.Trial, transaction_cost: bool, spread: b
             signal_filter_short.columns.set_levels(signal_filter_short.columns.levels[-1].str.lower(), level=-1)
         option_chain_data = kwargs['option_chain_data']
         param.update(
-            dict([('lower_bound_atm', trial.suggest_float(name='lower_bound_atm', low=np.log(-.1 + LOW_ATM_MONEYNESS),
+            dict([('lower_bound_atm', trial.suggest_float(name='lower_bound_atm', low=np.log(LOW_ATM_MONEYNESS),
                                                           high=np.log(LOW_ATM_MONEYNESS))),
                   ('upper_bound_atm', trial.suggest_float(name='upper_bound_atm', low=np.log(HIGH_ATM_MONEYNESS),
-                                                          high=np.log(.1 + HIGH_ATM_MONEYNESS)))]))
+                                                          high=np.log(HIGH_ATM_MONEYNESS)))]))
         ################################################################################################################
         ## BS pricing + Put Call Parity
         ################################################################################################################
