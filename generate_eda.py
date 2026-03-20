@@ -87,10 +87,15 @@ class EDA:
                     iv = iv.sort(by=[pl.col('underlying_name'), pl.col('type')])
                     iv = iv.group_by(['underlying_name', 'type']).agg(pl.col('mark_iv').min().alias('min'),
                                                                       pl.col('mark_iv').mean().alias('mean'),
-                                                                      pl.col('mark_iv').max().alias('max')).collect()
+                                                                      pl.col('mark_iv').max().alias('max'),
+                                                                      pl.col('mark_iv').quantile(0.75).alias('75'),
+                                                                      pl.col('mark_iv').quantile(0.50).alias('50'),
+                                                                      pl.col('mark_iv').quantile(0.25).alias('25'),
+                                                                      ).collect()
                     iv = \
-                        iv.to_pandas().set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
-                    iv.index = pd.MultiIndex.from_product([['IV'], ['max', 'mean', 'min']])
+                        iv.to_pandas().set_index(['underlying_name', 'type']).transpose().loc[
+                        ['max', 'mean', 'min', '75', '50', '25'], :]
+                    iv.index = pd.MultiIndex.from_product([['IV'], ['max', 'mean', 'min', '75', '50', '25']])
                     if iv_eda.get(symbol) is None:
                         iv_eda[symbol] = iv
                     else:
@@ -122,11 +127,16 @@ class EDA:
                     ####################################################################################################
                     time2mat = option_chain.select(['underlying_name', 'type', 'tau'])
                     time2mat = time2mat.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                    time2mat = time2mat.group_by(['underlying_name', 'type']).agg(pl.col('tau').min().alias('min'),
-                        pl.col('tau').mean().alias('mean'), pl.col('tau').max().alias('max')).collect().to_pandas()
+                    time2mat = time2mat.group_by(['underlying_name', 'type']).agg(
+                        pl.col('tau').min().alias('min'), pl.col('tau').mean().alias('mean'),
+                        pl.col('tau').max().alias('max'), pl.col('mark_iv').quantile(0.75).alias('75'),
+                        pl.col('mark_iv').quantile(0.50).alias('50'), pl.col('mark_iv').quantile(0.25).alias('25')
+                    ).collect().to_pandas()
                     time2mat = \
-                        time2mat.set_index(['underlying_name', 'type']).transpose().loc[['max', 'mean', 'min'], :]
-                    time2mat.index = pd.MultiIndex.from_product([['Time to maturity'], ['max', 'mean', 'min']])
+                        time2mat.set_index(['underlying_name', 'type']).transpose().loc[
+                        ['max', 'mean', 'min', '75', '50', '25'], :]
+                    time2mat.index = pd.MultiIndex.from_product([['Time to maturity'],
+                                                                 ['max', 'mean', 'min', '75', '50', '25']])
                     if time2mat_eda.get(symbol) is None:
                         time2mat_eda[symbol] = time2mat
                     else:
@@ -190,8 +200,7 @@ class EDA:
                                                    lambda x: x.quantile(.5), lambda x: x.quantile(.25)])
             summary_eda['Annualised RV'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
             summary_eda = pd.concat(summary_eda)[SYMBOLS]
-        summary_eda = summary_eda.style.format(decimal='.', thousands=',',
-                                               precision={True: 2, False: 6}[options])
+        summary_eda = summary_eda.style.format(decimal='.', thousands=',', precision={True: 2, False: 4}[options])
         with open(f'{self._target_path}'
                   f'/crypto_option_spot/summary{dict([(True, "_options"), (False, "")])[options]}.txt', 'w') as \
                 summary_file:
@@ -207,4 +216,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     eda_obj = EDA(target_path=args.target_path)
     eda_obj.summary(options=False)
-    eda_obj.summary()
+    # eda_obj.summary()
