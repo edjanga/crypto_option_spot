@@ -28,30 +28,32 @@ if __name__ == '__main__':
     parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target', type=str, help='RV or returns.', default='returns')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
-                        default='../metric.csv')
+                        default='./data_centre')
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
     args = parser.parse_args()
     print(args)
     dates = list(pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left'))
     dates = list(map(lambda date: date.date(), dates))
     feature_builder = FeatureBuilder()
-    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
+    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot/crypto_option_spot.db',
+                                 check_same_thread=False)
     ####################################################################################################################
     ## Spot
     ####################################################################################################################
     SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
     SYMBOLS_QUERY = f'({",".join(SYMBOLS_QUERY)})'
-    features_query = f'WITH base AS(SELECT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
+    features_query = f'WITH base AS(SELECT DISTINCT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
     f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
                      f'features_values FROM base ' \
     f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
     f'FROM base;'
     features = pl.read_database(query=features_query, connection=db_connect)
-    features = features.with_columns([pl.col('timestamp').str.to_datetime().dt.replace_time_zone('UTC'),
-                                      pl.col('features_values').cast(pl.Float32, strict=False)]).filter(
-        (pl.col('timestamp') >= pl.lit(args.start_date)) & (pl.col('timestamp') < pl.lit(args.end_date)))
-    features = features.pivot(values='features_values', index=['underlying_name', 'timestamp'], columns='features')
-    features = features.sort(['underlying_name', 'timestamp'])
+    features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
+                                      pl.col('features_values').cast(pl.Float32, strict=False)])
+    features = features.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
+        (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))).to_pandas()
+    features = \
+        features.pivot_table(values='features_values', index=['underlying_name', 'timestamp'], columns='features')
     ####################################################################################################################
     ## Options
     ####################################################################################################################
@@ -61,12 +63,13 @@ if __name__ == '__main__':
             f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
         options_features = pl.read_database(query=options_features_query, connection=db_connect)
         options_features = \
-            options_features.with_columns([pl.col('timestamp').str.to_datetime().dt.replace_time_zone('UTC'),
-                                           pl.col('features_values').cast(pl.Float32, strict=False)]).filter(
-                (pl.col('timestamp') >= pl.lit(args.start_date)) & (pl.col('timestamp') < pl.lit(args.end_date)))
-        options_features = options_features.sort(['underlying_name', 'timestamp'])
+            options_features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
+                                           pl.col('features_values').cast(pl.Float32, strict=False)])
+        options_features = \
+            options_features.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
+                                   (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True))))
         options_features = options_features.with_columns(pl.all().exclude(['underlying_name', 'timestamp'])
-                                                         .forward_fill().over('underlying_name'))
+                                                         .forward_fill().over('underlying_name')).to_pandas()
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
     except Exception:
         main_features = features
