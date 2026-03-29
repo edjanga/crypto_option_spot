@@ -33,7 +33,7 @@ VOL_REGIMES = ['Low', 'Normal', 'High']
 # Number of times features get shuffled
 N_SHUFFLES = 50
 # Params for DL architecture
-PARAMS_DL = {'hidden_size': [128, 256, 512], 'num_layers': [1, 2],
+PARAMS_DL = {'hidden_size': [128, 256, 512], 'num_layers': [2, 3],
              'learning_rate': [1e-3, 5e-3], 'beta': list(np.linspace(1, 10, 10)), 'dropout': [.1, .2],
              'batch_size': [512]}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
