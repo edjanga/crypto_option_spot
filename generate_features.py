@@ -36,7 +36,7 @@ if __name__ == '__main__':
                         help='Tag indicating whether options dynamics are included in the models', default=0)
     parser.add_argument('--D', type=str, help='Number of days ahead to forecast values for', default='1M')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
-                        default='../data_centre')
+                        default='../metric.csv')
     parser.add_argument('--collect', type=int, help='Whether to have all data stored in memory or not',
                         default=1)
     args = parser.parse_args()
@@ -149,7 +149,7 @@ if __name__ == '__main__':
                         .otherwise(pl.lit('contemporaneous'))
                         .alias('lag'), pl.lit(args.freq).alias('freq')]
                     )
-                    agg_option_chain_data = agg_option_chain_data.collect(engine=ENGINE).to_pandas()
+                    agg_option_chain_data = agg_option_chain_data.collect().to_pandas()
                     agg_option_chain_data.to_sql(name='option_features', con=db_connect, if_exists='append',
                                                  index=False)
                     print(
