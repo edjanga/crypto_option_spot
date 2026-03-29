@@ -160,6 +160,8 @@ class FeatureBuilder:
             exposure = exposure.with_columns(expr.alias(exp))
         if 'min' in freq:
             pl_freq = freq.replace('min', 'm')
+        else:
+            pl_freq = freq
         exposure = exposure.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by='underlying_name').agg([pl.col(exp).sum() for exp in
                                                                                 ['gex', 'vax', 'vex', 'vox']])
