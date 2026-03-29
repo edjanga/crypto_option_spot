@@ -36,12 +36,14 @@ if __name__ == '__main__':
                         help='Tag indicating whether options dynamics are included in the models', default=0)
     parser.add_argument('--D', type=str, help='Number of days ahead to forecast values for', default='1M')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
-                        default='../metric.csv')
+                        default='../data_centre')
     parser.add_argument('--collect', type=int, help='Whether to have all data stored in memory or not',
                         default=1)
     args = parser.parse_args()
     print(f'[Generation]: Features {args} generation process has started..............................................')
-    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False)
+    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db', check_same_thread=False,
+                                 timeout=30)
+    db_connect.execute('PRAGMA journal_mode=WAL;')
     feature_builder = FeatureBuilder()
     collect = bool(args.collect)
     ####################################################################################################################
