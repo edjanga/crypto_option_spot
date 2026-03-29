@@ -153,7 +153,7 @@ if __name__ == '__main__':
                     )
                     agg_option_chain_data = agg_option_chain_data.collect().to_pandas()
                     agg_option_chain_data.to_sql(name='option_features', con=db_connect, if_exists='append',
-                                                 index=False)
+                                                 index=False, chunksize=10_000)
                     print(
                         f'[Features]: Option features for {symbol} between {date.strftime(DATE_FORMAT)} and '
                         f'{(date+relativedelta(days=30)).strftime(DATE_FORMAT)} have been inserted.')
