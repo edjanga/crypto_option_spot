@@ -323,6 +323,7 @@ class DLRegressor:
                     positiveness: bool, cols_ignore: List[str], n_trials: int, target: str) -> None:
         X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
         X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
+
         def objective(trial: optuna.Trial):
             params = {
                 'hidden_size': trial.suggest_categorical('hidden_size', PARAMS_DL['hidden_size']),
@@ -348,6 +349,9 @@ class DLRegressor:
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
+            if len(X_valid_s) == 0:
+                print("Warning: validation set is empty, skipping trial")
+                return float('inf')
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
@@ -382,6 +386,7 @@ class DLRegressor:
                                   logger=False, enable_progress_bar=False)
         trainer.fit(self._model, loader)
 
+
 class GRUModel(p_light.LightningModule):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, lr: float,
                  output_size: int = 1, positiveness: bool = False):
@@ -413,9 +418,6 @@ class GRUModel(p_light.LightningModule):
         loss = F.mse_loss(y_hat, y)
         self.log('valid_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
-
-    # def configure_optimizers(self):
-    #     return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5, fused=True)
