@@ -126,7 +126,7 @@ if __name__ == '__main__':
                     train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
                 model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y,
                                   n_trials=N_TRIALS//20, positiveness=args.target == 'RV',
-                                  cols_ignore_in_scaling=cols_ignore_in_scaling)
+                                  cols_ignore=cols_ignore_in_scaling)
                 models.loc[date] = model
                 standard_scaler = model.standardscaler
         models = models.ffill()

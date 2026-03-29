@@ -450,9 +450,11 @@ class DLRegressor:
             trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=DEVICE, devices=1, precision='16-mixed',
                                       callbacks=[pruning_cb, early_stop_cb], logger=False, enable_progress_bar=False)
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
-                                      batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
+                                      batch_size=params['batch_size'], num_workers=4, pin_memory=True,
+                                      persistent_workers=True)
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
-                                      batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
+                                      batch_size=params['batch_size'], num_workers=4, pin_memory=True,
+                                      persistent_workers=True)
             trainer.fit(model, train_loader, valid_loader)
             return trainer.callback_metrics['valid_loss'].item()
         study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
