@@ -23,6 +23,7 @@ from torch.utils.data import Dataset
 import torch.nn as nn
 import torch.nn.functional as F
 
+torch.set_float32_matmul_precision('high')
 DEVICE = 'cpu'
 if torch.backends.mps.is_available():
     DEVICE = 'mps'
@@ -345,13 +346,11 @@ class DLRegressor:
             precision = 16 if accelerator == 'gpu' else 32
             trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=accelerator,
                                       devices=1, precision=precision, callbacks=[pruning_cb, early_stop_cb],
-                                      logger=False, enable_progress_bar=False, check_val_every_n_epoch=1)
+                                      logger=False, enable_progress_bar=False, check_val_every_n_epoch=1,
+                                      gradient_clip_val=1.0))
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
-            if len(X_valid_s) == 0:
-                print("Warning: validation set is empty, skipping trial")
-                return float('inf')
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
