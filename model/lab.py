@@ -72,10 +72,9 @@ class FeatureBuilder:
         aggs = [pl.sum('returns').alias('returns')]
         K = (pd.to_timedelta('1D') // pd.to_timedelta(freq))
         for m in range(2, upperbound + 1):
+            aggs.append((pl.col('returns') ** m).sum().alias(f'm{m}'))
             if m == 2:
-                aggs.append((pl.col('returns') ** 2).sum().alias('m2'))
-            else:
-                aggs.append((pl.col('returns') ** m).sum().alias(f'm{m}'))
+                aggs.append((pl.col('returns') ** 2).sum().alias('RV'))
         moments = data.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name').agg(aggs)
         for m in range(3, upperbound + 1):
             moments = moments.with_columns((((pl.lit(K) / pl.col('m2')) ** m) ** 0.5).alias(f'm{m}'))
