@@ -351,7 +351,7 @@ class DLRegressor:
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
-            trainer.fit(model, train_loader, valid_loader)
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
             metrics = trainer.callback_metrics
             val_loss = metrics.get('valid_loss')
             if val_loss is None:
@@ -411,7 +411,7 @@ class GRUModel(p_light.LightningModule):
         x, y = batch
         y_hat = self(x)
         loss = F.mse_loss(y_hat, y)
-        self.log('valid_loss', loss, on_step=False, on_epoch=True)
+        self.log('valid_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
