@@ -11,7 +11,7 @@ from model.lab import FeatureBuilder, LassoRegressor, ElasticRegressor, Boosting
     PermutationFeatureImportance
 from dateutil.relativedelta import relativedelta
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), GRURegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
@@ -28,7 +28,7 @@ if __name__ == '__main__':
     parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target', type=str, help='RV or returns.', default='returns')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
-                        default='../data_centre')
+                        default='../metric.csv')
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
     args = parser.parse_args()
     print(args)
@@ -140,7 +140,7 @@ if __name__ == '__main__':
                 train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
                     train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
                 model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y,
-                                  n_trials=N_TRIALS//20, max_epochs=EPOCH, positiveness=args.target == 'RV',
+                                  n_trials=N_TRIALS//20, positiveness=args.target == 'RV',
                                   cols_ignore_in_scaling=cols_ignore_in_scaling)
                 models.loc[date] = model
                 standard_scaler = model.standardscaler
@@ -180,7 +180,6 @@ if __name__ == '__main__':
                 test_X = test_X.loc[test_X.index.get_level_values(0).isin(
                     train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
                 test_y = test_y.loc[test_X.index]
-            # if model.name in ['lasso', 'elastic']:
             for symbol in test_X.index.get_level_values(0).unique():
                 test_X.loc[test_X.index.get_level_values(0) == symbol,
                 ~test_X.columns.isin(cols_ignore_in_scaling)] = \

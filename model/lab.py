@@ -441,7 +441,7 @@ class DLRegressor:
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
                     model_class: Type[p_light.LightningModule], positiveness: bool, cols_ignore: List[str],
-                    batch_size: int, n_trials: int) -> None:
+                    n_trials: int) -> None:
         X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
         X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
         def objective(trial: optuna.Trial):
