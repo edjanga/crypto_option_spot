@@ -414,8 +414,15 @@ class GRUModel(p_light.LightningModule):
         self.log('valid_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
+    # def configure_optimizers(self):
+    #     return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5, fused=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'monitor': 'valid_loss', 'interval': 'epoch', 'frequency': 1}
+                }
 
 
 class GRURegressor(DLRegressor):
