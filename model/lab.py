@@ -64,31 +64,50 @@ class FeatureBuilder:
         pass
 
     @staticmethod
+    # def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 6) -> pl.DataFrame:
+    #     if isinstance(data, pl.DataFrame):
+    #         data = data.lazy()
+    #     pl_freq = freq[:-2] if 'min' in freq else freq
+    #     moments = \
+    #         data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
+    #             index_column='timestamp', every=pl_freq, by='underlying_name').sum()
+    #     K = (pd.to_timedelta('1D') // pd.to_timedelta(freq))
+    #     for m in range(2, upperbound + 1):
+    #         if m > 2:
+    #             tmp = data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
+    #                 index_column='timestamp', every=pl_freq,
+    #                 by='underlying_name').agg([
+    #                 (pl.col('returns') ** 2).sum().alias(f'm2'), (pl.col('returns') ** m).sum().alias(f'm{m}')])
+    #             tmp = tmp.with_columns((((K / pl.col(f'm2')) ** m) ** .5).alias(f'm{m}')).drop('m2')
+    #         else:
+    #             tmp = data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
+    #                 index_column='timestamp', every=pl_freq,
+    #                 by='underlying_name').agg([(pl.col('returns') ** m).sum().alias(f'm{m}')])
+    #         moments = moments.join(tmp, on=['underlying_name', 'timestamp'])
+    #     moments = \
+    #         moments.with_columns([
+    #             pl.when(pl.col(m) == float("inf")).then(np.finfo(np.float32).max).when(
+    #                 pl.col(m) == -float("inf")).then(np.finfo(np.float32).min).otherwise(pl.col(m)).alias(m) for m in
+    #             ['returns']+[f'm{m}' for m in range(2, upperbound + 1)]])
+    #     return moments.collect(engine=ENGINE)
     def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 6) -> pl.DataFrame:
         if isinstance(data, pl.DataFrame):
             data = data.lazy()
-        pl_freq = freq[:-2] if 'min' in freq else freq
-        moments = \
-            data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-                index_column='timestamp', every=pl_freq, by='underlying_name').sum()
+        pl_freq = freq[:-3] if 'min' in freq else freq
+        data = data.sort(['underlying_name', 'timestamp'])
+        aggs = [pl.sum('returns').alias('returns')]
         K = (pd.to_timedelta('1D') // pd.to_timedelta(freq))
         for m in range(2, upperbound + 1):
-            if m > 2:
-                tmp = data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-                    index_column='timestamp', every=pl_freq,
-                    by='underlying_name').agg([
-                    (pl.col('returns') ** 2).sum().alias(f'm2'), (pl.col('returns') ** m).sum().alias(f'm{m}')])
-                tmp = tmp.with_columns((((K / pl.col(f'm2')) ** m) ** .5).alias(f'm{m}')).drop('m2')
+            if m == 2:
+                aggs.append((pl.col('returns') ** 2).sum().alias('m2'))
             else:
-                tmp = data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-                    index_column='timestamp', every=pl_freq,
-                    by='underlying_name').agg([(pl.col('returns') ** m).sum().alias(f'm{m}')])
-            moments = moments.join(tmp, on=['underlying_name', 'timestamp'])
-        moments = \
-            moments.with_columns([
-                pl.when(pl.col(m) == float("inf")).then(np.finfo(np.float32).max).when(
-                    pl.col(m) == -float("inf")).then(np.finfo(np.float32).min).otherwise(pl.col(m)).alias(m) for m in
-                ['returns']+[f'm{m}' for m in range(2, upperbound + 1)]])
+                aggs.append((pl.col('returns') ** m).sum().alias(f'm{m}'))
+        moments = data.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name').agg(aggs)
+        for m in range(3, upperbound + 1):
+            moments = moments.with_columns((((pl.lit(K) / pl.col('m2')) ** m) ** 0.5).alias(f'm{m}'))
+        for m in ['returns'] + [f'm{m}' for m in range(2, upperbound + 1)]:
+            moments = moments.with_columns(pl.when(pl.col(m) == float('inf')).then(np.finfo(np.float32).max).otherwise(
+                pl.when(pl.col(m) == -float('inf')).then(np.finfo(np.float32).min).otherwise(pl.col(m))).alias(m))
         return moments.collect(engine=ENGINE)
 
     @staticmethod
