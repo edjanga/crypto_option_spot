@@ -64,32 +64,6 @@ class FeatureBuilder:
         pass
 
     @staticmethod
-    # def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 6) -> pl.DataFrame:
-    #     if isinstance(data, pl.DataFrame):
-    #         data = data.lazy()
-    #     pl_freq = freq[:-2] if 'min' in freq else freq
-    #     moments = \
-    #         data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-    #             index_column='timestamp', every=pl_freq, by='underlying_name').sum()
-    #     K = (pd.to_timedelta('1D') // pd.to_timedelta(freq))
-    #     for m in range(2, upperbound + 1):
-    #         if m > 2:
-    #             tmp = data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-    #                 index_column='timestamp', every=pl_freq,
-    #                 by='underlying_name').agg([
-    #                 (pl.col('returns') ** 2).sum().alias(f'm2'), (pl.col('returns') ** m).sum().alias(f'm{m}')])
-    #             tmp = tmp.with_columns((((K / pl.col(f'm2')) ** m) ** .5).alias(f'm{m}')).drop('m2')
-    #         else:
-    #             tmp = data.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
-    #                 index_column='timestamp', every=pl_freq,
-    #                 by='underlying_name').agg([(pl.col('returns') ** m).sum().alias(f'm{m}')])
-    #         moments = moments.join(tmp, on=['underlying_name', 'timestamp'])
-    #     moments = \
-    #         moments.with_columns([
-    #             pl.when(pl.col(m) == float("inf")).then(np.finfo(np.float32).max).when(
-    #                 pl.col(m) == -float("inf")).then(np.finfo(np.float32).min).otherwise(pl.col(m)).alias(m) for m in
-    #             ['returns']+[f'm{m}' for m in range(2, upperbound + 1)]])
-    #     return moments.collect(engine=ENGINE)
     def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 6) -> pl.DataFrame:
         if isinstance(data, pl.DataFrame):
             data = data.lazy()
@@ -146,6 +120,7 @@ class FeatureBuilder:
     @staticmethod
     def compute_exposure(data: pl.DataFrame, freq: str, collect: bool = True) -> pd.DataFrame:
         exposure = data
+        pl_freq = freq.replace('min', 'm')
         for exp, greek in GREEKS_EXPOSURE.items():
             if exp == 'dex':
                 expr = (pl.col('netDealerExposure') * pl.col(greek) * pl.col('underlying_price'))
@@ -158,21 +133,16 @@ class FeatureBuilder:
             elif exp == "vox":
                 expr = (pl.col('vax') * (-pl.col('moneyness') - 0.5 * pl.col('tau') * (pl.col('mark_iv') ** 2)))
             exposure = exposure.with_columns(expr.alias(exp))
-        if 'min' in freq:
-            pl_freq = freq.replace('min', 'm')
-        else:
-            pl_freq = freq
         exposure = exposure.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by='underlying_name').agg([pl.col(exp).sum() for exp in
                                                                                 ['gex', 'vax', 'vex', 'vox']])
         if collect:
-            exposure = exposure.collect(engine=ENGINE)
+            exposure = exposure.collect()
         return exposure
 
     @staticmethod
     def put_call_ratio(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame|pl.LazyFrame:
-        if 'min' in freq:
-            pl_freq = freq.replace('min', 'm')
+        pl_freq = freq.replace('min', 'm')
         data.filter(pl.col('type') == 'put')
         pcr = data.filter(pl.col('type') == 'put').sort(by=[pl.col('underlying_name'), pl.col('type'),
                                                             pl.col('timestamp')]).group_by_dynamic(
@@ -184,16 +154,15 @@ class FeatureBuilder:
         pcr = pcr.with_columns((pl.col('volume')/pl.col('volume_call')).alias('pcr')).drop(
             ['type', 'volume', 'volume_call', 'type_call'])
         if collect:
-            pcr = pcr.collect(engine=ENGINE)
+            pcr = pcr.collect()
         return pcr
 
     @staticmethod
     def spread(data: pl.DataFrame, freq: str, collect: bool = True) -> pl.DataFrame:
-        if 'min' in freq:
-            pl_freq = freq.replace('min', 'm')
+        pl_freq = freq.replace('min', 'm')
         spread = data
         if collect:
-            spread = spread.collect(engine=ENGINE)
+            spread = spread.collect()
         spread = spread.select(['underlying_name', 'timestamp', 'type', 'spread'])
         spread = spread.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(pl.col('spread').mean())
@@ -204,8 +173,7 @@ class FeatureBuilder:
 
     @staticmethod
     def label_market_participants(data: pl.DataFrame, freq: str) -> pl.DataFrame:
-        if 'min' in freq:
-            pl_freq = freq.replace('min', 'm')
+        pl_freq = freq.replace('min', 'm')
         mkt_participants = data.sort(by=[pl.col('underlying_name'), pl.col('type'),
                                          pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(
