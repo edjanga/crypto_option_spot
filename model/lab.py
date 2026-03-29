@@ -340,9 +340,11 @@ class DLRegressor:
                                  dropout=params['dropout'] if params['num_layers'] > 1 else 0.0)
             pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
-            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator={'cuda': 'gpu', 'cpu': 'cpu'}[DEVICE],
-                                      devices=1, precision=16, callbacks=[pruning_cb, early_stop_cb],
-                                      logger=False, enable_progress_bar=False)
+            accelerator = 'gpu' if 'cuda' in DEVICE else 'cpu'
+            precision = 16 if accelerator == 'gpu' else 32
+            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=accelerator,
+                                      devices=1, precision=precision, callbacks=[pruning_cb, early_stop_cb],
+                                      logger=False, enable_progress_bar=False, check_val_every_n_epoch=1)
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
@@ -350,7 +352,11 @@ class DLRegressor:
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
             trainer.fit(model, train_loader, valid_loader)
-            return trainer.callback_metrics['valid_loss'].item()
+            metrics = trainer.callback_metrics
+            val_loss = metrics.get('valid_loss')
+            if val_loss is None:
+                return float('inf')
+            return val_loss.item()
         study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
         study.optimize(objective, n_trials=n_trials)
         print(f'Best trial parameters: {study.best_params}')
@@ -365,13 +371,16 @@ class DLRegressor:
         if self._model is None:
             return
         for name, param in self._model.named_parameters():
-            param.requires_grad = ('fc' in name)
-        loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=len(train_X),
+            param.requires_grad = name.startswith('fc')
+        if hasattr(self._model, 'lr'):
+            self._model.lr *= 0.1
+        loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=min(1024, len(train_X)),
                             num_workers=4, pin_memory=True)
-        trainer = p_light.Trainer(max_epochs=epochs, accelerator={'cuda': 'gpu', 'cpu': 'cpu'}[DEVICE], devices=1,
-                                  precision=16, logger=False, enable_progress_bar=False)
+        accelerator = 'gpu' if 'cuda' in DEVICE else 'cpu'
+        precision = 16 if accelerator == 'gpu' else 32
+        trainer = p_light.Trainer(max_epochs=epochs, accelerator=accelerator, devices=1, precision=precision,
+                                  logger=False, enable_progress_bar=False)
         trainer.fit(self._model, loader)
-
 
 class GRUModel(p_light.LightningModule):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, lr: float,
