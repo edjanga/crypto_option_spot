@@ -461,7 +461,7 @@ class DLRegressor:
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
-            trainer.fit(self._model, train_loader, valid_loader)
+            trainer.fit(model, train_loader, valid_loader)
             return trainer.callback_metrics['valid_loss'].item()
         study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
         study.optimize(objective, n_trials=n_trials)
@@ -486,8 +486,8 @@ class DLRegressor:
 
 
 class GRUModel(p_light.LightningModule):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, output_size: int = 1,
-                 positiveness: bool = False):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, lr: float,
+                 output_size: int = 1, positiveness: bool = False):
         super().__init__()
         self.save_hyperparameters()
         self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
