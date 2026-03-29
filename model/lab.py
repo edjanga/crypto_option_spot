@@ -13,7 +13,6 @@ from optuna.samplers import RandomSampler
 from functools import partial
 import lightgbm as lgb
 from torch.utils.data import DataLoader
-from .dl_room import TimeSeriesDataset
 from sklearn.preprocessing import StandardScaler
 import polars as pl
 import pytorch_lightning as p_light
