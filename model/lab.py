@@ -79,9 +79,6 @@ class FeatureBuilder:
         moments = data.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name').agg(aggs)
         for m in range(3, upperbound + 1):
             moments = moments.with_columns((((pl.lit(K) / pl.col('m2')) ** m) ** 0.5).alias(f'm{m}'))
-        # for m in ['returns'] + [f'm{m}' for m in range(2, upperbound + 1)]:
-        #     moments = moments.with_columns(pl.when(pl.col(m) == float('inf')).then(np.finfo(np.float32).max).otherwise(
-        #         pl.when(pl.col(m) == -float('inf')).then(np.finfo(np.float32).min).otherwise(pl.col(m))).alias(m))
         return moments.collect()
 
     @staticmethod
@@ -280,116 +277,6 @@ class BoostingRegressor(Regressor):
         super(BoostingRegressor, self).__init__(name=name)
 
 
-# class DLRegressor(Regressor):
-#     def __init__(self, name: str, **kwargs):
-#         super(DLRegressor, self).__init__(name=name)
-#         if len(kwargs) > 0:
-#             self._model = DLRegressor(**kwargs)
-#         self._standardscaler = dict()
-#
-#     @property
-#     def standardscaler(self) -> Dict[(str, StandardScaler)]:
-#         return self._standardscaler
-#
-#     @property
-#     def model(self) -> Union[LSTMModel, GRUModel]:
-#         return self._model
-#
-#     @model.setter
-#     def model(self, model: Union[LSTMModel, GRUModel]) -> None:
-#         self._model = model
-#
-#     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-#                     positiveness: bool,  cols_ignore_in_scaling: List[str], batch_size: int, n_trials: int = N_TRIALS,
-#                     max_epochs: int = EPOCH) -> None:
-#         params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
-#         for symbol in train_X.index.get_level_values(0).unique():
-#             self._standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
-#             train_X.loc[
-#                 train_X.index.get_level_values(0) == symbol, ~train_X.columns.isin(cols_ignore_in_scaling)] = \
-#                 self._standardscaler[symbol].fit_transform(X=train_X.loc[train_X.index.get_level_values(0) == symbol,
-#                 ~train_X.columns.isin(cols_ignore_in_scaling)])
-#             valid_X.loc[
-#                 valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
-#                 self._standardscaler[symbol].transform(
-#                     X=valid_X.loc[
-#                         valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)])
-#         train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
-#         valid_dataset = TimeSeriesDataset(valid_X.values, valid_y.values)
-#         train_loader = \
-#             DataLoader(train_dataset, batch_size=batch_size, num_workers=0, persistent_workers=True, pin_memory=True)
-#         valid_loader = \
-#             DataLoader(valid_dataset, batch_size=batch_size, num_workers=0, persistent_workers=True, pin_memory=True)
-#         best_valid_loss = float('inf')
-#         best_params = None
-#         best_model = None
-#         for trial, params in enumerate(params_list):
-#             print(f'\nTrial {trial + 1}/{n_trials}')
-#             print(f'Parameters: {params}')
-#             if isinstance(self, LSTMRegressor):
-#                 model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
-#                                   num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-#                                   batch_size=params['batch_size'], feature_names=train_X.columns.tolist(),
-#                                   positiveness=positiveness, dropout=params['dropout'], beta=params['beta'])
-#             elif isinstance(self, GRURegressor):
-#                 model = GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
-#                                  num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-#                                  batch_size=params['batch_size'], feature_names=train_X.columns.tolist(),
-#                                  positiveness=positiveness, dropout=params['dropout'], beta=params['beta'])
-#             trainer = \
-#                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
-#                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
-#                                 enable_progress_bar=True, num_sanity_val_steps=0, accelerator=DEVICE,
-#                                 precision='bf16-mixed')
-#             trainer.fit(model, train_loader, valid_loader)
-#             valid_loss = trainer.callback_metrics.get('valid_loss', float('inf'))
-#             if valid_loss < best_valid_loss:
-#                 best_valid_loss = valid_loss
-#                 best_params = params
-#                 best_model = model
-#             print(f'Trial {trial + 1} completed. Validation loss: {valid_loss:.4f}')
-#         print('\nBest parameters:', best_params)
-#         print(f'Best validation loss: {best_valid_loss:.2f}')
-#         self._model = best_model
-#
-#     @staticmethod
-#     def model_fine_tune(train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
-#                         date: datetime, L: str, target: str, n_trials: int = N_TRIALS,
-#                         max_epochs: int = EPOCH) -> LSTMModel:
-#         print(f'Fine tuning: '
-#               f'{model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} has started...............')
-#         model.eval()
-#         for name, param in model.named_parameters():
-#             if name not in ['fc.weight', 'fc.bias']:
-#                 param.requires_grad = False
-#                 print(f'Weights in {name} layer has been frozen')
-#         train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
-#         best_train_loss = float('inf')
-#         best_params = None
-#         best_model = None
-#         params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
-#         for trial, params in enumerate(params_list):
-#             print(f"\nTrial {trial + 1}/{n_trials}")
-#             print(f"Parameters: {params}")
-#             train_loader = \
-#                 DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=7, persistent_workers=True)
-#             trainer = \
-#                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
-#                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
-#                                 enable_progress_bar=True)
-#             trainer.fit(model, train_loader)
-#             train_loss = trainer.callback_metrics.get('train_loss', float('inf'))
-#             if train_loss < best_train_loss:
-#                 best_train_loss = train_loss
-#                 best_params = params
-#                 best_model = model
-#             print(f'Trial {trial + 1} completed. Validation loss: {train_loss:.4f}')
-#         print(f'\nBest parameters:', best_params)
-#         print(f'Best training loss: {best_train_loss:.2f}')
-#         print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} completed.')
-#         return best_model
-
-
 class TimeSeriesDataset(Dataset):
 
     def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 1):
@@ -453,7 +340,7 @@ class DLRegressor:
                                  dropout=params['dropout'] if params['num_layers'] > 1 else 0.0)
             pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
-            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=DEVICE, devices=1, precision='16-mixed',
+            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=DEVICE, devices=1, precision='16',
                                       callbacks=[pruning_cb, early_stop_cb], logger=False, enable_progress_bar=False)
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
@@ -480,7 +367,7 @@ class DLRegressor:
             param.requires_grad = ('fc' in name)
         loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=len(train_X),
                             num_workers=4, pin_memory=True)
-        trainer = p_light.Trainer(max_epochs=epochs, accelerator=DEVICE, devices=1, precision='16-mixed',
+        trainer = p_light.Trainer(max_epochs=epochs, accelerator=DEVICE, devices=1, precision='16',
                                   logger=False, enable_progress_bar=False)
         trainer.fit(self._model, loader)
 
