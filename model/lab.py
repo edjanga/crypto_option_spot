@@ -413,6 +413,10 @@ class DLRegressor:
     def model(self):
         return self._model
 
+    @property
+    def standardscaler(self):
+        return self._standardscaler
+
     def _prepare_data(self, df: pd.DataFrame, cols_ignore: List[str], is_train: bool = True) -> pd.DataFrame:
         df_scaled = df.copy()
         idx = pd.IndexSlice
@@ -428,14 +432,13 @@ class DLRegressor:
         return df_scaled
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-                    model_class: Type[p_light.LightningModule], positiveness: bool, cols_ignore: List[str],
-                    n_trials: int) -> None:
+                    positiveness: bool, cols_ignore: List[str], n_trials: int) -> None:
         X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
         X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
         def objective(trial: optuna.Trial):
             params = {
                 'hidden_size': trial.suggest_categorical('hidden_size', PARAMS_DL['hidden_size']),
-                'num_layers': trial.suggest_categorical('num_layers', PARAMS_DL['hidden_size']),
+                'num_layers': trial.suggest_categorical('num_layers', PARAMS_DL['num_layers']),
                 'learning_rate': trial.suggest_categorical('learning_rate', PARAMS_DL['learning_rate']),
                 'dropout': trial.suggest_categorical('dropout', PARAMS_DL['dropout']),
                 'batch_size': trial.suggest_categorical('batch_size', PARAMS_DL['batch_size']),
@@ -443,7 +446,7 @@ class DLRegressor:
             }
             if positiveness is True:
                 params.update({'beta': trial.suggest_categorical('beta', PARAMS_DL['beta'])})
-            model = model_class(input_size=train_X.shape[1], positiveness=positiveness,
+            model = self._model(input_size=train_X.shape[1], positiveness=positiveness,
                                 feature_names=train_X.columns.tolist(), **params)
             pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
@@ -460,7 +463,7 @@ class DLRegressor:
         study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
         study.optimize(objective, n_trials=n_trials)
         print(f'Best trial parameters: {study.best_params}')
-        self._model = model_class(input_size=train_X.shape[1], **study.best_params)
+        self._model(input_size=train_X.shape[1], **study.best_params)
 
     def model_fine_tune(self, train_X: pd.DataFrame, train_y: pd.Series, epochs: int = 5) -> None:
         if self._model is None:
