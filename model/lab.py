@@ -108,7 +108,7 @@ class FeatureBuilder:
         for m in ['returns'] + [f'm{m}' for m in range(2, upperbound + 1)]:
             moments = moments.with_columns(pl.when(pl.col(m) == float('inf')).then(np.finfo(np.float32).max).otherwise(
                 pl.when(pl.col(m) == -float('inf')).then(np.finfo(np.float32).min).otherwise(pl.col(m))).alias(m))
-        return moments.collect(engine=ENGINE)
+        return moments.collect()
 
     @staticmethod
     def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
