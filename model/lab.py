@@ -485,7 +485,7 @@ class DLRegressor:
         trainer.fit(self._model, loader)
 
 
-class GRUModel(pl.LightningModule):
+class GRUModel(p_light.LightningModule):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, output_size: int = 1,
                  positiveness: bool = False):
         super().__init__()
