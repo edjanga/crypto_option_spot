@@ -340,8 +340,9 @@ class DLRegressor:
                                  dropout=params['dropout'] if params['num_layers'] > 1 else 0.0)
             pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
-            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=DEVICE, devices=1, precision='16',
-                                      callbacks=[pruning_cb, early_stop_cb], logger=False, enable_progress_bar=False)
+            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator={'cuda': 'gpu', 'cpu': 'cpu'}[DEVICE],
+                                      devices=1, precision=16, callbacks=[pruning_cb, early_stop_cb],
+                                      logger=False, enable_progress_bar=False)
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
@@ -367,8 +368,8 @@ class DLRegressor:
             param.requires_grad = ('fc' in name)
         loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=len(train_X),
                             num_workers=4, pin_memory=True)
-        trainer = p_light.Trainer(max_epochs=epochs, accelerator=DEVICE, devices=1, precision='16',
-                                  logger=False, enable_progress_bar=False)
+        trainer = p_light.Trainer(max_epochs=epochs, accelerator={'cuda': 'gpu', 'cpu': 'cpu'}[DEVICE], devices=1,
+                                  precision=16, logger=False, enable_progress_bar=False)
         trainer.fit(self._model, loader)
 
 
