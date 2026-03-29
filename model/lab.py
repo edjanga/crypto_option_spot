@@ -7,21 +7,20 @@ import torch
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import Lasso, ElasticNet
 from sklearn.metrics import mean_squared_error
-from typing import List, Union, Dict, Tuple
+from typing import List, Union, Dict, Tuple, Optional, Type
 import optuna
 from optuna.samplers import RandomSampler
 from functools import partial
 import lightgbm as lgb
 from torch.utils.data import DataLoader
-from .dl_room import TimeSeriesDataset, LSTMModel, GRUModel
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from datetime import datetime
-from sklearn.model_selection import ParameterSampler
+from .dl_room import TimeSeriesDataset
+from sklearn.preprocessing import StandardScaler
 import polars as pl
 import pytorch_lightning as p_light
 from pytorch_lightning.callbacks import EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
+from optuna.integration import PyTorchLightningPruningCallback
 import statsmodels.api as sm
+from torch.utils.data import Dataset
 
 
 DEVICE = 'cpu'
@@ -51,14 +50,11 @@ def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
     X = data.filter(regex='|'.join(list_factors))
     pnl = pnl.xs(x.name[1], axis=1, level=1).xs(x.name[-1], axis=0, level=1).stack()
     pnl.name = 'P&L'
-    if not targets.empty:
-        pdb.set_trace()
-        # x = x.join(targets.filter(regex='|'.join(list_factors)), axis=1, how='left')
     X = pnl.reset_index(0).swaplevel(0, 1).join(X, on=['underlying_name', 'timestamp']).set_index('aggregated',
                                                                                                   append=True)
     X['P&L'] = X['P&L'] + np.random.uniform(0, 1e-8, X.shape[0])
     X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
-    X = (X - X.min()).div(X.max() - X.min()).replace([-np.inf, np.inf], np.nan).dropna()
+    X = (X - X.min()).div(X.max()-X.min()).replace([-np.inf, np.inf], np.nan).dropna()
     params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
     params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
     return params
@@ -296,111 +292,199 @@ class BoostingRegressor(Regressor):
         super(BoostingRegressor, self).__init__(name=name)
 
 
-class DLRegressor(Regressor):
-    def __init__(self, name: str, **kwargs):
-        super(DLRegressor, self).__init__(name=name)
-        if len(kwargs) > 0:
-            self._model = DLRegressor(**kwargs)
-        self._standardscaler = dict()
+# class DLRegressor(Regressor):
+#     def __init__(self, name: str, **kwargs):
+#         super(DLRegressor, self).__init__(name=name)
+#         if len(kwargs) > 0:
+#             self._model = DLRegressor(**kwargs)
+#         self._standardscaler = dict()
+#
+#     @property
+#     def standardscaler(self) -> Dict[(str, StandardScaler)]:
+#         return self._standardscaler
+#
+#     @property
+#     def model(self) -> Union[LSTMModel, GRUModel]:
+#         return self._model
+#
+#     @model.setter
+#     def model(self, model: Union[LSTMModel, GRUModel]) -> None:
+#         self._model = model
+#
+#     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
+#                     positiveness: bool,  cols_ignore_in_scaling: List[str], batch_size: int, n_trials: int = N_TRIALS,
+#                     max_epochs: int = EPOCH) -> None:
+#         params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
+#         for symbol in train_X.index.get_level_values(0).unique():
+#             self._standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
+#             train_X.loc[
+#                 train_X.index.get_level_values(0) == symbol, ~train_X.columns.isin(cols_ignore_in_scaling)] = \
+#                 self._standardscaler[symbol].fit_transform(X=train_X.loc[train_X.index.get_level_values(0) == symbol,
+#                 ~train_X.columns.isin(cols_ignore_in_scaling)])
+#             valid_X.loc[
+#                 valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
+#                 self._standardscaler[symbol].transform(
+#                     X=valid_X.loc[
+#                         valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)])
+#         train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
+#         valid_dataset = TimeSeriesDataset(valid_X.values, valid_y.values)
+#         train_loader = \
+#             DataLoader(train_dataset, batch_size=batch_size, num_workers=0, persistent_workers=True, pin_memory=True)
+#         valid_loader = \
+#             DataLoader(valid_dataset, batch_size=batch_size, num_workers=0, persistent_workers=True, pin_memory=True)
+#         best_valid_loss = float('inf')
+#         best_params = None
+#         best_model = None
+#         for trial, params in enumerate(params_list):
+#             print(f'\nTrial {trial + 1}/{n_trials}')
+#             print(f'Parameters: {params}')
+#             if isinstance(self, LSTMRegressor):
+#                 model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
+#                                   num_layers=params['num_layers'], learning_rate=params['learning_rate'],
+#                                   batch_size=params['batch_size'], feature_names=train_X.columns.tolist(),
+#                                   positiveness=positiveness, dropout=params['dropout'], beta=params['beta'])
+#             elif isinstance(self, GRURegressor):
+#                 model = GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
+#                                  num_layers=params['num_layers'], learning_rate=params['learning_rate'],
+#                                  batch_size=params['batch_size'], feature_names=train_X.columns.tolist(),
+#                                  positiveness=positiveness, dropout=params['dropout'], beta=params['beta'])
+#             trainer = \
+#                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
+#                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
+#                                 enable_progress_bar=True, num_sanity_val_steps=0, accelerator=DEVICE,
+#                                 precision='bf16-mixed')
+#             trainer.fit(model, train_loader, valid_loader)
+#             valid_loss = trainer.callback_metrics.get('valid_loss', float('inf'))
+#             if valid_loss < best_valid_loss:
+#                 best_valid_loss = valid_loss
+#                 best_params = params
+#                 best_model = model
+#             print(f'Trial {trial + 1} completed. Validation loss: {valid_loss:.4f}')
+#         print('\nBest parameters:', best_params)
+#         print(f'Best validation loss: {best_valid_loss:.2f}')
+#         self._model = best_model
+#
+#     @staticmethod
+#     def model_fine_tune(train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
+#                         date: datetime, L: str, target: str, n_trials: int = N_TRIALS,
+#                         max_epochs: int = EPOCH) -> LSTMModel:
+#         print(f'Fine tuning: '
+#               f'{model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} has started...............')
+#         model.eval()
+#         for name, param in model.named_parameters():
+#             if name not in ['fc.weight', 'fc.bias']:
+#                 param.requires_grad = False
+#                 print(f'Weights in {name} layer has been frozen')
+#         train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
+#         best_train_loss = float('inf')
+#         best_params = None
+#         best_model = None
+#         params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
+#         for trial, params in enumerate(params_list):
+#             print(f"\nTrial {trial + 1}/{n_trials}")
+#             print(f"Parameters: {params}")
+#             train_loader = \
+#                 DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=7, persistent_workers=True)
+#             trainer = \
+#                 p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
+#                                 logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
+#                                 enable_progress_bar=True)
+#             trainer.fit(model, train_loader)
+#             train_loss = trainer.callback_metrics.get('train_loss', float('inf'))
+#             if train_loss < best_train_loss:
+#                 best_train_loss = train_loss
+#                 best_params = params
+#                 best_model = model
+#             print(f'Trial {trial + 1} completed. Validation loss: {train_loss:.4f}')
+#         print(f'\nBest parameters:', best_params)
+#         print(f'Best training loss: {best_train_loss:.2f}')
+#         print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} completed.')
+#         return best_model
+
+
+class TimeSeriesDataset(Dataset):
+
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 1):
+        self.X = torch.tensor(X).float()
+        self.y = torch.tensor(y).float()
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return self.X.__len__() - (self.seq_len-1)
+
+    def __getitem__(self, index):
+        return self.X[index:index + self.seq_len], self.y[index + self.seq_len - 1]
+
+
+class DLRegressor:
+    def __init__(self, name: str):
+        self.name = name
+        self._model: Optional[p_light.LightningModule] = None
+        self._standardscaler: Dict[str, StandardScaler] = {}
 
     @property
-    def standardscaler(self) -> Dict[(str, StandardScaler)]:
-        return self._standardscaler
-
-    @property
-    def model(self) -> Union[LSTMModel, GRUModel]:
+    def model(self):
         return self._model
 
-    @model.setter
-    def model(self, model: Union[LSTMModel, GRUModel]) -> None:
-        self._model = model
+    def _prepare_data(self, df: pd.DataFrame, cols_ignore: List[str], is_train: bool = True) -> pd.DataFrame:
+        df_scaled = df.copy()
+        idx = pd.IndexSlice
+        scaling_cols = [c for c in df.columns if c not in cols_ignore]
+        for symbol in df.index.get_level_values(0).unique():
+            if is_train:
+                self._standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
+                df_scaled.loc[idx[symbol, :], scaling_cols] = \
+                    self._standardscaler[symbol].fit_transform(df.loc[idx[symbol, :], scaling_cols])
+            elif symbol in self._standardscaler:
+                df_scaled.loc[idx[symbol, :], scaling_cols] = \
+                    self._standardscaler[symbol].transform(df.loc[idx[symbol, :], scaling_cols])
+        return df_scaled
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-                    positiveness: bool,  cols_ignore_in_scaling: List[str], n_trials: int = N_TRIALS,
-                    max_epochs: int = EPOCH) -> None:
-        params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
-        for symbol in train_X.index.get_level_values(0).unique():
-            self._standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
-            train_X.loc[
-                train_X.index.get_level_values(0) == symbol, ~train_X.columns.isin(cols_ignore_in_scaling)] = \
-                self._standardscaler[symbol].fit_transform(X=train_X.loc[train_X.index.get_level_values(0) == symbol,
-                ~train_X.columns.isin(cols_ignore_in_scaling)])
-            valid_X.loc[
-                valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)] = \
-                self._standardscaler[symbol].transform(
-                    X=valid_X.loc[
-                        valid_X.index.get_level_values(0) == symbol, ~valid_X.columns.isin(cols_ignore_in_scaling)])
-        train_dataset = TimeSeriesDataset(train_X.values, train_y.values)
-        valid_dataset = TimeSeriesDataset(valid_X.values, valid_y.values)
-        train_loader = DataLoader(train_dataset, batch_size=1_024, num_workers=7, persistent_workers=True)
-        valid_loader = DataLoader(valid_dataset, batch_size=1_024, num_workers=7, persistent_workers=True)
-        best_valid_loss = float('inf')
-        best_params = None
-        best_model = None
-        for trial, params in enumerate(params_list):
-            print(f'\nTrial {trial + 1}/{n_trials}')
-            print(f'Parameters: {params}')
-            if isinstance(self, LSTMRegressor):
-                model = LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
-                                  num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-                                  feature_names=train_X.columns.tolist(), positiveness=positiveness,
-                                  dropout=params['dropout'], beta=params['beta'])
-            elif isinstance(self, GRURegressor):
-                model = GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'], output_size=1,
-                                 num_layers=params['num_layers'], learning_rate=params['learning_rate'],
-                                 feature_names=train_X.columns.tolist(), positiveness=positiveness,
-                                 dropout=params['dropout'], beta=params['beta'])
-            trainer = \
-                p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='valid_loss', patience=5)],
-                                logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
-                                enable_progress_bar=True, num_sanity_val_steps=0)
-            trainer.fit(model, train_loader, valid_loader)
-            valid_loss = trainer.callback_metrics.get('valid_loss', float('inf'))
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                best_params = params
-                best_model = model
-            print(f'Trial {trial + 1} completed. Validation loss: {valid_loss:.4f}')
-        print('\nBest parameters:', best_params)
-        print(f'Best validation loss: {best_valid_loss:.2f}')
-        self._model = best_model
+                    model_class: Type[p_light.LightningModule], positiveness: bool, cols_ignore: List[str],
+                    batch_size: int, n_trials: int) -> None:
+        X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
+        X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
+        def objective(trial: optuna.Trial):
+            params = {
+                'hidden_size': trial.suggest_categorical('hidden_size', PARAMS_DL['hidden_size']),
+                'num_layers': trial.suggest_categorical('num_layers', PARAMS_DL['hidden_size']),
+                'learning_rate': trial.suggest_categorical('learning_rate', PARAMS_DL['learning_rate']),
+                'dropout': trial.suggest_categorical('dropout', PARAMS_DL['dropout']),
+                'batch_size': trial.suggest_categorical('batch_size', PARAMS_DL['batch_size']),
 
-    @staticmethod
-    def model_fine_tune(train_fine_tune_X: pd.DataFrame, train_fine_tune_y: pd.Series, model: LSTMModel,
-                        date: datetime, L: str, target: str, n_trials: int = N_TRIALS,
-                        max_epochs: int = EPOCH) -> LSTMModel:
-        print(f'Fine tuning: '
-              f'{model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} has started...............')
-        model.eval()
-        for name, param in model.named_parameters():
-            if name not in ['fc.weight', 'fc.bias']:
-                param.requires_grad = False
-                print(f'Weights in {name} layer has been frozen')
-        train_dataset = TimeSeriesDataset(train_fine_tune_X.values, train_fine_tune_y.values)
-        best_train_loss = float('inf')
-        best_params = None
-        best_model = None
-        params_list = list(ParameterSampler(PARAMS_DL, n_iter=n_trials, random_state=123))
-        for trial, params in enumerate(params_list):
-            print(f"\nTrial {trial + 1}/{n_trials}")
-            print(f"Parameters: {params}")
-            train_loader = \
-                DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=7, persistent_workers=True)
-            trainer = \
-                p_light.Trainer(max_epochs=max_epochs, callbacks=[EarlyStopping(monitor='train_loss', patience=5)],
-                                logger=TensorBoardLogger('lightning_logs', name=f'trial_{trial}'),
-                                enable_progress_bar=True)
-            trainer.fit(model, train_loader)
-            train_loss = trainer.callback_metrics.get('train_loss', float('inf'))
-            if train_loss < best_train_loss:
-                best_train_loss = train_loss
-                best_params = params
-                best_model = model
-            print(f'Trial {trial + 1} completed. Validation loss: {train_loss:.4f}')
-        print(f'\nBest parameters:', best_params)
-        print(f'Best training loss: {best_train_loss:.2f}')
-        print(f'Fine tuning: {model.__class__.__name__.lower()}_{L}_{target}_{date.strftime("%Y-%m-%d")} completed.')
-        return best_model
+            }
+            if positiveness is True:
+                params.update({'beta': trial.suggest_categorical('beta', PARAMS_DL['beta'])})
+            model = model_class(input_size=train_X.shape[1], positiveness=positiveness,
+                                feature_names=train_X.columns.tolist(), **params)
+            pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
+            early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
+            trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=DEVICE, devices=1, precision='16-mixed',
+                                      callbacks=[pruning_cb, early_stop_cb], logger=False, enable_progress_bar=False)
+            train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
+                                      batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
+            valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
+                                      batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
+            trainer.fit(model, train_loader, valid_loader)
+            return trainer.callback_metrics['valid_loss'].item()
+        study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+        study.optimize(objective, n_trials=n_trials)
+        print(f'Best trial parameters: {study.best_params}')
+        self._model = model_class(input_size=train_X.shape[1], **study.best_params)
+
+    def model_fine_tune(self, train_X: pd.DataFrame, train_y: pd.Series, epochs: int = 5) -> None:
+        if self._model is None:
+            return
+        for name, param in self._model.named_parameters():
+            param.requires_grad = ('fc' in name)
+
+        loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=len(train_X),
+                            num_workers=4, pin_memory=True)
+
+        trainer = p_light.Trainer(max_epochs=epochs, accelerator=DEVICE, devices=1, precision='16-mixed',
+                                  logger=False, enable_progress_bar=False)
+        trainer.fit(self._model, loader)
 
 
 class GRURegressor(DLRegressor):
@@ -465,12 +549,13 @@ class PermutationFeatureImportance:
         while count < 50:
             for feature in self._test.columns:
                 shuffled_test, feature = shuffle_single_feature(self._test, feature)
-                self._test_y.iloc[:, 1] = \
-                    self.model.predict(shuffled_test) if not isinstance(self.model, Union[GRUModel, LSTMModel]) else \
-                        self.model(torch.from_numpy(
-                            shuffled_test.values.reshape(1, shuffled_test.values.shape[0],
-                                                         shuffled_test.values.shape[1])).to(torch.float32)
-                                   ).flatten().unsqueeze(0).detach().numpy()[0]
+                if not isinstance(self.model, Union[GRURegressor, LSTMRegressor]):
+                    self._test_y.iloc[:, 1] = self.model.predict(shuffled_test)
+                else:
+                    self._test_y.iloc[:, 1] = \
+                        self.model(torch.from_numpy(shuffled_test.values.reshape(1, shuffled_test.values.shape[0],
+                                                     shuffled_test.values.shape[1])))
+                    self._test_y = self._test_y.to(torch.float32).flatten().unsqueeze(0).detach().numpy()[0]
                 feature_importance[feature] += \
                 (self._test_y.diff(axis=1).iloc[:, -1].div(avg1s)).abs().groupby(by=pd.Grouper(level=0)).mean().mean()
             count += 1
