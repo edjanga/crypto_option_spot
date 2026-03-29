@@ -35,7 +35,7 @@ if __name__ == '__main__':
     dates = list(pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left'))
     dates = list(map(lambda date: date.date(), dates))
     feature_builder = FeatureBuilder()
-    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot/crypto_option_spot.db',
+    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db',
                                  check_same_thread=False)
     ####################################################################################################################
     ## Spot
