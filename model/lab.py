@@ -20,7 +20,8 @@ from pytorch_lightning.callbacks import EarlyStopping
 from optuna.integration import PyTorchLightningPruningCallback
 import statsmodels.api as sm
 from torch.utils.data import Dataset
-
+import torch.nn as nn
+import torch.nn.functional as F
 
 DEVICE = 'cpu'
 if torch.backends.mps.is_available():
@@ -432,7 +433,7 @@ class DLRegressor:
         return df_scaled
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-                    positiveness: bool, cols_ignore: List[str], n_trials: int) -> None:
+                    positiveness: bool, cols_ignore: List[str], n_trials: int, target: str) -> None:
         X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
         X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
         def objective(trial: optuna.Trial):
@@ -442,12 +443,14 @@ class DLRegressor:
                 'learning_rate': trial.suggest_categorical('learning_rate', PARAMS_DL['learning_rate']),
                 'dropout': trial.suggest_categorical('dropout', PARAMS_DL['dropout']),
                 'batch_size': trial.suggest_categorical('batch_size', PARAMS_DL['batch_size']),
-
             }
             if positiveness is True:
                 params.update({'beta': trial.suggest_categorical('beta', PARAMS_DL['beta'])})
-            model = self._model(input_size=train_X.shape[1], positiveness=positiveness,
-                                feature_names=train_X.columns.tolist(), **params)
+            if self.name == 'gru':
+                model = GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'],
+                                 num_layers=params['num_layers'], lr=params['learning_rate'],
+                                 positiveness=target == 'RV',
+                                 dropout=params['dropout'] if params['num_layers'] > 1 else 0.0)
             pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
             trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=DEVICE, devices=1, precision='16-mixed',
@@ -458,25 +461,64 @@ class DLRegressor:
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
                                       batch_size=params['batch_size'], num_workers=4, pin_memory=True,
                                       persistent_workers=True)
-            trainer.fit(model, train_loader, valid_loader)
+            trainer.fit(self._model, train_loader, valid_loader)
             return trainer.callback_metrics['valid_loss'].item()
         study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
         study.optimize(objective, n_trials=n_trials)
         print(f'Best trial parameters: {study.best_params}')
-        self._model(input_size=train_X.shape[1], **study.best_params)
+        if self.name == 'gru':
+            self._model = \
+                GRUModel(input_size=train_X.shape[1], hidden_size=study.best_params['hidden_size'],
+                         num_layers=study.best_params['num_layers'], lr=study.best_params['learning_rate'],
+                         dropout=study.best_params['dropout'] if study.best_params['num_layers'] > 1 else 0.0,
+                         positiveness=target == 'RV')
 
     def model_fine_tune(self, train_X: pd.DataFrame, train_y: pd.Series, epochs: int = 5) -> None:
         if self._model is None:
             return
         for name, param in self._model.named_parameters():
             param.requires_grad = ('fc' in name)
-
         loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=len(train_X),
                             num_workers=4, pin_memory=True)
-
         trainer = p_light.Trainer(max_epochs=epochs, accelerator=DEVICE, devices=1, precision='16-mixed',
                                   logger=False, enable_progress_bar=False)
         trainer.fit(self._model, loader)
+
+
+class GRUModel(pl.LightningModule):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, output_size: int = 1,
+                 positiveness: bool = False):
+        super().__init__()
+        self.save_hyperparameters()
+        self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.positiveness = positiveness
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = self.dropout(out[:, -1, :])
+        out = self.fc(out)
+        if self.positiveness:
+            out = F.softplus(out)
+        return out.squeeze(-1)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.mse_loss(y_hat, y)
+        self.log('train_loss', loss, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.mse_loss(y_hat, y)
+        self.log('valid_loss', loss, on_step=False, on_epoch=True)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
 
 class GRURegressor(DLRegressor):
