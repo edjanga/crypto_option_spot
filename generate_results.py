@@ -54,6 +54,8 @@ if __name__ == '__main__':
         (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))).to_pandas()
     features = \
         features.pivot_table(values='features_values', index=['underlying_name', 'timestamp'], columns='features')
+    features = features.replace([np.inf, -np.inf],
+                                [np.finfo(np.float32).max, np.finfo(np.float32).min])
     ####################################################################################################################
     ## Options
     ####################################################################################################################
