@@ -2,7 +2,7 @@ import argparse
 import itertools
 import os
 import pdb
-
+import polars as pl
 import pytz
 import sqlite3
 from constants import *
@@ -46,20 +46,12 @@ if __name__ == '__main__':
                      f'features_values FROM base ' \
     f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
     f'FROM base;'
-    features = pd.read_sql(sql=features_query, con=db_connect, chunksize=100_000)
-    tmp_features = list()
-    while True:
-        try:
-            tmp_features.append(next(features))
-        except StopIteration:
-            break
-    features = pd.concat(tmp_features, ignore_index=True)
-    features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
-    features = features[(features['timestamp'] >= args.start_date) & (features['timestamp'] < args.end_date)]
-    features['features_values'] = pd.to_numeric(features['features_values'], errors='coerce').astype('float32')
-    features = \
-        pd.pivot_table(features, columns='features', values='features_values', index=['underlying_name', 'timestamp'])
-    features.index = features.index.set_names(['underlying_name', 'timestamp'])
+    features = pl.read_database(query=features_query, connection=db_connect)
+    features = features.with_columns([pl.col('timestamp').str.to_datetime().dt.replace_time_zone('UTC'),
+                                      pl.col('features_values').cast(pl.Float32, strict=False)]).filter(
+        (pl.col('timestamp') >= pl.lit(args.start_date)) & (pl.col('timestamp') < pl.lit(args.end_date)))
+    features = features.pivot(values='features_values', index=['underlying_name', 'timestamp'], columns='features')
+    features = features.sort(['underlying_name', 'timestamp'])
     ####################################################################################################################
     ## Options
     ####################################################################################################################
@@ -67,26 +59,14 @@ if __name__ == '__main__':
         options_features_query = \
             f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
             f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
-        tmp_options_features = list()
+        options_features = pl.read_database(query=options_features_query, connection=db_connect)
         options_features = \
-            pd.read_sql(sql=options_features_query, con=db_connect, chunksize=100_000)
-        while True:
-            try:
-                tmp_options_features.append(next(options_features))
-            except StopIteration:
-                break
-        options_features = pd.concat(tmp_options_features)
-        options_features['timestamp'] = pd.to_datetime(options_features['timestamp'], utc=pytz.UTC)
-        options_features = \
-            options_features[(options_features['timestamp'] >= args.start_date) &
-                             (options_features['timestamp'] < args.end_date)]
-        options_features['features_values'] = \
-            pd.to_numeric(options_features['features_values'], errors='coerce').astype('float32')
-        options_features = pd.pivot_table(data=options_features, values='features_values', columns='features',
-                                          index=['underlying_name', 'timestamp'])
-        options_features = \
-            options_features.groupby(by=pd.Grouper(level='underlying_name'),
-                                     group_keys=False).apply(lambda x: x.ffill())
+            options_features.with_columns([pl.col('timestamp').str.to_datetime().dt.replace_time_zone('UTC'),
+                                           pl.col('features_values').cast(pl.Float32, strict=False)]).filter(
+                (pl.col('timestamp') >= pl.lit(args.start_date)) & (pl.col('timestamp') < pl.lit(args.end_date)))
+        options_features = options_features.sort(['underlying_name', 'timestamp'])
+        options_features = options_features.with_columns(pl.all().exclude(['underlying_name', 'timestamp'])
+                                                         .forward_fill().over('underlying_name'))
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
     except Exception:
         main_features = features
