@@ -484,7 +484,7 @@ class PermutationFeatureImportance:
         avg1s = avg1s.apply(lambda x: (x - x.shift()).abs().sum() / (x.shape[0] - 1))
         feature_importance = dict([(feature, 0) for feature in self._test.columns])
         count = 0
-        pdb.set_trace()
+        self._test = self._test.replace([-np.inf, np.inf], [np.finfo(np.float32).min, np.finfo(np.float32).max])
         while count < 50:
             for feature in self._test.columns:
                 shuffled_test, feature = shuffle_single_feature(self._test, feature)
@@ -493,8 +493,8 @@ class PermutationFeatureImportance:
                 else:
                     tmp_shuffle = torch.from_numpy(
                         shuffled_test.values.reshape(shuffled_test.values.shape[0], 1, shuffled_test.values.shape[1]))
-                    self._test_y.iloc[:, 1] = self.model.model(tmp_shuffle)
-                    self._test_y = self._test_y.to(torch.float32).flatten().unsqueeze(0).detach().numpy()[0]
+                    self._test_y.iloc[:, 1] = self.model.model(tmp_shuffle).detach().cpu().numpy()
+                    # self._test_y = self._test_y.to(torch.float32).flatten().unsqueeze(0).detach().numpy()[0]
                 feature_importance[feature] += \
                 (self._test_y.diff(axis=1).iloc[:, -1].div(avg1s)).abs().groupby(by=pd.Grouper(level=0)).mean().mean()
             count += 1
