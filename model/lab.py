@@ -349,10 +349,10 @@ class DLRegressor:
                                       devices=1, precision=precision, callbacks=[pruning_cb, early_stop_cb],
                                       logger=False, enable_progress_bar=False, check_val_every_n_epoch=1)
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
-                                      batch_size=params['batch_size'], num_workers=2, pin_memory=True,
+                                      batch_size=params['batch_size'], num_workers=8, pin_memory=True,
                                       persistent_workers=True)
             valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
-                                      batch_size=params['batch_size'], num_workers=2, pin_memory=True,
+                                      batch_size=params['batch_size'], num_workers=8, pin_memory=True,
                                       persistent_workers=True)
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
             metrics = trainer.callback_metrics
@@ -378,7 +378,7 @@ class DLRegressor:
         if hasattr(self._model, 'lr'):
             self._model.lr *= 0.1
         loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values), batch_size=min(1024, len(train_X)),
-                            num_workers=4, pin_memory=True)
+                            num_workers=8, pin_memory=True)
         accelerator = 'gpu' if 'cuda' in DEVICE else 'cpu'
         precision = 16 if accelerator == 'gpu' else 32
         trainer = p_light.Trainer(max_epochs=epochs, accelerator=accelerator, devices=1, precision=precision,
