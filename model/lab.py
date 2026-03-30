@@ -510,7 +510,7 @@ class PermutationFeatureImportance:
             for feature in self._test.columns:
                 shuffled_test, feature = shuffle_single_feature(self._test, feature)
                 if not isinstance(self.model, Union[GRURegressor, LSTMRegressor]):
-                    self._test_y.iloc[:, 1] = self.model.predict(shuffled_test)
+                    self._test_y.iloc[:, 1] = self.model.model.predict(shuffled_test)
                 else:
                     tmp_shuffle = torch.from_numpy(
                         shuffled_test.values.reshape(shuffled_test.values.shape[0], 1, shuffled_test.values.shape[1]))
