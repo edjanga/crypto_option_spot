@@ -13,7 +13,7 @@ from dateutil.relativedelta import relativedelta
 from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
 from sklearn.preprocessing import StandardScaler
 
-models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), GRURegressor(), LSTMRegressor()]
+models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor()] #, GRURegressor(), LSTMRegressor()
 models_factory_dd = {model.name.lower(): model for model in models}
 LAGS = INTRADAY_LAGS+INTERDAY_LAGS
 
@@ -54,8 +54,6 @@ if __name__ == '__main__':
         (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))).to_pandas()
     features = \
         features.pivot_table(values='features_values', index=['underlying_name', 'timestamp'], columns='features')
-    features = features.replace([np.inf, -np.inf],
-                                [np.finfo(np.float32).max, np.finfo(np.float32).min])
     ####################################################################################################################
     ## Options
     ####################################################################################################################
@@ -69,12 +67,13 @@ if __name__ == '__main__':
                                            pl.col('features_values').cast(pl.Float32, strict=False)])
         options_features = \
             options_features.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
-                                   (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True))))
+                                    (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True))))
         options_features = options_features.with_columns(pl.all().exclude(['underlying_name', 'timestamp'])
                                                          .forward_fill().over('underlying_name')).to_pandas()
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
     except Exception:
         main_features = features
+    main_features = main_features.replace([np.inf, -np.inf], [np.finfo(np.float32).max, np.finfo(np.float32).min])
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     ####################################################################################################################
@@ -106,11 +105,11 @@ if __name__ == '__main__':
             train_y = train_X.pop(args.target)
             cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in BINARY_PATTERN)]
             if args.regression in ['lasso', 'elastic']:
-                standard_scaler = {symbol: StandardScaler().set_output(transform='pandas') for symbol in SYMBOLS}
+                model.standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
                 for symbol in train_X.index.get_level_values(0).unique():
                     mask = train_X.index.get_level_values(0) == symbol
                     cols = ~train_X.columns.isin(cols_ignore_in_scaling)
-                    train_X.loc[mask, cols] = standard_scaler[symbol].fit_transform(train_X.loc[mask, cols])
+                    train_X.loc[mask, cols] = model.standardscaler[symbol].fit_transform(train_X.loc[mask, cols])
             study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
             if model.name in ['lasso', 'elastic', 'lightgbm']:
                 rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)

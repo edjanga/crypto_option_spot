@@ -203,10 +203,15 @@ class Regressor:
 
     def __init__(self, name: str):
         self._name = name
+        self._standardscaler: Dict[str, StandardScaler] = {}
 
     @property
     def name(self):
         return self._name
+
+    @property
+    def standardscaler(self):
+        return self._standardscaler
 
     def model_train(self, features: Union[pd.DataFrame, np.ndarray],
                     target: Union[pd.DataFrame, np.ndarray], study_name: str, **kwargs):
@@ -347,7 +352,8 @@ class DLRegressor:
             precision = 16 if accelerator == 'gpu' else 32
             trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=accelerator,
                                       devices=1, precision=precision, callbacks=[pruning_cb, early_stop_cb],
-                                      logger=False, enable_progress_bar=False, check_val_every_n_epoch=1)
+                                      logger=False, enable_progress_bar=False, check_val_every_n_epoch=1,
+                                      enable_checkpointing=False)
             train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=8, pin_memory=True,
                                       persistent_workers=True)
@@ -494,7 +500,6 @@ class PermutationFeatureImportance:
                     tmp_shuffle = torch.from_numpy(
                         shuffled_test.values.reshape(shuffled_test.values.shape[0], 1, shuffled_test.values.shape[1]))
                     self._test_y.iloc[:, 1] = self.model.model(tmp_shuffle).detach().cpu().numpy()
-                    # self._test_y = self._test_y.to(torch.float32).flatten().unsqueeze(0).detach().numpy()[0]
                 feature_importance[feature] += \
                 (self._test_y.diff(axis=1).iloc[:, -1].div(avg1s)).abs().groupby(by=pd.Grouper(level=0)).mean().mean()
             count += 1
