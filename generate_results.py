@@ -90,6 +90,7 @@ if __name__ == '__main__':
     ## Modelling
     ####################################################################################################################
     model = models_factory_dd[args.regression]
+    model.standardscaler = {symbol: StandardScaler().set_output(transform='pandas') for symbol in SYMBOLS}
     start_idx = dates.index(dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
     permutation_feature_importance_obj = PermutationFeatureImportance()
     for D, options in itertools.product(['1D', '1W', '1M'], [0, 1]):
@@ -107,7 +108,6 @@ if __name__ == '__main__':
             cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in BINARY_PATTERN)]
             if args.regression in ['lasso', 'elastic']:
                 for symbol in train_X.index.get_level_values(0).unique():
-                    model.standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
                     mask = train_X.index.get_level_values(0) == symbol
                     cols = ~train_X.columns.isin(cols_ignore_in_scaling)
                     train_X.loc[mask, cols] = model.standardscaler[symbol].fit_transform(train_X.loc[mask, cols])
@@ -115,7 +115,8 @@ if __name__ == '__main__':
             if model.name in ['lasso', 'elastic', 'lightgbm']:
                 rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
                 pdb.set_trace()
-                models.loc[date] = rres_study.user_attrs['best_estimator']
+                model.model = rres_study.user_attrs['best_estimator']
+                models.loc[date] = model
             else:
                 train_dates = np.unique(train_X.index.get_level_values(1))
                 split_idx = int(0.8 * len(train_dates))
