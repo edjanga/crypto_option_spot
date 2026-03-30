@@ -321,7 +321,8 @@ class DLRegressor:
         return df_scaled
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-                    positiveness: bool, cols_ignore: List[str], n_trials: int, target: str) -> None:
+                    positiveness: bool, cols_ignore: List[str], n_trials: int, target: str,
+                    study_name: str) -> None:
         X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
         X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
 
@@ -359,7 +360,7 @@ class DLRegressor:
             if val_loss is None:
                 return float('inf')
             return val_loss.item()
-        study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+        study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner(), study_name=study_name)
         study.optimize(objective, n_trials=n_trials)
         print(f'Best trial parameters: {study.best_params}')
         if self.name == 'gru':
