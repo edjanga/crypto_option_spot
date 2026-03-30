@@ -73,8 +73,6 @@ if __name__ == '__main__':
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
     except Exception:
         main_features = features
-    main_features = main_features.replace([np.inf, -np.inf], [np.finfo(np.float32).max, np.finfo(np.float32).min])
-    main_features = main_features.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     ####################################################################################################################
@@ -86,6 +84,8 @@ if __name__ == '__main__':
     symbol_one_hot.index = main_features.index
     main_features = pd.concat([main_features, symbol_one_hot], axis=1)
     main_features = main_features.groupby(by=pd.Grouper(level=0), group_keys=False).apply(lambda x: x.ffill()).dropna()
+    main_features = main_features.replace([np.inf, -np.inf], [np.finfo(np.float32).max, np.finfo(np.float32).min])
+    main_features = main_features.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
     ####################################################################################################################
     ## Modelling
     ####################################################################################################################
