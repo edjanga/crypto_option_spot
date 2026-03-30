@@ -148,7 +148,6 @@ if __name__ == '__main__':
                 (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days))
             test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
                                   (features.index.get_level_values(1).date < end_date_forecast), :]
-            test_X = test_X.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
             test_y = test_X.pop(args.target)
             if (D != '1D') & (model.name in ['gru', 'lstm']):
                 ########################################################################################################
@@ -176,6 +175,7 @@ if __name__ == '__main__':
                 ~test_X.columns.isin(cols_ignore_in_scaling)] = \
                     standard_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
                                                       ~test_X.columns.isin(cols_ignore_in_scaling)])
+            test_X = test_X.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
             if model.name in ['gru', 'lstm']:
                 test_X_tensor = \
                     torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
