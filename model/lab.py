@@ -214,6 +214,10 @@ class Regressor:
     def standardscaler(self):
         return self._standardscaler
 
+    @standardscaler.setter
+    def standardscaler(self, standardscaler: Dict[str, StandardScaler]) -> None:
+        self._standardscaler = standardscaler
+
     @property
     def model(self):
         return self._model
