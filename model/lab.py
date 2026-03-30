@@ -204,6 +204,7 @@ class Regressor:
     def __init__(self, name: str):
         self._name = name
         self._standardscaler: Dict[str, StandardScaler] = {}
+        self._model: Union[LassoRegressor, ElasticRegressor, BoostingRegressor] = None
 
     @property
     def name(self):
@@ -212,6 +213,14 @@ class Regressor:
     @property
     def standardscaler(self):
         return self._standardscaler
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: object):
+        self._model = model
 
     def model_train(self, features: Union[pd.DataFrame, np.ndarray],
                     target: Union[pd.DataFrame, np.ndarray], study_name: str, **kwargs):
@@ -231,6 +240,8 @@ class Regressor:
                   train_y: Union[pd.Series, np.ndarray]) -> float:
         train_dates = list(np.unique(train_X.index.get_level_values(1)))
         train_dates, valid_dates = train_dates[:int(.8*len(train_dates))], train_dates[int(.8*len(train_dates)):]
+        train_X = train_X.replace([-np.inf, np.inf], [np.nan, np.nan]).dropna()
+        train_y = train_y.loc[train_X.index]
         train_X, valid_X = train_X.loc[train_X.index.get_level_values(1).isin(train_dates), :], \
             train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
         train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \

@@ -114,6 +114,7 @@ if __name__ == '__main__':
             study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
             if model.name in ['lasso', 'elastic', 'lightgbm']:
                 rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
+                pdb.set_trace()
                 models.loc[date] = rres_study.user_attrs['best_estimator']
             else:
                 train_dates = np.unique(train_X.index.get_level_values(1))
