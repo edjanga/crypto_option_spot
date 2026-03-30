@@ -114,7 +114,6 @@ if __name__ == '__main__':
             study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
             if model.name in ['lasso', 'elastic', 'lightgbm']:
                 rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
-                pdb.set_trace()
                 model.model = rres_study.user_attrs['best_estimator']
                 models.loc[date] = model
             else:
@@ -149,6 +148,7 @@ if __name__ == '__main__':
                 (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days))
             test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
                                   (features.index.get_level_values(1).date < end_date_forecast), :]
+            test_X = test_X.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
             test_y = test_X.pop(args.target)
             if (D != '1D') & (model.name in ['gru', 'lstm']):
                 ########################################################################################################
