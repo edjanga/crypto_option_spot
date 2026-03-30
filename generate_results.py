@@ -74,6 +74,7 @@ if __name__ == '__main__':
     except Exception:
         main_features = features
     main_features = main_features.replace([np.inf, -np.inf], [np.finfo(np.float32).max, np.finfo(np.float32).min])
+    main_features = main_features.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
     mase_score = MeanAbsoluteScaledError()
     permutation_feature_importance_obj = PermutationFeatureImportance()
     ####################################################################################################################
