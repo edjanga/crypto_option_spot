@@ -92,46 +92,8 @@ if __name__ == '__main__':
     model = models_factory_dd[args.regression]
     start_idx = dates.index(dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
     permutation_feature_importance_obj = PermutationFeatureImportance()
-    # for D, options in itertools.product(['1D', '1W', '1M'], [0, 1]):
-    #     models = pd.Series(data=np.nan, index=dates)
-    #     features_importance = dict()
-    #     features_names = LAGS[LAGS.index(args.freq):LAGS.index(D) + 1]+[args.target]+\
-    #                      ['is_BTCUSDT', 'is_ETHUSDT', 'is_BNBUSDT', 'is_SOLUSDT', 'is_XRPUSDT']
-    #     features_names = f'{"|".join(features_names)}'
-    #     features = main_features.filter(regex=features_names)
-    #     for idx, date in enumerate(dates[start_idx::DAYS_CONVERTER[args.L]]):
-    #         start_date = date-relativedelta(days=DAYS_CONVERTER[args.L])
-    #         train_X = features.loc[(features.index.get_level_values(1).date >= start_date) &
-    #                                (features.index.get_level_values(1).date < date), :]
-    #         train_y = train_X.pop(args.target)
-    #         cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in BINARY_PATTERN)]
-    #         if args.regression in ['lasso', 'elastic']:
-    #             standard_scaler = \
-    #                 dict([(symbol, StandardScaler().set_output(transform='pandas')) for symbol in SYMBOLS])
-    #             for symbol in train_X.index.get_level_values(0).unique():
-    #                 train_X.loc[train_X.index.get_level_values(0) == symbol,
-    #                 ~train_X.columns.isin(cols_ignore_in_scaling)] = \
-    #                     standard_scaler[symbol].fit_transform(train_X.xs(symbol, drop_level=False).loc[:,
-    #                                                         ~train_X.columns.isin(cols_ignore_in_scaling)])
-    #         study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
-    #         if model.name in ['lasso', 'elastic', 'lightgbm']:
-    #             rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
-    #             models.loc[date] = rres_study.user_attrs['best_estimator']
-    #         else:
-    #             train_dates = list(np.unique(train_X.index.get_level_values(1)))
-    #             train_dates, valid_dates = train_dates[:int(.8 * len(train_dates))], train_dates[
-    #                                                                                  int(.8 * len(train_dates)):]
-    #             train_X, valid_X = train_X.loc[train_X.index.get_level_values(1).isin(train_dates), :], \
-    #                 train_X.loc[train_X.index.get_level_values(1).isin(valid_dates), :]
-    #             train_y, valid_y = train_y.loc[train_y.index.get_level_values(1).isin(train_dates)], \
-    #                 train_y.loc[train_y.index.get_level_values(1).isin(valid_dates)]
-    #             model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y,
-    #                               n_trials=N_TRIALS//20, positiveness=args.target == 'RV',
-    #                               cols_ignore=cols_ignore_in_scaling)
-    #             models.loc[date] = model
-    #             standard_scaler = model.standardscaler
     for D, options in itertools.product(['1D', '1W', '1M'], [0, 1]):
-        models = pd.Series(data=np.nan, index=dates)
+        models = pd.Series(dtype=object, index=dates)
         features_importance = dict()
         features_names = LAGS[LAGS.index(args.freq):LAGS.index(D) + 1] + [args.target] + \
                          ['is_BTCUSDT', 'is_ETHUSDT', 'is_BNBUSDT', 'is_SOLUSDT', 'is_XRPUSDT']
