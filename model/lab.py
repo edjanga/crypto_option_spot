@@ -455,7 +455,6 @@ class PermutationFeatureImportance:
     def model(self, model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor]) -> None:
         self._model = model
 
-
     @property
     def test(self) -> Union[pd.DataFrame, np.ndarray, DataLoader]:
         return self._test
@@ -492,8 +491,8 @@ class PermutationFeatureImportance:
                     self._test_y.iloc[:, 1] = self.model.predict(shuffled_test)
                 else:
                     self._test_y.iloc[:, 1] = \
-                        self.model(torch.from_numpy(shuffled_test.values.reshape(1, shuffled_test.values.shape[0],
-                                                     shuffled_test.values.shape[1])))
+                        self.model.model(torch.from_numpy(shuffled_test.values.reshape(1, shuffled_test.values.shape[0],
+                                                                                       shuffled_test.values.shape[1])))
                     self._test_y = self._test_y.to(torch.float32).flatten().unsqueeze(0).detach().numpy()[0]
                 feature_importance[feature] += \
                 (self._test_y.diff(axis=1).iloc[:, -1].div(avg1s)).abs().groupby(by=pd.Grouper(level=0)).mean().mean()
