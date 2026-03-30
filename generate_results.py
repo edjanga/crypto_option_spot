@@ -130,11 +130,10 @@ if __name__ == '__main__':
                                       positiveness=(args.target == 'RV'), cols_ignore=cols_ignore_in_scaling,
                                       target=args.target, study_name=study_name)
                     models.loc[date] = model
-                    standard_scaler = model.standardscaler
                 except Exception:
                     continue
         models = models.ffill()
-        models = models.dropna().apply(lambda x: x.model) if args.regression in ['gru', 'lstm'] else models.dropna()
+        models = models.dropna()
         models.index = pd.to_datetime(models.index, utc=pytz.UTC)
         ################################################################################################################
         ## Performance evaluation
@@ -143,6 +142,7 @@ if __name__ == '__main__':
         mase = list()
         permutation_feature_importance_obj.freq = args.freq
         for start_date_forecast in dates[start_idx::pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days]:
+            standard_scaler = models.loc[pd.Timestamp(start_date).tz_localize('UTC')].standardscaler
             end_date_forecast = \
                 (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days))
             test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
