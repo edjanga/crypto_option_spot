@@ -185,7 +185,7 @@ if __name__ == '__main__':
                     index=test_y.index,
                     data=models.loc[models.index.date == date].iloc[0].model(test_X_tensor).detach().numpy().reshape(
                         test_X_tensor.shape[0]) if model.name in ['gru', 'lstm'] else
-                    models.loc[models.index.date == date].iloc[0].predict(test_X))
+                    models.loc[models.index.date == date].iloc[0].model.predict(test_X))
             for symbol in test_X.index.get_level_values(0).unique():
                 y_hat.loc[y_hat.index.get_level_values(0) == symbol] = \
                     standard_scaler[symbol].var_[0] ** .5 * y_hat.loc[y_hat.index.get_level_values(0) == symbol] + \
