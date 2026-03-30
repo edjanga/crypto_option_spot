@@ -198,11 +198,12 @@ if __name__ == '__main__':
             mase_metric = list()
             for symbol in test_y.index.get_level_values(0).unique():
                 symbol_test_y, symbol_train_y = test_y.xs(symbol, axis=0, level=0), train_y.xs(symbol, axis=0, level=0)
-                symbol_test_y = symbol_test_y.dropna()
-                symbol_train_y = symbol_train_y.dropna()
-                mase_metric.append(mase_score(y_true=symbol_test_y.iloc[:, 0].values,
-                                              y_pred=symbol_test_y.iloc[:, 1].values,
-                                              y_train=symbol_train_y.values))
+                if not symbol_test_y.empty:
+                    symbol_test_y = symbol_test_y.dropna()
+                    symbol_train_y = symbol_train_y.dropna()
+                    mase_metric.append(mase_score(y_true=symbol_test_y.iloc[:, 0].values,
+                                                  y_pred=symbol_test_y.iloc[:, 1].values,
+                                                  y_train=symbol_train_y.values))
             mase.append([sum(mase_metric)/len(mase_metric),
                          start_date_forecast, model.name.lower(), args.target, D, options, args.freq])
             ############################################################################################################
