@@ -105,8 +105,8 @@ if __name__ == '__main__':
             train_y = train_X.pop(args.target)
             cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in BINARY_PATTERN)]
             if args.regression in ['lasso', 'elastic']:
-                model.standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
                 for symbol in train_X.index.get_level_values(0).unique():
+                    model.standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
                     mask = train_X.index.get_level_values(0) == symbol
                     cols = ~train_X.columns.isin(cols_ignore_in_scaling)
                     train_X.loc[mask, cols] = model.standardscaler[symbol].fit_transform(train_X.loc[mask, cols])
