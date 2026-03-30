@@ -162,12 +162,15 @@ if __name__ == '__main__':
                 X_valid_split = train_X.loc[train_X.index.get_level_values(1).isin(valid_dates_split)]
                 y_train_split = train_y.loc[train_y.index.get_level_values(1).isin(train_dates_split)]
                 y_valid_split = train_y.loc[train_y.index.get_level_values(1).isin(valid_dates_split)]
-                model.model_train(train_X=X_train_split, train_y=y_train_split, valid_X=X_valid_split,
-                                  valid_y=y_valid_split, n_trials=N_TRIALS // 20, positiveness=(args.target == 'RV'),
-                                  cols_ignore=cols_ignore_in_scaling, target=args.target, study_name=study_name)
-                models.loc[date] = model
-                standard_scaler = model.standardscaler
-            pdb.set_trace()
+                try:
+                    model.model_train(train_X=X_train_split, train_y=y_train_split, valid_X=X_valid_split,
+                                      valid_y=y_valid_split, n_trials=N_TRIALS // 20,
+                                      positiveness=(args.target == 'RV'), cols_ignore=cols_ignore_in_scaling,
+                                      target=args.target, study_name=study_name)
+                    models.loc[date] = model
+                    standard_scaler = model.standardscaler
+                except Exception:
+                    continue
         models = models.ffill()
         models = models.dropna().apply(lambda x: x.model) if args.regression in ['gru', 'lstm'] else models.dropna()
         models.index = pd.to_datetime(models.index, utc=pytz.UTC)
