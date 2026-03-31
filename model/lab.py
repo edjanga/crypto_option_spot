@@ -69,7 +69,7 @@ class FeatureBuilder:
     def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 4) -> pl.DataFrame:
         if isinstance(data, pl.DataFrame):
             data = data.lazy()
-        pl_freq = freq.replace('in', '') if 'min' in freq else freq
+        pl_freq = freq.replace('in', '')
         data = data.sort(['underlying_name', 'timestamp'])
         aggs = [pl.sum('returns').alias('returns')]
         K = (pd.to_timedelta('1D') // pd.to_timedelta(freq))
@@ -78,8 +78,9 @@ class FeatureBuilder:
             if m == 2:
                 aggs.append((pl.col('returns') ** 2).sum().alias('RV'))
         moments = data.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name').agg(aggs)
-        for m in range(1, upperbound - 1):
-            moments = moments.with_columns((((pl.lit(K) ** m / pl.col('m2')) ** (m + 2)) ** 0.5).alias(f'm{m+2}'))
+        for m in range(3, upperbound + 1):
+            moments = \
+                moments.with_columns(pl.col(f'm{m}')*(((pl.lit(K) ** (m-2) / pl.col(f'm{m}'))) ** 0.5).alias(f'm{m}'))
         return moments.collect()
 
     @staticmethod
