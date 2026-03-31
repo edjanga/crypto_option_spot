@@ -171,12 +171,12 @@ if __name__ == '__main__':
                 test_X = test_X.loc[test_X.index.get_level_values(0).isin(
                     train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
                 test_y = test_y.loc[test_X.index]
-            for symbol in test_X.index.get_level_values(0).unique():
-                test_X.loc[test_X.index.get_level_values(0) == symbol,
-                ~test_X.columns.isin(cols_ignore_in_scaling)] = \
-                    standard_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
-                                                      ~test_X.columns.isin(cols_ignore_in_scaling)])
-            test_X = test_X.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
+            if args.regression != 'lightgbm':
+                for symbol in test_X.index.get_level_values(0).unique():
+                    test_X.loc[test_X.index.get_level_values(0) == symbol,
+                    ~test_X.columns.isin(cols_ignore_in_scaling)] = \
+                        standard_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
+                                                          ~test_X.columns.isin(cols_ignore_in_scaling)])
             if model.name in ['gru', 'lstm']:
                 test_X_tensor = \
                     torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
@@ -187,10 +187,11 @@ if __name__ == '__main__':
                     data=models.loc[models.index.date == date].iloc[0].model(test_X_tensor).detach().numpy().reshape(
                         test_X_tensor.shape[0]) if model.name in ['gru', 'lstm'] else
                     models.loc[models.index.date == date].iloc[0].model.predict(test_X))
-            for symbol in test_X.index.get_level_values(0).unique():
-                y_hat.loc[y_hat.index.get_level_values(0) == symbol] = \
-                    standard_scaler[symbol].var_[0] ** .5 * y_hat.loc[y_hat.index.get_level_values(0) == symbol] + \
-                    standard_scaler[symbol].mean_[0]
+            if args.regression != 'lightgbm':
+                for symbol in test_X.index.get_level_values(0).unique():
+                    y_hat.loc[y_hat.index.get_level_values(0) == symbol] = \
+                        standard_scaler[symbol].var_[0] ** .5 * y_hat.loc[y_hat.index.get_level_values(0) == symbol] + \
+                        standard_scaler[symbol].mean_[0]
             ############################################################################################################
             ## Model assessement
             ############################################################################################################
