@@ -84,8 +84,6 @@ if __name__ == '__main__':
     symbol_one_hot.index = main_features.index
     main_features = pd.concat([main_features, symbol_one_hot], axis=1)
     main_features = main_features.groupby(by=pd.Grouper(level=0), group_keys=False).apply(lambda x: x.ffill()).dropna()
-    main_features = main_features.replace([np.inf, -np.inf], [np.finfo(np.float32).max, np.finfo(np.float32).min])
-    main_features = main_features.clip(upper=np.finfo(np.float32).max, lower=np.finfo(np.float32).min)
     ####################################################################################################################
     ## Modelling
     ####################################################################################################################
@@ -110,7 +108,10 @@ if __name__ == '__main__':
                 for symbol in train_X.index.get_level_values(0).unique():
                     mask = train_X.index.get_level_values(0) == symbol
                     cols = ~train_X.columns.isin(cols_ignore_in_scaling)
+                    train_X.loc[mask, cols] = \
+                        train_X.loc[mask, cols].replace([-np.inf, np.inf], [np.nan, np.nan]).bfill().ffill()
                     train_X.loc[mask, cols] = model.standardscaler[symbol].fit_transform(train_X.loc[mask, cols])
+                    train_X.loc[mask, cols] = train_X.loc[mask, cols].bfill().ffill()
             study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
             if model.name in ['lasso', 'elastic', 'lightgbm']:
                 rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
@@ -257,12 +258,13 @@ if __name__ == '__main__':
             features_importance.to_sql(con=db_connect, if_exists='append', name='feature_importance')
             print(f'[Data Insertion]: Results for {args} have been inserted into the database.')
         else:
-            forecasts.to_csv(f'{args.target_path}/forecasts.csv', mode='a',
-                             header=not os.path.exists(f'{args.target_path}/forecasts.csv'))
-            metric.to_csv(f'{args.target_path}/metric.csv', mode='a',
-                          header=not os.path.exists(f'{args.target_path}/metric.csv'))
-            features_importance.to_csv(f'{args.target_path}/features_importance.csv', mode='a',
-                                       header=not os.path.exists(f'{args.target_path}/features_importance.csv'))
+            forecasts.to_csv(f'{args.target_path}/forecasts.csv_{args.regression}', mode='a',
+                             header=not os.path.exists(f'{args.target_path}/forecasts_{args.regression}.csv'))
+            metric.to_csv(f'{args.target_path}/metric.csv_{args.regression}', mode='a',
+                          header=not os.path.exists(f'{args.target_path}/metric_{args.regression}.csv'))
+            features_importance.to_csv(
+                f'{args.target_path}/features_importance_{args.regression}.csv', mode='a',
+                header=not os.path.exists(f'{args.target_path}/features_importance_{args.regression}.csv'))
             print(f'[Data Export]: Results for {args} have been exported into csv files.')
 
 
