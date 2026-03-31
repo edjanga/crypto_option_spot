@@ -79,9 +79,8 @@ class FeatureBuilder:
                 aggs.append((pl.col('returns') ** 2).sum().alias('RV'))
         moments = data.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name').agg(aggs)
         for m in range(3, upperbound + 1):
-            moments = \
-                moments.with_columns((pl.col(f'm{m}') * (pl.lit(K) ** (m / 2 - 1)) / (pl.col('m2') ** (m / 2)))\
-                    .alias(f'm{m}'))
+            scale = float(K ** (m / 2 - 1))
+            moments = moments.with_columns((pl.col(f'm{m}') * scale / (pl.col('m2') ** (m / 2))).alias(f'm{m}'))
         moments = moments.with_columns(pl.when(pl.col(pl.Float32, pl.Float64).is_infinite())
                                        .then(None).otherwise(pl.col(pl.Float32, pl.Float64))
                                        .forward_fill().over('underlying_name'))
