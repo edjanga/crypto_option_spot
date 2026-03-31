@@ -66,7 +66,7 @@ class FeatureBuilder:
         pass
 
     @staticmethod
-    def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 4) -> pl.DataFrame:
+    def returns_moments(data: pl.DataFrame | pl.LazyFrame, freq: str, upperbound: int = 6) -> pl.DataFrame:
         if isinstance(data, pl.DataFrame):
             data = data.lazy()
         pl_freq = freq.replace('in', '')
@@ -85,7 +85,7 @@ class FeatureBuilder:
         return moments.collect()
 
     @staticmethod
-    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 5)]) -> pl.LazyFrame:
+    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
         intraday_lags_exprs = [pl.col(feature) for feature in features]
         for lag in INTRADAY_LAGS:
             window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
