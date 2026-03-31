@@ -81,7 +81,9 @@ class FeatureBuilder:
         for m in range(3, upperbound + 1):
             scale = float(K ** (m / 2 - 1))
             exp = float(m / 2)
-            moments = moments.with_columns((pl.col(f'm{m}') * scale / pl.col('m2').pow(exp)).alias(f'm{m}'))
+            moments = \
+                moments.with_columns((pl.col(f'm{m}') * scale / pl.col('m2').cast(pl.Float64).pow(exp))
+                                     .cast(pl.Float32).alias(f'm{m}'))
             moments = moments.with_columns(pl.when(pl.col(f'm{m}').is_infinite())
                                            .then(None).otherwise(pl.col(f'm{m}'))
                                            .forward_fill().over('underlying_name').alias(f'm{m}'))
