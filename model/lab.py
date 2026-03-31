@@ -82,6 +82,9 @@ class FeatureBuilder:
             moments = \
                 moments.with_columns((pl.col(f'm{m}') * (pl.lit(K) ** (m / 2 - 1)) / (pl.col('m2') ** (m / 2)))\
                     .alias(f'm{m}'))
+        moments = moments.with_columns(pl.when(pl.col(pl.Float32, pl.Float64).is_infinite())
+                                       .then(None).otherwise(pl.col(pl.Float32, pl.Float64))
+                                       .forward_fill().over('underlying_name'))
         return moments.collect()
 
     @staticmethod
