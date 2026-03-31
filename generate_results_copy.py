@@ -179,16 +179,19 @@ if __name__ == "__main__":
     parser.add_argument('--target', type=str, default='returns')
     parser.add_argument('--target_path', type=str, default='./data_centre')
     parser.add_argument('--to_csv', type=int, default=1)
+    parser.add_argument('--options', type=int, default=0)
+    parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
     args = parser.parse_args()
     print(args)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC).date
     db_connect = sqlite3.connect(f"{args.target_path}/crypto_option_spot.db", check_same_thread=False)
     SYMBOLS_QUERY = "(" + ",".join(f'"{s}"' for s in SYMBOLS) + ")"
-    features_query = f'WITH base AS(SELECT DISTINCT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
-                     f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
-                     f'features_values FROM base ' \
-                     f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
-                     f'FROM base;'
+    features_query = \
+        f'WITH base AS(SELECT DISTINCT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
+        f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
+        f'features_values FROM base ' \
+        f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
+        f'FROM base;'
     features = pl.read_database(query=features_query, connection=db_connect)
     features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
                                       pl.col('features_values').cast(pl.Float32, strict=False)])
@@ -221,7 +224,7 @@ if __name__ == "__main__":
     model = models_factory_dd[args.regression]
     model.standardscaler = {s: StandardScaler().set_output(transform='pandas') for s in SYMBOLS}
     start_idx = np.searchsorted(dates, dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
-    date_grid = dates[start_idx::DAYS_CONVERTER[args.L]]
+    date_grid = dates[start_idx::DAYS_CONVERTER[args.D]]
     date_masks = {d: (main_features.index.get_level_values(1).date >= d - relativedelta(days=DAYS_CONVERTER[args.L])) &
                       (main_features.index.get_level_values(1).date < d) for d in date_grid}
     trained_models = dict(Parallel(n_jobs=-1)(
@@ -255,5 +258,4 @@ if __name__ == "__main__":
         forecasts.to_sql('forecasts', con=db_connect, if_exists='append')
         metric.to_sql('metric', con=db_connect, if_exists='append')
         features_importance.to_sql('feature_importance', con=db_connect, if_exists='append')
-
     print("[Done] All forecasts, MASE, and feature importance computed and stored.")
