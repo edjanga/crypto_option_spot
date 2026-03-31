@@ -80,8 +80,8 @@ class FeatureBuilder:
         moments = data.group_by_dynamic(index_column='timestamp', every=pl_freq, by='underlying_name').agg(aggs)
         for m in range(3, upperbound + 1):
             moments = \
-                moments.with_columns(pl.col(f'm{m}') * (pl.lit(K) ** (m / 2 - 1)) / (pl.col('m2') ** (m / 2)))\
-                    .alias(f'm{m}')
+                moments.with_columns((pl.col(f'm{m}') * (pl.lit(K) ** (m / 2 - 1)) / (pl.col('m2') ** (m / 2)))\
+                    .alias(f'm{m}'))
         return moments.collect()
 
     @staticmethod
