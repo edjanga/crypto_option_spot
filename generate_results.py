@@ -26,7 +26,7 @@ mase_score = MeanAbsoluteScaledError()
 
 
 def train_one_window(date, features, date_mask, model, args):
-    train_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp'])
+    train_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
     numeric_cols = train_X.select_dtypes(include='float32').columns.tolist()
     numeric_cols.remove(args.target)
     study_name = f'{model.name}_{args.L}_{args.target}_{date}'
