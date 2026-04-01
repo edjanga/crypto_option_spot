@@ -76,7 +76,6 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args):
         sym = y_hat.index.get_level_values(0)
         y_hat = y_hat * sym.map(stds) + sym.map(means)
     forecast_df = pd.concat([test_y.rename('y'), y_hat.rename('yhat')], axis=1)
-    pdb.set_trace()
     in_sample_avg = \
         train_features.to_pandas().groupby('underlying_name').apply(
             lambda x: ((x-x.shift()).abs().sum())/(x.shape[0]-1))
@@ -179,12 +178,12 @@ if __name__ == "__main__":
         ))
     else:
         trained_models = dict()
-        forecasts = list()
-        metrics = list()
-        features_importance = list()
         for date in date_grid:
             date, underlying_name, tmp_model = train_one_window(date, main_features, date_masks, model, args)
             trained_models[(underlying_name, date)] = tmp_model
+    forecasts = list()
+    metrics = list()
+    features_importance = list()
     date_grid_test = dates
     date_grid_test = date_grid_test[date_grid_test.index(date_grid[0])::DAYS_CONVERTER[args.D]]
     pd.Series(trained_models).reindex(date_grid_test)
