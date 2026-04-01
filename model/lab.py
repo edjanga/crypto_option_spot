@@ -22,6 +22,7 @@ import statsmodels.api as sm
 from torch.utils.data import Dataset
 import torch.nn as nn
 import torch.nn.functional as F
+from joblib import Parallel, delayed
 
 torch.set_float32_matmul_precision('high')
 DEVICE = 'cpu'
@@ -31,6 +32,10 @@ elif torch.cuda.is_available():
     DEVICE = 'cuda'
 
 tscv = TimeSeriesSplit(n_splits=2)
+
+
+def qlike_loss(y_hat: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return (y / (y_hat + eps) - torch.log(y / (y_hat + eps)) - 1).mean()
 
 
 def shuffle_single_feature(test, feature: str) -> Tuple[pd.DataFrame, str]:
@@ -333,26 +338,15 @@ class DLRegressor:
     def standardscaler(self):
         return self._standardscaler
 
-    def _prepare_data(self, df: pd.DataFrame, cols_ignore: List[str], is_train: bool = True) -> pd.DataFrame:
-        df_scaled = df.copy()
-        idx = pd.IndexSlice
-        scaling_cols = [c for c in df.columns if c not in cols_ignore]
-        for symbol in df.index.get_level_values(0).unique():
-            if is_train:
-                self._standardscaler[symbol] = StandardScaler().set_output(transform='pandas')
-                df_scaled.loc[idx[symbol, :], scaling_cols] = \
-                    self._standardscaler[symbol].fit_transform(df.loc[idx[symbol, :], scaling_cols])
-            elif symbol in self._standardscaler:
-                df_scaled.loc[idx[symbol, :], scaling_cols] = \
-                    self._standardscaler[symbol].transform(df.loc[idx[symbol, :], scaling_cols])
-        return df_scaled
+    @standardscaler.setter
+    def standardscaler(self, standardscaler: Dict[str, StandardScaler]) -> None:
+        self._standardscaler = standardscaler
 
     def model_train(self, train_X: pd.DataFrame, train_y: pd.Series, valid_X: pd.DataFrame, valid_y: pd.Series,
-                    positiveness: bool, cols_ignore: List[str], n_trials: int, target: str,
+                    positiveness: bool, cols_include: List[str], n_trials: int, target: str,
                     study_name: str) -> None:
-        X_train_s = self._prepare_data(train_X, cols_ignore, is_train=True)
-        X_valid_s = self._prepare_data(valid_X, cols_ignore, is_train=False)
-
+        # X_train_s = self._prepare_data(train_X, cols_include, is_train=True)
+        # X_valid_s = self._prepare_data(valid_X, cols_include, is_train=False)
         def objective(trial: optuna.Trial):
             params = {
                 'hidden_size': trial.suggest_categorical('hidden_size', PARAMS_DL['hidden_size']),
@@ -363,23 +357,28 @@ class DLRegressor:
             }
             if positiveness is True:
                 params.update({'beta': trial.suggest_categorical('beta', PARAMS_DL['beta'])})
-            if self.name == 'gru':
-                model = GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'],
-                                 num_layers=params['num_layers'], lr=params['learning_rate'],
-                                 positiveness=target == 'RV',
-                                 dropout=params['dropout'] if params['num_layers'] > 1 else 0.0)
-            pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
+            model_architecture = {'gru': GRUModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'],
+                                                  num_layers=params['num_layers'], lr=params['learning_rate'],
+                                                  positiveness=target == 'RV',
+                                                  dropout=params['dropout'] if params['num_layers'] > 1 else 0.0),
+                                  'lstm': LSTMModel(input_size=train_X.shape[1], hidden_size=params['hidden_size'],
+                                                    num_layers=params['num_layers'], lr=params['learning_rate'],
+                                                    positiveness=target == 'RV',
+                                                    dropout=params['dropout'] if params['num_layers'] > 1 else 0.0)
+                                  }
+            model = model_architecture[self.name]
+            # pruning_cb = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stop_cb = EarlyStopping(monitor='valid_loss', patience=3)
             accelerator = 'gpu' if 'cuda' in DEVICE else 'cpu'
             precision = 16 if accelerator == 'gpu' else 32
             trainer = p_light.Trainer(max_epochs=EPOCH // 10, accelerator=accelerator,
-                                      devices=1, precision=precision, callbacks=[pruning_cb, early_stop_cb],
+                                      devices=1, precision=precision, callbacks=[early_stop_cb],
                                       logger=False, enable_progress_bar=False, check_val_every_n_epoch=1,
                                       enable_checkpointing=False)
-            train_loader = DataLoader(TimeSeriesDataset(X_train_s.values, train_y.values),
+            train_loader = DataLoader(TimeSeriesDataset(train_X.values, train_y.values),
                                       batch_size=params['batch_size'], num_workers=8, pin_memory=True,
                                       persistent_workers=True)
-            valid_loader = DataLoader(TimeSeriesDataset(X_valid_s.values, valid_y.values),
+            valid_loader = DataLoader(TimeSeriesDataset(valid_X.values, valid_y.values),
                                       batch_size=params['batch_size'], num_workers=8, pin_memory=True,
                                       persistent_workers=True)
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
@@ -391,12 +390,22 @@ class DLRegressor:
         study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner(), study_name=study_name)
         study.optimize(objective, n_trials=n_trials)
         print(f'Best trial parameters: {study.best_params}')
-        if self.name == 'gru':
-            self._model = \
-                GRUModel(input_size=train_X.shape[1], hidden_size=study.best_params['hidden_size'],
-                         num_layers=study.best_params['num_layers'], lr=study.best_params['learning_rate'],
-                         dropout=study.best_params['dropout'] if study.best_params['num_layers'] > 1 else 0.0,
-                         positiveness=target == 'RV')
+        model_architecture_fitted = {'gru': GRUModel(input_size=train_X.shape[1],
+                                                     hidden_size=study.best_params['hidden_size'],
+                                                     num_layers=study.best_params['num_layers'],
+                                                     lr=study.best_params['learning_rate'],
+                                                     positiveness=target == 'RV',
+                                                     dropout=study.best_params['dropout']
+                                                     if study.best_params['num_layers'] > 1 else 0.0),
+                                     'lstm': LSTMModel(input_size=train_X.shape[1],
+                                                       hidden_size=study.best_params['hidden_size'],
+                                                       num_layers=study.best_params['num_layers'],
+                                                       lr=study.best_params['learning_rate'],
+                                                       positiveness=target == 'RV',
+                                                       dropout=study.best_params['dropout']
+                                                       if study.best_params['num_layers'] > 1 else 0.0)
+                                     }
+        self._model = model_architecture_fitted[self.name]
 
     def model_fine_tune(self, train_X: pd.DataFrame, train_y: pd.Series, epochs: int = 5) -> None:
         if self._model is None:
@@ -435,7 +444,8 @@ class GRUModel(p_light.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = F.mse_loss(y_hat, y)
+        loss = qlike_loss(y_hat, y)
+        #loss = F.mse_loss(y_hat, y)
         self.log('train_loss', loss, on_step=False, on_epoch=True)
         return loss
 
@@ -459,74 +469,103 @@ class GRURegressor(DLRegressor):
         super(GRURegressor, self).__init__(name=name)
 
 
+class LSTMModel(p_light.LightningModule):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, lr: float,
+                 output_size: int = 1, positiveness: bool = False):
+        super().__init__()
+        self.save_hyperparameters()
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.positiveness = positiveness
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.dropout(out[:, -1, :])
+        out = self.fc(out)
+        if self.positiveness:
+            out = F.softplus(out)
+        return out.squeeze(-1)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = qlike_loss(y_hat, y)
+        #loss = F.mse_loss(y_hat, y)
+        self.log('train_loss', loss, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.mse_loss(y_hat, y)
+        self.log('valid_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5, fused=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'monitor': 'valid_loss', 'interval': 'epoch', 'frequency': 1}
+                }
+
+
 class LSTMRegressor(DLRegressor):
     def __init__(self, name: str = 'lstm'):
         super(LSTMRegressor, self).__init__(name=name)
 
 
 class PermutationFeatureImportance:
-    def __init__(self, test: Union[pd.DataFrame, np.ndarray, DataLoader] = None,
-                 model: Union[LassoRegressor, ElasticRegressor, BoostingRegressor, LSTMRegressor] = None,
-                 test_y: pd.Series = None, train_y: pd.Series = None,  freq: str = None):
-        self._model = model
-        self._test = test
-        self._test_y = test_y
-        self._train_y = train_y
+    def __init__(self, test: pd.DataFrame = None,
+                 model: Union[LassoRegressor, ElasticRegressor, BoostingRegressor, GRURegressor, LSTMRegressor] = None,
+                 test_y: pd.DataFrame = None, train_y: pd.Series = None, freq: str = None,
+                 n_iter: int = 50, n_jobs: int = 2):
+        self.model = model
+        self._underlying_name = None
+        self.test = test.copy() if test is not None else None
+        self.test_y = test_y.copy() if test_y is not None else None
+        self.train_y = train_y
+        self.freq = freq
+        self.n_iter = n_iter
+        self.n_jobs = n_jobs
         self.score = dict()
-        self._freq = freq
+        self._in_avg = None
 
     @property
-    def model(self) -> Union[LassoRegressor, BoostingRegressor, LSTMRegressor]:
-        return self._model
+    def in_avg(self):
+        return self._in_avg
 
-    @model.setter
-    def model(self, model: Union[LassoRegressor, BoostingRegressor, LSTMRegressor]) -> None:
-        self._model = model
-
-    @property
-    def test(self) -> Union[pd.DataFrame, np.ndarray, DataLoader]:
-        return self._test
-
-    @test.setter
-    def test(self, test: Union[pd.DataFrame, np.ndarray, DataLoader]) -> None:
-        self._test = test
+    @in_avg.setter
+    def in_avg(self, in_avg: dict[str, float]):
+        self._in_avg = in_avg
 
     @property
-    def test_y(self) -> pd.Series:
-        return self._test_y
+    def underlying_name(self):
+        return self._underlying_name
 
-    @test_y.setter
-    def test_y(self, test_y: pd.Series) -> None:
-        self._test_y = test_y
+    @underlying_name.setter
+    def underlying_name(self, underlying_name: str):
+        self._underlying_name = underlying_name
 
-    @property
-    def train_y(self) -> pd.Series:
-        return self._train_y
-
-    @train_y.setter
-    def train_y(self, train_y: pd.Series) -> None:
-        self._train_y = train_y
+    def _feature_mase(self, feature: str) -> float:
+        x = self.test
+        y_true = self.test_y.iloc[:, 0].values
+        iter_scores = []
+        for _ in range(self.n_iter):
+            x[feature] = np.random.permutation(x[feature].values)
+            if hasattr(self.model.model, 'predict'):
+                y_pred = self.model.model.predict(x)
+            else:
+                x_tensor = torch.from_numpy(x.values.astype(np.float32).reshape(x.shape[0], 1, x.shape[1]))
+                y_pred = self.model.model(x_tensor).detach().cpu().numpy().ravel()
+            iter_scores.append(np.mean(np.abs(y_pred - y_true) / self._in_avg[self._underlying_name]))
+        return np.mean(iter_scores)
 
     def compute_score(self) -> pd.Series:
-        avg1s = self._train_y.groupby(by=pd.Grouper(level=0))
-        avg1s = avg1s.apply(lambda x: (x - x.shift()).abs().sum() / (x.shape[0] - 1))
-        feature_importance = dict([(feature, 0) for feature in self._test.columns])
-        count = 0
-        self._test = self._test.replace([-np.inf, np.inf], [np.finfo(np.float32).min, np.finfo(np.float32).max])
-        while count < 50:
-            for feature in self._test.columns:
-                shuffled_test, feature = shuffle_single_feature(self._test, feature)
-                if not isinstance(self.model, Union[GRURegressor, LSTMRegressor]):
-                    self._test_y.iloc[:, 1] = self.model.model.predict(shuffled_test)
-                else:
-                    tmp_shuffle = torch.from_numpy(
-                        shuffled_test.values.reshape(shuffled_test.values.shape[0], 1, shuffled_test.values.shape[1]))
-                    self._test_y.iloc[:, 1] = self.model.model(tmp_shuffle).detach().cpu().numpy()
-                feature_importance[feature] += \
-                (self._test_y.diff(axis=1).iloc[:, -1].div(avg1s)).abs().groupby(by=pd.Grouper(level=0)).mean().mean()
-            count += 1
-        feature_importance = pd.Series(feature_importance)/50
-        return feature_importance
+        features = self.test.columns.tolist()
+        results = Parallel(n_jobs=self.n_jobs)(delayed(self._feature_mase)(f) for f in features)
+        self.score = dict(zip(features, results))
+        return pd.Series(self.score)
 
 
 class PnLExplained:
