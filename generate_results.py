@@ -1,24 +1,120 @@
 import argparse
-import itertools
-import os
 import pdb
+
 import polars as pl
 import pytz
 import sqlite3
-from constants import *
 import pandas as pd
-from model.lab import FeatureBuilder, LassoRegressor, ElasticRegressor, BoostingRegressor, GRURegressor, LSTMRegressor,\
-    PermutationFeatureImportance
 from dateutil.relativedelta import relativedelta
-from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
+from joblib import Parallel, delayed
 from sklearn.preprocessing import StandardScaler
+from sktime.performance_metrics.forecasting import MeanAbsoluteScaledError
+from constants import *
+from model.lab import LassoRegressor, ElasticRegressor, BoostingRegressor,\
+    GRURegressor, LSTMRegressor, PermutationFeatureImportance
+import torch
+import os
 
-models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor()] #, GRURegressor(), LSTMRegressor()
+models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), GRURegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
-LAGS = INTRADAY_LAGS+INTERDAY_LAGS
+LAGS = INTRADAY_LAGS + INTERDAY_LAGS
+mase_score = MeanAbsoluteScaledError()
 
 
-if __name__ == '__main__':
+def train_one_window(date, features, date_mask, model, args):
+    train_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp'])
+    numeric_cols = train_X.select_dtypes(include='float32').columns.tolist()
+    numeric_cols.remove(args.target)
+    study_name = f'{model.name}_{args.L}_{args.target}_{date}'
+    if args.regression != 'lightgbm':
+        tmp_train_X = list()
+        for sym, tmp in train_X.groupby(level='underlying_name'):
+            tmp_scaled = model.standardscaler[sym].fit_transform(tmp[numeric_cols])
+            tmp = tmp.copy()
+            tmp[numeric_cols] = tmp_scaled
+            tmp_train_X.append(tmp)
+        train_X = pd.concat(tmp_train_X)
+    train_y = train_X.pop(args.target)
+    if args.regression in ['lasso', 'elastic', 'lightgbm']:
+        res = model.model_train(features=train_X, target=train_y, study_name=study_name)
+        model.model = res.user_attrs['best_estimator']
+    else:
+        valid_X = train_X.groupby(level='underlying_name', group_keys=False).apply(
+            lambda x: x.iloc[int(.8 * x.shape[0]):])
+        valid_y = train_y.groupby(level='underlying_name', group_keys=False).apply(
+            lambda x: x.iloc[int(.8 * x.shape[0]):])
+        train_X = train_X.loc[~train_X.index.isin(valid_X.index), :]
+        train_X = train_X.groupby(level='underlying_name', group_keys=False).apply(lambda x: x.bfill())
+        train_y = train_y.loc[~train_y.index.isin(valid_y.index), :]
+        model.model_train(train_X=train_X, train_y=train_y, valid_X=valid_X, valid_y=valid_y,
+                          n_trials=N_TRIALS // 20, positiveness=(args.target == 'RV'), cols_include=numeric_cols,
+                          target=args.target, study_name=study_name)
+    return date, model
+
+
+def evaluate_one_window(date, model, features, train_features, date_mask, args):
+    test_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp'])
+    numeric_cols = test_X.select_dtypes(include='float32').columns.tolist()
+    numeric_cols.remove(args.target)
+    if args.regression != 'lightgbm':
+        tmp_test_X = list()
+        for sym, tmp in test_X.groupby(level='underlying_name'):
+            tmp_scaled = model.standardscaler[sym].transform(tmp[numeric_cols])
+            tmp = tmp.copy()
+            tmp[numeric_cols] = tmp_scaled
+            tmp_test_X.append(tmp)
+        test_X = pd.concat(tmp_test_X)
+    test_y = test_X.pop(args.target)
+    if model.name in ['gru', 'lstm']:
+        X_tensor = torch.from_numpy(test_X.values.reshape(test_X.shape[0], 1, test_X.shape[1]).astype(np.float32))
+    y_hat = model.model.predict(test_X) if hasattr(model.model, 'predict') else \
+        model.model(X_tensor).detach().numpy().ravel()
+    y_hat = pd.Series(y_hat, index=test_y.index)
+    if args.regression != 'lightgbm':
+        means = pd.Series({k: v.mean_[0] for k, v in model.standardscaler.items()})
+        stds = pd.Series({k: np.sqrt(v.var_[0]) for k, v in model.standardscaler.items()})
+        sym = y_hat.index.get_level_values(0)
+        y_hat = y_hat * sym.map(stds) + sym.map(means)
+    forecast_df = pd.concat([test_y.rename('y'), y_hat.rename('yhat')], axis=1)
+    pdb.set_trace()
+    in_sample_avg = \
+        train_features.to_pandas().groupby('underlying_name').apply(
+            lambda x: ((x-x.shift()).abs().sum())/(x.shape[0]-1))
+    mase_mean = \
+        forecast_df.diff(axis=1).dropna(how='all', axis=1).div(in_sample_avg.rename(columns={'returns': 'yhat'})).abs()
+    mase_mean = mase_mean.rename(columns={'yhat': 'MASE'})
+    perm_obj = PermutationFeatureImportance()
+    perm_obj.in_avg = in_sample_avg.iloc[:, 0].to_dict()
+    perm_obj.model = model
+    perm_df = list()
+    for sym in SYMBOLS:
+        perm_obj.underlying_name = sym
+        perm_obj.test = test_X.xs(sym, axis=0, level=0, drop_level=True)
+        perm_obj.test_y = forecast_df.xs(sym, axis=0, level=0, drop_level=True)
+        perm_score = perm_obj.compute_score()
+        perm_score.index = \
+            pd.MultiIndex.from_product([[sym], [pd.to_datetime(date, utc=True)], perm_score.index.tolist()],
+                                       names=['underlying_name', 'timestamp', 'features'])
+        perm_df.append(perm_score.reset_index(-1).assign(
+            regression=args.regression, D=args.D, freq=args.freq, market=args.options, target=args.target))
+    return forecast_df, mase_mean, pd.concat(perm_df).rename(columns={0: 'MASE'})
+
+
+def evaluate_all_windows(trained_models, features, train_features, args):
+    date_grid = list(trained_models.keys())
+    results = Parallel(n_jobs=-1)(delayed(evaluate_one_window)(d, trained_models[d], features, train_features, args)
+                                  for d in date_grid)
+    forecasts = pd.concat([r[0] for r in results])
+    mase_metrics = pd.DataFrame([
+        {'timestamp': d, 'MASE': r[1], 'regression': args.regression, 'target': args.target, 'D': args.freq,
+         'market': 0, 'freq': args.freq}
+        for d, r in zip(date_grid, results)
+    ]).set_index('timestamp')
+    features_importance = pd.concat([r[2] for r in results])
+    return forecasts, mase_metrics, features_importance
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Script generating all results presented in the associated paper.\n'
                                                  'Results are computed model by model.')
     parser.add_argument('--regression', type=str, help='Regression technique to be used for modelling.')
@@ -27,246 +123,119 @@ if __name__ == '__main__':
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target', type=str, help='RV or returns.', default='returns')
-    parser.add_argument('--target_path', type=str, help='Directory where database is located',
-                        default='./data_centre')
+    parser.add_argument('--target_path', type=str, help='Directory where database is located', default='./data_centre')
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
+    parser.add_argument('--options', type=int, default=0, help='Add option features or not.')
+    parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
     args = parser.parse_args()
     print(args)
-    dates = list(pd.date_range(start=args.start_date, end=args.end_date, freq='1D', tz=pytz.UTC, inclusive='left'))
-    dates = list(map(lambda date: date.date(), dates))
-    feature_builder = FeatureBuilder()
-    db_connect = sqlite3.connect(database=f'{args.target_path}/crypto_option_spot.db',
-                                 check_same_thread=False)
-    ####################################################################################################################
-    ## Spot
-    ####################################################################################################################
-    SYMBOLS_QUERY = [f'\"{symbol}\"' for symbol in SYMBOLS]
-    SYMBOLS_QUERY = f'({",".join(SYMBOLS_QUERY)})'
-    features_query = f'WITH base AS(SELECT DISTINCT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
-    f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
-                     f'features_values FROM base ' \
-    f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
-    f'FROM base;'
-    features = pl.read_database(query=features_query, connection=db_connect)
-    features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
-                                      pl.col('features_values').cast(pl.Float32, strict=False)])
-    features = features.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
-        (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))).to_pandas()
-    features = \
-        features.pivot_table(values='features_values', index=['underlying_name', 'timestamp'], columns='features')
-    ####################################################################################################################
-    ## Options
-    ####################################################################################################################
-    try:
+    dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC).date.tolist()
+    db_connect = sqlite3.connect(f"{args.target_path}/crypto_option_spot.db", check_same_thread=False)
+    SYMBOLS_QUERY = "(" + ",".join(f'"{s}"' for s in SYMBOLS) + ")"
+    features_query = \
+        f'WITH base AS(SELECT DISTINCT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
+        f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
+        f'features_values FROM base ' \
+        f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
+        f'FROM base;'
+    features = pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000)
+    features = (df.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
+                                 pl.col('features_values').cast(pl.Float32, strict=False)]) for df in features)
+    features = (df.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
+                          (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))) for df in features)
+    features = pl.concat(features)
+    if args.options == 1:
         options_features_query = \
             f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
             f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
-        options_features = pl.read_database(query=options_features_query, connection=db_connect)
         options_features = \
-            options_features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
-                                           pl.col('features_values').cast(pl.Float32, strict=False)])
+            pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000)
         options_features = \
-            options_features.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
-                                    (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True))))
-        options_features = options_features.with_columns(pl.all().exclude(['underlying_name', 'timestamp'])
-                                                         .forward_fill().over('underlying_name')).to_pandas()
+            (df.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
+                              pl.col('features_values').cast(pl.Float32, strict=False)]) for df in options_features)
+        options_features = (df.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
+                              (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))) for df in
+                            options_features)
+        options_features = pl.concat(options_features)
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
-    except Exception:
+    else:
         main_features = features
-    mase_score = MeanAbsoluteScaledError()
-    permutation_feature_importance_obj = PermutationFeatureImportance()
-    ####################################################################################################################
-    ## One hot label encoding
-    ####################################################################################################################
-    symbol_one_hot = \
-        pd.DataFrame(
-            data=pd.get_dummies(main_features.index.get_level_values(0), prefix='is', prefix_sep='_')).astype(np.int8)
-    symbol_one_hot.index = main_features.index
-    main_features = pd.concat([main_features, symbol_one_hot], axis=1)
-    main_features = main_features.groupby(by=pd.Grouper(level=0), group_keys=False).apply(lambda x: x.ffill()).dropna()
-    ####################################################################################################################
-    ## Modelling
-    ####################################################################################################################
+    # one_hot = main_features.select('underlying_name').to_dummies().rename(
+    #     lambda c: c.replace('underlying_name_', 'is_')).cast(pl.Int8)
+    # main_features = pl.concat([main_features, one_hot], how='horizontal')
+    main_features = main_features.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
+    main_features = \
+        main_features.pivot(values='features_values', index=['underlying_name', 'timestamp'], columns='features',
+                            aggregate_function='first')
     model = models_factory_dd[args.regression]
-    model.standardscaler = {symbol: StandardScaler().set_output(transform='pandas') for symbol in SYMBOLS}
-    start_idx = dates.index(dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
-    permutation_feature_importance_obj = PermutationFeatureImportance()
-    for D, options in itertools.product(['1D', '1W', '1M'], [0, 1]):
-        models = pd.Series(dtype=object, index=dates)
-        features_importance = dict()
-        features_names = LAGS[LAGS.index(args.freq):LAGS.index(D) + 1] + [args.target] + \
-                         ['is_BTCUSDT', 'is_ETHUSDT', 'is_BNBUSDT', 'is_SOLUSDT', 'is_XRPUSDT']
-        features_names = f'{"|".join(features_names)}'
-        features = main_features.filter(regex=features_names)
-        for idx, date in enumerate(dates[start_idx::DAYS_CONVERTER[args.L]]):
-            start_date = date - relativedelta(days=DAYS_CONVERTER[args.L])
-            train_X = features.loc[(features.index.get_level_values(1).date >= start_date) &
-                                   (features.index.get_level_values(1).date < date), :].copy()
-            train_y = train_X.pop(args.target)
-            cols_ignore_in_scaling = [col for col in train_X.columns if any(pat in col for pat in BINARY_PATTERN)]
-            if args.regression in ['lasso', 'elastic']:
-                for symbol in train_X.index.get_level_values(0).unique():
-                    mask = train_X.index.get_level_values(0) == symbol
-                    cols = ~train_X.columns.isin(cols_ignore_in_scaling)
-                    train_X.loc[mask, cols] = \
-                        train_X.loc[mask, cols].replace([-np.inf, np.inf], [np.nan, np.nan]).bfill().ffill()
-                    train_X.loc[mask, cols] = model.standardscaler[symbol].fit_transform(train_X.loc[mask, cols])
-                    train_X.loc[mask, cols] = train_X.loc[mask, cols].bfill().ffill()
-            study_name = f'{model.name}_{args.L}_{args.target}_{date.strftime(DATE_FORMAT)}'
-            if model.name in ['lasso', 'elastic', 'lightgbm']:
-                rres_study = model.model_train(features=train_X, target=train_y, study_name=study_name)
-                model.model = rres_study.user_attrs['best_estimator']
-                models.loc[date] = model
-            else:
-                train_dates = np.unique(train_X.index.get_level_values(1))
-                split_idx = int(0.8 * len(train_dates))
-                train_dates_split = train_dates[:split_idx]
-                valid_dates_split = train_dates[split_idx:]
-                X_train_split = train_X.loc[train_X.index.get_level_values(1).isin(train_dates_split)]
-                X_valid_split = train_X.loc[train_X.index.get_level_values(1).isin(valid_dates_split)]
-                y_train_split = train_y.loc[train_y.index.get_level_values(1).isin(train_dates_split)]
-                y_valid_split = train_y.loc[train_y.index.get_level_values(1).isin(valid_dates_split)]
-                try:
-                    model.model_train(train_X=X_train_split, train_y=y_train_split, valid_X=X_valid_split,
-                                      valid_y=y_valid_split, n_trials=N_TRIALS // 20,
-                                      positiveness=(args.target == 'RV'), cols_ignore=cols_ignore_in_scaling,
-                                      target=args.target, study_name=study_name)
-                    models.loc[date] = model
-                except Exception:
-                    continue
-        models = models.ffill()
-        models = models.dropna()
-        models.index = pd.to_datetime(models.index, utc=pytz.UTC)
-        ################################################################################################################
-        ## Performance evaluation
-        ################################################################################################################
+    model.standardscaler = {s: StandardScaler().set_output(transform='pandas') for s in SYMBOLS}
+    start_idx = np.searchsorted(dates, dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
+    date_grid = dates[start_idx::DAYS_CONVERTER[args.L]]
+    date_masks = {d: ((main_features['timestamp'] >= pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.L]))) &
+                      (main_features['timestamp'] < pl.lit(d))) for d in date_grid}
+    if os.cpu_count() > 8:
+        trained_models = dict(Parallel(n_jobs=12)(
+            delayed(train_one_window)(d, main_features, date_masks, model, args) for d in date_grid
+        ))
+    else:
+        trained_models = dict()
         forecasts = list()
-        mase = list()
-        permutation_feature_importance_obj.freq = args.freq
-        for start_date_forecast in dates[start_idx::pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days]:
-            standard_scaler = models.loc[pd.Timestamp(start_date).tz_localize('UTC')].standardscaler
-            end_date_forecast = \
-                (start_date_forecast+relativedelta(days=pd.to_timedelta(DAYS_CONVERTER[D], unit='D').days))
-            test_X = features.loc[(features.index.get_level_values(1).date >= start_date_forecast) &
-                                  (features.index.get_level_values(1).date < end_date_forecast), :]
-            test_y = test_X.pop(args.target)
-            if (D != '1D') & (model.name in ['gru', 'lstm']):
-                ########################################################################################################
-                ## Fine-tuning
-                ########################################################################################################
-                fine_tuned_model = models.loc[models.index.date == start_date_forecast].iloc[0]
-                train_fine_tune_X = \
-                    features.loc[features.index.get_level_values(1).date == date - relativedelta(days=1), :].dropna()
-                train_fine_tune_y = train_fine_tune_X.pop(args.target)
-                for symbol in train_fine_tune_X.index.get_level_values(0).unique():
-                    train_fine_tune_X.loc[train_fine_tune_X.index.get_level_values(0) == symbol,
-                    ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)] = \
-                        standard_scaler[symbol].transform(train_fine_tune_X.xs(symbol, drop_level=False).loc[:,
-                                                          ~train_fine_tune_X.columns.isin(cols_ignore_in_scaling)])
-                fine_tuned_model = model.model_fine_tune(train_fine_tune_X=train_fine_tune_X, n_trials=1,
-                                                         train_fine_tune_y=train_fine_tune_y,
-                                                         model=fine_tuned_model, max_epochs=EPOCH//10, date=date,
-                                                         L=args.L, target=args.target)
-                models.loc[pd.to_datetime(date, utc=pytz.UTC)] = fine_tuned_model
-                test_X = test_X.loc[test_X.index.get_level_values(0).isin(
-                    train_fine_tune_X.index.get_level_values(0).unique()), train_fine_tune_X.columns].dropna()
-                test_y = test_y.loc[test_X.index]
-            if args.regression != 'lightgbm':
-                for symbol in test_X.index.get_level_values(0).unique():
-                    test_X.loc[test_X.index.get_level_values(0) == symbol,
-                    ~test_X.columns.isin(cols_ignore_in_scaling)] = \
-                        standard_scaler[symbol].transform(test_X.xs(symbol, drop_level=False).loc[:,
-                                                          ~test_X.columns.isin(cols_ignore_in_scaling)])
-            if model.name in ['gru', 'lstm']:
-                test_X_tensor = \
-                    torch.from_numpy(test_X.values.reshape((test_X.shape[0], 1,
-                                                            test_X.shape[1])).astype(np.float32))
-            y_hat = \
-                pd.Series(
-                    index=test_y.index,
-                    data=models.loc[models.index.date == date].iloc[0].model(test_X_tensor).detach().numpy().reshape(
-                        test_X_tensor.shape[0]) if model.name in ['gru', 'lstm'] else
-                    models.loc[models.index.date == date].iloc[0].model.predict(test_X))
-            if args.regression != 'lightgbm':
-                for symbol in test_X.index.get_level_values(0).unique():
-                    y_hat.loc[y_hat.index.get_level_values(0) == symbol] = \
-                        standard_scaler[symbol].var_[0] ** .5 * y_hat.loc[y_hat.index.get_level_values(0) == symbol] + \
-                        standard_scaler[symbol].mean_[0]
-            ############################################################################################################
-            ## Model assessement
-            ############################################################################################################
-            test_y = pd.concat([test_y.rename('values'), pd.Series(y_hat, index=test_y.index, name='forecast')], axis=1)
-            test_y = \
-                test_y.replace(0, np.nan).groupby(by=[pd.Grouper(level=0)], group_keys=False).apply(lambda x: x.ffill())
-            forecasts.append(test_y)
-            mase_metric = list()
-            for symbol in test_y.index.get_level_values(0).unique():
-                symbol_test_y, symbol_train_y = test_y.xs(symbol, axis=0, level=0), train_y.xs(symbol, axis=0, level=0)
-                try:
-                    symbol_test_y = symbol_test_y.dropna()
-                    symbol_train_y = symbol_train_y.dropna()
-                    mase_metric.append(mase_score(y_true=symbol_test_y.iloc[:, 0].values,
-                                                  y_pred=symbol_test_y.iloc[:, 1].values,
-                                                  y_train=symbol_train_y.values))
-                except ValueError:
-                    continue
-            mase.append([sum(mase_metric)/len(mase_metric),
-                         start_date_forecast, model.name.lower(), args.target, D, options, args.freq])
-            ############################################################################################################
-            ## Feature importance
-            ############################################################################################################
-            permutation_feature_importance_obj.model = models.loc[models.index.date == date].iloc[0]
-            permutation_feature_importance_obj.test = test_X
-            permutation_feature_importance_obj.test_y = test_y
-            permutation_feature_importance_obj.train_y = train_y
-            permutation_feature_importance_obj.score[pd.to_datetime(start_date_forecast, utc=pytz.UTC)] = \
-                permutation_feature_importance_obj.compute_score()
-        features_importance = pd.DataFrame(permutation_feature_importance_obj.score).transpose()
-        features_importance.index.name = 'timestamp'
-        features_importance = \
-            pd.melt(frame=features_importance, ignore_index=False, value_name='MASE', var_name='features')
-        metric = \
-            pd.DataFrame(mase, columns=['MASE', 'timestamp', 'regression', 'target', 'D',
-                                        'market', 'freq']).set_index('timestamp')
-        forecasts = pd.concat(forecasts).reset_index('underlying_name').assign(
-            regression=model.name.lower(), target=args.target, D=D, market=options, freq=args.freq)
-        metric.index = pd.to_datetime(metric.index, utc=True)
-        metric.index.name = 'timestamp'
-        underlying_rv = pd.read_sql(sql='SELECT "underlying_name", "timestamp", "target", "target_values" '
-                                        'FROM spot_features WHERE target == "RV";', con=db_connect).drop('target',
-                                                                                                         axis=1)
-        underlying_rv['timestamp'] = pd.to_datetime(underlying_rv['timestamp'], utc=pytz.UTC)
-        underlying_rv['target_values'] = pd.to_numeric(underlying_rv['target_values'], errors='coerce').astype(
-            'float32')
-        underlying_rv = underlying_rv.groupby(by=pd.Grouper(key='timestamp'))['target_values'].mean()
-        volatility_regime = underlying_rv.resample(args.freq).sum()
-        volatility_regime = \
-            volatility_regime.loc[(volatility_regime.index.date >= dates[start_idx]) &
-                                  (volatility_regime.index.date <= dates[-1])]
-        volatility_regime = pd.qcut(volatility_regime, q=[0, .45, .9, 1], labels=VOL_REGIMES)
-        volatility_regime.name = 'volatility_regime'
-        metric = metric.join(volatility_regime)
-        features_importance = features_importance.join(volatility_regime, how='left')
-        features_importance = \
-            features_importance.assign(regression=args.regression, D=D, freq=args.freq, market=options,
-                                       target=args.target)
-        ################################################################################################################
-        ## Database insertion or exporting to .csv files
-        ################################################################################################################
-        if args.to_csv == 0:
-            forecasts.to_sql(con=db_connect, if_exists='append', name='forecasts')
-            metric.to_sql(con=db_connect, if_exists='append', name='metric')
-            features_importance.to_sql(con=db_connect, if_exists='append', name='feature_importance')
-            print(f'[Data Insertion]: Results for {args} have been inserted into the database.')
-        else:
-            forecasts.to_csv(f'{args.target_path}/forecasts.csv_{args.regression}', mode='a',
-                             header=not os.path.exists(f'{args.target_path}/forecasts_{args.regression}.csv'))
-            metric.to_csv(f'{args.target_path}/metric.csv_{args.regression}', mode='a',
-                          header=not os.path.exists(f'{args.target_path}/metric_{args.regression}.csv'))
-            features_importance.to_csv(
-                f'{args.target_path}/features_importance_{args.regression}.csv', mode='a',
-                header=not os.path.exists(f'{args.target_path}/features_importance_{args.regression}.csv'))
-            print(f'[Data Export]: Results for {args} have been exported into csv files.')
-
-
-
+        metrics = list()
+        features_importance = list()
+        for date in date_grid:
+            date, underlying_name, tmp_model = train_one_window(date, main_features, date_masks, model, args)
+            trained_models[(underlying_name, date)] = tmp_model
+        date_grid_test = dates
+        date_grid_test = date_grid_test[date_grid_test.index(date_grid[0])::DAYS_CONVERTER[args.D]]
+        pd.Series(trained_models).reindex(date_grid_test)
+        date_masks_tests = {d: ((main_features['timestamp'] < pl.lit(d + relativedelta(days=DAYS_CONVERTER[args.D]))) &
+                                (main_features['timestamp'] >= pl.lit(d))) for d in date_grid_test}
+        for date in date_grid_test:
+            try:
+                in_sample_date = date_grid[np.where(np.array(date_grid) > date)[0][0]]
+            except Exception:
+                break
+            tmp_model = trained_models[in_sample_date]
+            forecast, metric, feature_importance = \
+                evaluate_one_window(
+                    date, tmp_model, main_features,
+                    main_features.filter(date_masks[in_sample_date])[['underlying_name', args.target]],
+                    date_masks_tests, args)
+            forecasts.append(forecast)
+            metrics.append(metric)
+            features_importance.append(feature_importance)
+    forecasts = pd.concat(forecasts)
+    forecasts = \
+        forecasts.set_index(forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1))
+    metric = pd.concat(metrics)
+    metric = metric.set_index(metric.index.set_levels(pd.to_datetime(metric.index.levels[1], utc=True), level=1))
+    features_importance = pd.concat(features_importance)
+    features_importance = features_importance.set_index(features_importance.index.set_levels(
+        pd.to_datetime(features_importance.index.levels[1], utc=True), level=1))
+    underlying_rv = pd.read_sql(
+        f'SELECT underlying_name, timestamp, target_values FROM spot_features WHERE target == "{args.target}";',
+        con=db_connect
+    )
+    underlying_rv['timestamp'] = pd.to_datetime(underlying_rv['timestamp'], utc=True)
+    underlying_rv['target_values'] = underlying_rv['target_values'].astype(np.float32)
+    volatility_regime = underlying_rv.groupby('timestamp')['target_values'].mean().resample(args.freq).sum()
+    volatility_regime = volatility_regime.loc[(volatility_regime.index.date >= dates[start_idx]) &
+                                             (volatility_regime.index.date <= dates[-1])]
+    volatility_regime = pd.qcut(volatility_regime, q=[0, .45, .9, 1], labels=VOL_REGIMES)
+    volatility_regime.name = 'volatility_regime'
+    metric = metric.join(volatility_regime, how='left', on='timestamp')
+    features_importance = features_importance.join(volatility_regime, how='left')
+    forecasts = forecasts.join(volatility_regime, how='left')
+    if args.to_csv:
+        forecasts.to_csv(f'{args.target_path}/forecasts.csv_{args.regression}', mode='a',
+                         header=not os.path.exists(f'{args.target_path}/forecasts_{args.regression}.csv'))
+        metric.to_csv(f'{args.target_path}/metric.csv_{args.regression}', mode='a',
+                      header=not os.path.exists(f'{args.target_path}/metric_{args.regression}.csv'))
+        features_importance.to_csv(
+            f'{args.target_path}/features_importance_{args.regression}.csv', mode='a',
+            header=not os.path.exists(f'{args.target_path}/features_importance_{args.regression}.csv'))
+    else:
+        forecasts.to_sql('forecasts', con=db_connect, if_exists='append')
+        metric.to_sql('metric', con=db_connect, if_exists='append')
+        features_importance.to_sql('feature_importance', con=db_connect, if_exists='append')
+    print("[Done] All forecasts, MASE, and feature importance computed and stored.")
