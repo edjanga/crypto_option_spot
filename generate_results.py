@@ -15,9 +15,9 @@ from model.lab import LassoRegressor, ElasticRegressor, BoostingRegressor,\
 import torch
 import os
 
-CASTS = [pl.col('underlying_name').cast(pl.Utf8),
-         pl.col('timestamp').cast(pl.Utf8),#.str.to_datetime(format='%Y-%m-%d %H:%M:%S%z', strict=False).dt.replace_time_zone('UTC'),
-         pl.col('features').cast(pl.Utf8), pl.col('features_values').cast(pl.Float32)]
+# CASTS = [pl.col('underlying_name').cast(pl.Utf8),
+#          pl.col('timestamp').cast(pl.Utf8),#.str.to_datetime(format='%Y-%m-%d %H:%M:%S%z', strict=False).dt.replace_time_zone('UTC'),
+#          pl.col('features').cast(pl.Utf8), pl.col('features_values').cast(pl.Float32)]
 
 models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), GRURegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
@@ -141,8 +141,8 @@ if __name__ == "__main__":
         f'features_values FROM base ' \
         f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
         f'FROM base;'
-    features = pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000)
-    features = (df.with_columns(CASTS) for df in features)
+    features = pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000,
+                                infer_schema_length=None)
     features = (df.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
                                  pl.col('features_values').cast(pl.Float32, strict=False)]) for df in features)
     features = (df.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
