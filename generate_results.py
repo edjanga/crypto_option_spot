@@ -185,25 +185,25 @@ if __name__ == "__main__":
         for date in date_grid:
             date, underlying_name, tmp_model = train_one_window(date, main_features, date_masks, model, args)
             trained_models[(underlying_name, date)] = tmp_model
-        date_grid_test = dates
-        date_grid_test = date_grid_test[date_grid_test.index(date_grid[0])::DAYS_CONVERTER[args.D]]
-        pd.Series(trained_models).reindex(date_grid_test)
-        date_masks_tests = {d: ((main_features['timestamp'] < pl.lit(d + relativedelta(days=DAYS_CONVERTER[args.D]))) &
-                                (main_features['timestamp'] >= pl.lit(d))) for d in date_grid_test}
-        for date in date_grid_test:
-            try:
-                in_sample_date = date_grid[np.where(np.array(date_grid) > date)[0][0]]
-            except Exception:
-                break
-            tmp_model = trained_models[in_sample_date]
-            forecast, metric, feature_importance = \
-                evaluate_one_window(
-                    date, tmp_model, main_features,
-                    main_features.filter(date_masks[in_sample_date])[['underlying_name', args.target]],
-                    date_masks_tests, args)
-            forecasts.append(forecast)
-            metrics.append(metric)
-            features_importance.append(feature_importance)
+    date_grid_test = dates
+    date_grid_test = date_grid_test[date_grid_test.index(date_grid[0])::DAYS_CONVERTER[args.D]]
+    pd.Series(trained_models).reindex(date_grid_test)
+    date_masks_tests = {d: ((main_features['timestamp'] < pl.lit(d + relativedelta(days=DAYS_CONVERTER[args.D]))) &
+                            (main_features['timestamp'] >= pl.lit(d))) for d in date_grid_test}
+    for date in date_grid_test:
+        try:
+            in_sample_date = date_grid[np.where(np.array(date_grid) > date)[0][0]]
+        except Exception:
+            break
+        tmp_model = trained_models[in_sample_date]
+        forecast, metric, feature_importance = \
+            evaluate_one_window(
+                date, tmp_model, main_features,
+                main_features.filter(date_masks[in_sample_date])[['underlying_name', args.target]],
+                date_masks_tests, args)
+        forecasts.append(forecast)
+        metrics.append(metric)
+        features_importance.append(feature_importance)
     forecasts = pd.concat(forecasts)
     forecasts = \
         forecasts.set_index(forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1))
