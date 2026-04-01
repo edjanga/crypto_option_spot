@@ -160,9 +160,9 @@ if __name__ == "__main__":
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='right')
     else:
         main_features = features
-    # one_hot = main_features.select('underlying_name').to_dummies().rename(
-    #     lambda c: c.replace('underlying_name_', 'is_')).cast(pl.Int8)
-    # main_features = pl.concat([main_features, one_hot], how='horizontal')
+    one_hot = main_features.select('underlying_name').to_dummies().rename(
+        lambda c: c.replace('underlying_name_', 'is_')).cast(pl.Int8)
+    main_features = pl.concat([main_features, one_hot], how='horizontal')
     main_features = main_features.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
     main_features = \
         main_features.pivot(values='features_values', index=['underlying_name', 'timestamp'], columns='features',
