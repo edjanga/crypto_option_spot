@@ -22,7 +22,7 @@ import os
 models = [LassoRegressor(), ElasticRegressor(), BoostingRegressor(), GRURegressor(), LSTMRegressor()]
 models_factory_dd = {model.name.lower(): model for model in models}
 LAGS = INTRADAY_LAGS + INTERDAY_LAGS
-mase_score = MeanAbsoluteScaledError()
+contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
 
 
 def train_one_window(date, features, date_mask, model, args):
@@ -84,7 +84,8 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args):
         train_features.to_pandas().groupby('underlying_name').apply(
             lambda x: ((x-x.shift()).abs().sum())/(x.shape[0]-1))
     mase_mean = \
-        forecast_df.diff(axis=1).dropna(how='all', axis=1).div(in_sample_avg.rename(columns={'returns': 'yhat'})).abs()
+        forecast_df.diff(axis=1).dropna(how='all', axis=1).div(
+            in_sample_avg.rename(columns={args.target: 'yhat'})).abs()
     mase_mean = mase_mean.rename(columns={'yhat': 'MASE'})
     perm_obj = PermutationFeatureImportance()
     perm_obj.in_avg = in_sample_avg.iloc[:, 0].to_dict()
@@ -103,20 +104,6 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args):
     return forecast_df, mase_mean, pd.concat(perm_df).rename(columns={0: 'MASE'})
 
 
-def evaluate_all_windows(trained_models, features, train_features, args):
-    date_grid = list(trained_models.keys())
-    results = Parallel(n_jobs=-1)(delayed(evaluate_one_window)(d, trained_models[d], features, train_features, args)
-                                  for d in date_grid)
-    forecasts = pd.concat([r[0] for r in results])
-    mase_metrics = pd.DataFrame([
-        {'timestamp': d, 'MASE': r[1], 'regression': args.regression, 'target': args.target, 'D': args.freq,
-         'market': 0, 'freq': args.freq}
-        for d, r in zip(date_grid, results)
-    ]).set_index('timestamp')
-    features_importance = pd.concat([r[2] for r in results])
-    return forecasts, mase_metrics, features_importance
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Script generating all results presented in the associated paper.\n'
                                                  'Results are computed model by model.')
@@ -130,6 +117,7 @@ if __name__ == "__main__":
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
     parser.add_argument('--options', type=int, default=0, help='Add option features or not.')
     parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
+    parser.add_argument('--cpu_count', type=int, default=10, help='Number of processes to run the whole pipeline on.')
     args = parser.parse_args()
     print(args)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC).date.tolist()
@@ -177,15 +165,10 @@ if __name__ == "__main__":
     date_grid = dates[start_idx::DAYS_CONVERTER[args.L]]
     date_masks = {d: ((main_features['timestamp'] >= pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.L]))) &
                       (main_features['timestamp'] < pl.lit(d))) for d in date_grid}
-    if os.cpu_count() > 8:
-        trained_models = dict(Parallel(n_jobs=12)(
-            delayed(train_one_window)(d, main_features, date_masks, model, args) for d in date_grid
-        ))
-    else:
-        trained_models = dict()
-        for date in date_grid:
-            date, underlying_name, tmp_model = train_one_window(date, main_features, date_masks, model, args)
-            trained_models[(underlying_name, date)] = tmp_model
+    main_features = main_features.drop(contemporanous_features[args.target])
+    trained_models = dict(Parallel(n_jobs=args.cpu_count)(
+        delayed(train_one_window)(d, main_features, date_masks, model, args) for d in date_grid
+    ))
     forecasts = list()
     metrics = list()
     features_importance = list()
@@ -227,19 +210,23 @@ if __name__ == "__main__":
                                              (volatility_regime.index.date <= dates[-1])]
     volatility_regime = pd.qcut(volatility_regime, q=[0, .45, .9, 1], labels=VOL_REGIMES)
     volatility_regime.name = 'volatility_regime'
-    metric = metric.join(volatility_regime, how='left', on='timestamp')
-    features_importance = features_importance.join(volatility_regime, how='left')
-    forecasts = forecasts.join(volatility_regime, how='left')
+    metric = metric.join(volatility_regime, how='left', on='timestamp').assign(regression=args.regression,
+                                                                               target=args.target, D=args.D,
+                                                                               freq=args.freq, market=args.options)
+    features_importance = features_importance.join(volatility_regime, how='left').assign(market=args.options)
+    forecasts = forecasts.join(volatility_regime, how='left').assign(regression=args.regression,
+                                                                     target=args.target, D=args.D, freq=args.freq,
+                                                                     market=args.options)
     if args.to_csv:
-        forecasts.to_csv(f'{args.target_path}/forecasts.csv_{args.regression}', mode='a',
-                         header=not os.path.exists(f'{args.target_path}/forecasts_{args.regression}.csv'))
-        metric.to_csv(f'{args.target_path}/metric.csv_{args.regression}', mode='a',
-                      header=not os.path.exists(f'{args.target_path}/metric_{args.regression}.csv'))
+        forecasts.to_csv(f'{args.target_path}/forecasts.csv', mode='a',
+                         header=not os.path.exists(f'{args.target_path}/forecasts.csv'))
+        metric.to_csv(f'{args.target_path}/metric.csv', mode='a',
+                      header=not os.path.exists(f'{args.target_path}/metric.csv'))
         features_importance.to_csv(
-            f'{args.target_path}/features_importance_{args.regression}.csv', mode='a',
-            header=not os.path.exists(f'{args.target_path}/features_importance_{args.regression}.csv'))
+            f'{args.target_path}/features_importance.csv', mode='a',
+            header=not os.path.exists(f'{args.target_path}/features_importance.csv'))
     else:
         forecasts.to_sql('forecasts', con=db_connect, if_exists='append')
         metric.to_sql('metric', con=db_connect, if_exists='append')
         features_importance.to_sql('feature_importance', con=db_connect, if_exists='append')
-    print("[Done] All forecasts, MASE, and feature importance computed and stored.")
+    print('[Done] All forecasts, MASE, and feature importance computed and stored.')
