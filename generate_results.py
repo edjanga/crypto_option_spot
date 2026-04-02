@@ -141,7 +141,8 @@ if __name__ == "__main__":
             f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
             f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
         options_features = \
-            pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000)
+            pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000,
+                             infer_schema_length=None)
         options_features = \
             (df.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
                               pl.col('features_values').cast(pl.Float32, strict=False)]) for df in options_features)
