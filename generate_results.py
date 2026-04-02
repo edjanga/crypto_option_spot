@@ -158,7 +158,7 @@ if __name__ == "__main__":
     main_features = pl.concat([main_features, one_hot], how='horizontal')
     main_features = main_features.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
     main_features = \
-        main_features.pivot(values='features_values', index=['underlying_name', 'timestamp'], columns='features',
+        main_features.pivot(values='features_values', index=['underlying_name', 'timestamp'], on='features',
                             aggregate_function='first')
     model = models_factory_dd[args.regression]
     model.standardscaler = {s: StandardScaler().set_output(transform='pandas') for s in SYMBOLS}
@@ -179,10 +179,7 @@ if __name__ == "__main__":
     date_masks_tests = {d: ((main_features['timestamp'] < pl.lit(d + relativedelta(days=DAYS_CONVERTER[args.D]))) &
                             (main_features['timestamp'] >= pl.lit(d))) for d in date_grid_test}
     for date in date_grid_test:
-        try:
-            in_sample_date = date_grid[np.where(np.array(date_grid) > date)[0][0]]
-        except Exception:
-            break
+        in_sample_date = date_grid[np.where(np.array(date_grid) >= date)[0][0]]
         tmp_model = trained_models[in_sample_date]
         forecast, metric, feature_importance = \
             evaluate_one_window(
