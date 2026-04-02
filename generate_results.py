@@ -95,6 +95,7 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args):
         perm_obj.underlying_name = sym
         perm_obj.test = test_X.xs(sym, axis=0, level=0, drop_level=True)
         perm_obj.test_y = forecast_df.xs(sym, axis=0, level=0, drop_level=True)
+        pdb.set_trace()
         perm_score = perm_obj.compute_score()
         perm_score.index = \
             pd.MultiIndex.from_product([[sym], [pd.to_datetime(date, utc=True)], perm_score.index.tolist()],
@@ -120,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument('--cpu_count', type=int, default=10, help='Number of processes to run the whole pipeline on.')
     args = parser.parse_args()
     print(args)
-    dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC).date.tolist()
+    dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
     db_connect = sqlite3.connect(f"{args.target_path}/crypto_option_spot.db", check_same_thread=False)
     SYMBOLS_QUERY = "(" + ",".join(f'"{s}"' for s in SYMBOLS) + ")"
     features_query = \
@@ -216,13 +217,13 @@ if __name__ == "__main__":
                                                                      target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
     if args.to_csv:
-        forecasts.to_csv(f'{args.target_path}/forecasts.csv', mode='a',
-                         header=not os.path.exists(f'{args.target_path}/forecasts.csv'))
-        metric.to_csv(f'{args.target_path}/metric.csv', mode='a',
-                      header=not os.path.exists(f'{args.target_path}/metric.csv'))
+        forecasts.to_csv(f'{args.target_path}/forecasts_{args.target}.csv', mode='a',
+                         header=not os.path.exists(f'{args.target_path}/forecasts_{args.target}.csv'))
+        metric.to_csv(f'{args.target_path}/metric_{args.target}.csv', mode='a',
+                      header=not os.path.exists(f'{args.target_path}/metric_{args.target}.csv'))
         features_importance.to_csv(
-            f'{args.target_path}/features_importance.csv', mode='a',
-            header=not os.path.exists(f'{args.target_path}/features_importance.csv'))
+            f'{args.target_path}/features_importance_{args.target}.csv', mode='a',
+            header=not os.path.exists(f'{args.target_path}/features_importance_{args.target}.csv'))
     else:
         forecasts.to_sql('forecasts', con=db_connect, if_exists='append')
         metric.to_sql('metric', con=db_connect, if_exists='append')
