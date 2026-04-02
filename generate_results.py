@@ -57,7 +57,7 @@ def train_one_window(date, features, date_mask, model, args):
 
 
 def evaluate_one_window(date, model, features, train_features, date_mask, args):
-    test_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp'])
+    test_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
     numeric_cols = test_X.select_dtypes(include='float32').columns.tolist()
     numeric_cols.remove(args.target)
     if args.regression != 'lightgbm':
@@ -71,6 +71,7 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args):
     test_y = test_X.pop(args.target)
     if model.name in ['gru', 'lstm']:
         X_tensor = torch.from_numpy(test_X.values.reshape(test_X.shape[0], 1, test_X.shape[1]).astype(np.float32))
+    pdb.set_trace()
     y_hat = model.model.predict(test_X) if hasattr(model.model, 'predict') else \
         model.model(X_tensor).detach().numpy().ravel()
     y_hat = pd.Series(y_hat, index=test_y.index)
