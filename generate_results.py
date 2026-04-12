@@ -1,4 +1,6 @@
 import argparse
+import pdb
+
 import polars as pl
 import pytz
 import sqlite3
@@ -20,17 +22,19 @@ regression = {'ml': ['Lasso', 'LGBMRegressor'], 'dl': ['SOFTS']}
 
 def train_one_window(date, features, date_mask, args):
     train_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
-    numeric_cols = train_X.select_dtypes(include='float32').columns.tolist()
-    numeric_cols.remove(args.target)
-    train_X = train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds',
-                                                    args.target: 'y'})
+    # numeric_cols = train_X.select_dtypes(include='float32').columns.tolist()
+    # numeric_cols.remove(args.target)
+    train_X = \
+        train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
     ds_unique = train_X.ds.unique()
     start, end = ds_unique[0], ds_unique[-1]
     full_dates = pd.date_range(start, end, freq=args.freq, inclusive='both')
     uids = train_X['unique_id'].unique()
     full_index = pd.MultiIndex.from_product([uids, full_dates], names=['unique_id', 'ds'])
     try:
-        train_X = (train_X.set_index(['unique_id', 'ds']).reindex(full_index).reset_index())
+        train_X = \
+            train_X.drop_duplicates(subset=['unique_id', 'ds']).set_index(['unique_id', 'ds']).reindex(full_index)
+        train_X = train_X.reset_index()
         if train_X.empty:
             raise ValueError
     except ValueError:
@@ -64,6 +68,7 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args, 
     test_X = features.filter(date_mask[date]).to_pandas()
     n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
     test_X = test_X.rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
+    test_X = test_X.drop_duplicates(subset=['unique_id', 'ds'])
     test_y = test_X[test_X['ds'] >= pd.Timestamp(date)][['unique_id', 'ds', 'y']].set_index(['unique_id', 'ds'])
     numeric_cols = test_X.select_dtypes(include='float32').columns.tolist()
     if args.regression != 'dl':
@@ -86,6 +91,7 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args, 
         softs_y = softs_model.predict(h=n_heads*n_steps_ahead_scaler, futr_df=test_X).set_index(['unique_id', 'ds'])
         tmp_model = [softs_y]
     test_y = pd.concat([test_y]+tmp_model, axis=1)
+    test_y = test_y.groupby([pd.Grouper(level=0), pd.Grouper(level=1, freq=args.freq)]).sum()
     #################################################### MASE ##########################################################
     train_features = train_features.to_pandas().rename(columns={'underlying_name': 'unique_id', args.target: 'y'})
     in_sample_avg = train_features[['unique_id', 'y']].groupby('unique_id')
@@ -96,14 +102,14 @@ def evaluate_one_window(date, model, features, train_features, date_mask, args, 
                                                                                  'LGBMRegressor': 'lightgbm',
                                                                                  'SOFTS': 'softs'})
     mase_mean = mase_mean.stack().reset_index().rename(
-        columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_2': 'regression', 0: 'MASE'})
+        columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_2': 'regression', 0: 'MASE'}).dropna()
     ############################################# Feature Importance ###################################################
     perm_df = list()
     for col in test_X.columns:
-        shuffled_X = test_X.copy().reset_index()
+        shuffled_X = test_X.copy()#.reset_index()
         shuffled_X[col] = shuffled_X.groupby('unique_id')[col].transform(lambda x: np.random.permutation(x.to_numpy()))
         if args.regression == 'ml':
-            shuffled_lasso_X = test_lasso_X.copy().reset_index()
+            shuffled_lasso_X = test_lasso_X.copy()#.reset_index()
             shuffled_lasso_X[col] = \
                 shuffled_lasso_X.groupby('unique_id')[col].transform(lambda x: np.random.permutation(x.to_numpy()))
             lightgbm_shuffled_y = lightgbm_model.predict(h=n_heads*n_steps_ahead_scaler,
@@ -146,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
     parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target', type=str, help='RV or returns.', default='returns')
-    parser.add_argument('--target_path', type=str, help='Directory where database is located', default='./data_centre')
+    parser.add_argument('--target_path', type=str, help='Directory where database is located', default='../data_centre')
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
     parser.add_argument('--options', type=int, default=0, help='Add option features or not.')
     parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
@@ -172,10 +178,14 @@ if __name__ == "__main__":
         features = pl.concat(features)
     else:
         features = pl.read_csv(f'{args.target_path}/spot_features.csv', batch_size=100_000)
+        features = features.filter(pl.col('target') == args.target)
         features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
                                           pl.col('features_values').cast(pl.Float32, strict=False)])
-    features = features.pivot(values='features_values', index=['underlying_name', 'timestamp'], on='features',
+    features = features.pivot(values='features_values',
+                              index=['underlying_name', 'timestamp', 'target', 'target_values'], on='features',
                               aggregate_function='first')
+    features = features.drop('target').with_columns(pl.col('target_values').alias(args.target)).drop('target_values')
+    features = features.unique(maintain_order=True)
     if args.options == 1:
         if not os.path.exists(f'{args.target_path}/option_features.csv'):
             options_features_query = \

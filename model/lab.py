@@ -17,8 +17,8 @@ elif torch.cuda.is_available():
 def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
     list_factors = x.features.values.tolist()
     target = x.target.unique()[0]
-    # targets = targets.xs(target, axis=1, level=-1).filter(regex='|'.join(list_factors)).unstack()
-    # targets = targets.loc[targets.index.get_level_values(0).isin(list_factors)]
+    targets = targets.xs(target, axis=1, level=-1).filter(regex='|'.join(list_factors)).unstack()
+    targets = targets.loc[targets.index.get_level_values(0).isin(list_factors)]
     X = data.filter(regex='|'.join(list_factors))
     pnl = pnl.xs(x.name[1], axis=1, level=1).xs(x.name[-1], axis=0, level=1).stack()
     pnl.name = 'P&L'
