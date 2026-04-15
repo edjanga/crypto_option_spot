@@ -56,6 +56,7 @@ def train_one_window(date, features, date_mask, args):
         std = train_group.xs('std', axis=1, level=1)
         for col in num_cols:
             train_X[col] = (train_X[col] - train_X['unique_id'].map(mean[col])) / train_X['unique_id'].map(std[col])
+        train_X[num_cols] = train_X.groupby('unique_id')[num_cols].transform(lambda x: x.fillna(x.mean()))
         model2.fit(train_X, fitted=False, static_features=[])
         model = [model, model2, train_group]
     return date, model
@@ -233,12 +234,12 @@ if __name__ == "__main__":
                             (main_features['timestamp'] >=
                              pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.D]+DAYS_CONVERTER[args.D]))))
                         for d in date_grid_test}
-    trained_models = dict(Parallel(n_jobs=args.cpu_count)(
-        delayed(train_one_window)(d, main_features, date_masks, args) for d in date_grid
-    ))
-    #(train_one_window)(d, main_features, date_masks, args)
-    # for d in date_grid:
-    #     train_one_window(d, main_features, date_masks, args)
+    # trained_models = dict(Parallel(n_jobs=args.cpu_count)(
+    #     delayed(train_one_window)(d, main_features, date_masks, args) for d in date_grid
+    # ))
+    # (train_one_window)(d, main_features, date_masks, args)
+    for d in date_grid:
+        train_one_window(d, main_features, date_masks, args)
     forecasts, metrics, features_importance = [], [], []
     date_grid_np = np.array(date_grid)
     date_grid_test = np.array(date_grid_test)
@@ -304,7 +305,6 @@ if __name__ == "__main__":
     #     forecasts.append(forecast.loc[forecast_range, :])
     #     metrics.append(metric.loc[metric_range, :])
     #     features_importance.append(feature_importance.loc[feature_importance_range, :])
-    pdb.set_trace()
     forecasts = pd.concat(forecasts).set_index(['underlying_name', 'timestamp'])
     forecasts.index = forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1)
     metric = pd.concat(metrics).set_index(['underlying_name', 'timestamp'])
