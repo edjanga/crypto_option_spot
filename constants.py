@@ -50,3 +50,4 @@ ATM_MONEYNESSES = \
     np.log(np.linspace(LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, int(100*(HIGH_ATM_MONEYNESS-LOW_ATM_MONEYNESS)+1)))
 BINARY_PATTERN = ['retail', 'informed', 'institutions', 'is_']
 ENGINE = 'cuda' if torch.cuda.is_available() else 'cpu'
+model_names = {'Lasso': 'lasso', 'LGBMRegressor': 'lightgbm', 'SOFTS': 'softs'}
