@@ -1,6 +1,4 @@
 import argparse
-import pdb
-
 import polars as pl
 import pytz
 import sqlite3
@@ -47,13 +45,15 @@ def train_one_window(date, features, date_mask, args):
         model = NeuralForecast(models=[model], freq=args.freq)
         model.fit(df=train_X, val_size=n_heads)
     else:
-        model = MLForecast(models=lgb.LGBMRegressor(force_col_wise=True), freq=args.freq, target_transforms=[])
-        model2 = MLForecast(models=Lasso(), freq=args.freq, target_transforms=[])
+        model = \
+            MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-3, n_estimators=50),
+                       freq=args.freq, target_transforms=[])
         model.fit(train_X, fitted=True, static_features=[])
+        model2 = MLForecast(models=Lasso(), freq=args.freq, target_transforms=[])
         num_cols = train_X.select_dtypes(include='number').columns
         train_group = train_X.groupby('unique_id')[num_cols].agg(['mean', 'std'])
         mean = train_group.xs('mean', axis=1, level=1)
-        std = train_group.xs('std', axis=1, level=1)
+        std = train_group.xs('std', axis=1, level=1).clip(lower=1e-8)
         for col in num_cols:
             train_X[col] = (train_X[col] - train_X['unique_id'].map(mean[col])) / train_X['unique_id'].map(std[col])
         train_X[num_cols] = train_X.groupby('unique_id')[num_cols].transform(lambda x: x.fillna(x.mean()))
@@ -66,10 +66,7 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler):
     n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
     if args.regression != 'dl':
         lightgbm_model, lasso_model, stats = tuple(model)
-        mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1)
-        # mean_g.columns = mean_g.columns.str.replace('_mean', '')
-        # std_g = stats.filter(regex=r'_std')
-        # std_g.columns = std_g.columns.str.replace('_mean', '')
+        mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
         idx_test = lightgbm_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
         test_X = pl.from_pandas(idx_test).with_columns(pl.col('ds').cast(pl.Datetime('us'))).rename(
             {'unique_id': 'underlying_name', 'ds': 'timestamp'}).join(main_features,
@@ -123,7 +120,7 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler):
             lasso_shuffled_y = lasso_model.predict(h=n_heads*n_steps_ahead_scaler,
                                                    X_df=shuffled_lasso_X).set_index(['unique_id', 'ds'])
             lasso_shuffled_y = lasso_shuffled_y.mul(std['y'], axis=0, level=0).add(mean['y'], axis=0, level=0)
-            test_shuffled_y = pd.concat([test_y['y'], lasso_shuffled_y, lightgbm_shuffled_y], axis=1) #pdb.set_trace()
+            test_shuffled_y = pd.concat([test_y['y'], lightgbm_shuffled_y, lasso_shuffled_y], axis=1)
         else:
             softs_shuffled_y = softs_model.predict(h=n_heads*n_steps_ahead_scaler,
                                                    futr_df=shuffled_X).set_index(['unique_id', 'ds'])
@@ -204,7 +201,7 @@ if __name__ == "__main__":
                                           (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))) for
                                 df in
                                 options_features)
-            options_features = pl.concat(options_features)
+            options_features = pl.concat(options_features).drop(['is_retail', 'is_informed', 'is_institutional'])
         else:
             options_features = pl.read_csv(f'{args.target_path}/option_features.csv', batch_size=100_000)
             options_features = options_features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime,
@@ -234,12 +231,9 @@ if __name__ == "__main__":
                             (main_features['timestamp'] >=
                              pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.D]+DAYS_CONVERTER[args.D]))))
                         for d in date_grid_test}
-    # trained_models = dict(Parallel(n_jobs=args.cpu_count)(
-    #     delayed(train_one_window)(d, main_features, date_masks, args) for d in date_grid
-    # ))
-    # (train_one_window)(d, main_features, date_masks, args)
-    for d in date_grid:
-        train_one_window(d, main_features, date_masks, args)
+    trained_models = dict(Parallel(n_jobs=args.cpu_count)(
+        delayed(train_one_window)(d, main_features, date_masks, args) for d in date_grid
+    ))
     forecasts, metrics, features_importance = [], [], []
     date_grid_np = np.array(date_grid)
     date_grid_test = np.array(date_grid_test)
@@ -274,37 +268,6 @@ if __name__ == "__main__":
         forecasts.append(forecast.loc[f_mask])
         metrics.append(metric.loc[m_mask])
         features_importance.append(feature_importance.loc[fi_mask])
-    # for idx_date_grid_test, date in enumerate(date_grid_test):
-    #     tmp_sum = (np.array(date_grid) <= date).sum()
-    #     n_steps_ahead_scaler = tmp_sum + 1 if idx_date_grid_test > 0 else 1
-    #     in_sample_date = date_grid[tmp_sum-1] if tmp_sum < len(date_grid) else date_grid[-1]
-    #     tmp_model = trained_models[in_sample_date]
-    #     if isinstance(tmp_model, tuple):
-    #         tmp_model = tmp_model[1]
-    #     elif tmp_model is None:
-    #         tmp_model = trained_models[in_sample_date-relativedelta(days=DAYS_CONVERTER[args.L])]
-    #     forecast, metric, feature_importance = \
-    #         evaluate_one_window(tmp_model,
-    #                             main_features.filter(date_masks[in_sample_date])[['underlying_name', args.target]],
-    #                             args, n_steps_ahead_scaler)
-    #     forecast_range = \
-    #         forecast.timestamp.between(pd.Timestamp(date),
-    #                                    min(pd.Timestamp(date + relativedelta(days=DAYS_CONVERTER[args.D])),
-    #                                        pd.Timestamp(args.end_date)),
-    #                                    inclusive='left')
-    #     metric_range = \
-    #         metric.timestamp.between(pd.Timestamp(date),
-    #                                  min(pd.Timestamp(date + relativedelta(days=DAYS_CONVERTER[args.D])),
-    #                                      pd.Timestamp(args.end_date)),
-    #                                  inclusive='left')
-    #     feature_importance_range = \
-    #         feature_importance.timestamp.between(pd.Timestamp(date),
-    #                                              min(pd.Timestamp(date + relativedelta(days=DAYS_CONVERTER[args.D])),
-    #                                                  pd.Timestamp(args.end_date)),
-    #                                              inclusive='left')
-    #     forecasts.append(forecast.loc[forecast_range, :])
-    #     metrics.append(metric.loc[metric_range, :])
-    #     features_importance.append(feature_importance.loc[feature_importance_range, :])
     forecasts = pd.concat(forecasts).set_index(['underlying_name', 'timestamp'])
     forecasts.index = forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1)
     metric = pd.concat(metrics).set_index(['underlying_name', 'timestamp'])
@@ -319,8 +282,8 @@ if __name__ == "__main__":
     underlying_rv['timestamp'] = pd.to_datetime(underlying_rv['timestamp'], utc=True)
     underlying_rv['target_values'] = underlying_rv['target_values'].astype(np.float32)
     volatility_regime = underlying_rv.groupby('timestamp')['target_values'].mean().resample(args.freq).sum()
-    volatility_regime = volatility_regime.loc[(volatility_regime.index.date >= dates[start_idx]) &
-                                             (volatility_regime.index.date <= dates[-1])]
+    volatility_regime = \
+        volatility_regime.loc[(volatility_regime.index.date < pd.to_datetime(args.end_date, utc=True).date())]
     volatility_regime = pd.qcut(volatility_regime, q=[0, .45, .9, 1], labels=VOL_REGIMES)
     volatility_regime.name = 'volatility_regime'
     metric = metric.join(volatility_regime, how='left', on='timestamp').assign(target=args.target, D=args.D,
