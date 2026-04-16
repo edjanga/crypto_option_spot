@@ -1,4 +1,6 @@
 import argparse
+import pdb
+
 import polars as pl
 import pytz
 import sqlite3
@@ -78,6 +80,8 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler):
                                    X_df=test_X.drop(columns=[args.target])).set_index(['unique_id', 'ds'])
         test_lasso_X = test_X.copy().rename(columns={args.target: 'y'}).set_index(['unique_id', 'ds'])
         test_lasso_X = test_lasso_X.subtract(mean, axis=0).div(std, axis=0).reset_index()
+        for col in mean.columns:
+            test_lasso_X[col] = test_lasso_X[col].fillna(test_lasso_X['unique_id'].map(mean[col]))
         lasso_y = lasso_model.predict(h=n_heads * n_steps_ahead_scaler, X_df=test_lasso_X.drop(columns='y'))
         lasso_y = lasso_y.set_index(['unique_id', 'ds'])
         lasso_y['Lasso'] = lasso_y['Lasso'].mul(std['y'], axis=0, level=0).add(mean['y'], axis=0, level=0)
