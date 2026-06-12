@@ -173,7 +173,7 @@ class EDA:
                     n_obs_eda[symbol] = tmp_n_obs if n_obs_eda.get(symbol) is None else n_obs_eda[symbol].add(tmp_n_obs)
             summary_eda = pd.concat([pd.concat(moneyness_eda.values(), axis=1), pd.concat(iv_eda.values(), axis=1),
                                      pd.concat(strikes_eda.values(), axis=1), pd.concat(time2mat_eda.values(), axis=1),
-                                     pd.concat(trading_days.values(), axis=1), pd.concat(n_obs_eda.values(), axis=1)])
+                                     pd.concat(n_obs_eda.values(), axis=1)])
         else:
             underlying_price = pl.scan_parquet(f'{self._target_path}/*/*/spot/*-*-*')
             underlying_price = underlying_price.select(['symbol', 'timestamp', 'mid_price[0]'])
