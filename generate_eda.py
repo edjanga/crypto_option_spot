@@ -162,7 +162,9 @@ class EDA:
                     ####################################################################################################
                     tmp_symbol = \
                         option_chain.filter(pl.col('underlying_name') == symbol).select(['underlying_name', 'type',
-                                                                                         'timestamp', 'date'])
+                                                                                         'timestamp'])
+                    tmp_symbol = tmp_symbol.with_columns(pl.col('timestamp').dt.date().alias('date'))
+                    tmp_symbol = tmp_symbol.sort(by=[pl.col('underlying_name'), pl.col('type')])
                     tmp_n_obs = \
                         tmp_symbol.group_by(['underlying_name',
                                              'type']).agg(pl.col('date').len().alias('Total observations')).collect()
