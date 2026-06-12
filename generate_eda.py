@@ -55,8 +55,9 @@ class EDA:
                         tmp_moneyness_values.agg({'min': 'min', 'mean': 'mean', 'max': 'max'}).transpose()
                     tmp_moneyness_values = tmp_moneyness_values.loc[['max', 'mean', 'min'], :]
                     tmp_moneyness = pd.concat([tmp_moneyness_label, tmp_moneyness_values])
-                    tmp_moneyness.index = pd.MultiIndex.from_product([['log m'], ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM',
-                                                                                  'max', 'mean', 'min']])
+                    tmp_moneyness.index = pd.MultiIndex.from_product([['$\log m$'],
+                                                                      ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM',
+                                                                       'max', 'mean', 'min']])
                     if moneyness_eda.get(symbol) is None:
                         moneyness_eda[symbol] = tmp_moneyness
                     else:
@@ -129,8 +130,8 @@ class EDA:
                     time2mat = time2mat.sort(by=[pl.col('underlying_name'), pl.col('type')])
                     time2mat = time2mat.group_by(['underlying_name', 'type']).agg(
                         pl.col('tau').min().alias('min'), pl.col('tau').mean().alias('mean'),
-                        pl.col('tau').max().alias('max'), pl.col('mark_iv').quantile(0.75).alias('75'),
-                        pl.col('mark_iv').quantile(0.50).alias('50'), pl.col('mark_iv').quantile(0.25).alias('25')
+                        pl.col('tau').max().alias('max'), pl.col('tau').quantile(0.75).alias('75'),
+                        pl.col('tau').quantile(0.50).alias('50'), pl.col('tau').quantile(0.25).alias('25')
                     ).collect().to_pandas()
                     time2mat = \
                         time2mat.set_index(['underlying_name', 'type']).transpose().loc[
@@ -157,25 +158,16 @@ class EDA:
                             time2mat.iloc[2, 1] if time2mat.iloc[2, 1] < time2mat_eda[symbol].iloc[2, 1] else \
                                 time2mat_eda[symbol].iloc[2, 1]
                     ####################################################################################################
-                    ## Trading days + Total observations
+                    ## Total observations
                     ####################################################################################################
                     tmp_symbol = \
                         option_chain.filter(pl.col('underlying_name') == symbol).select(['underlying_name', 'type',
                                                                                          'timestamp'])
-                    tmp_symbol = tmp_symbol.with_columns(pl.col('timestamp').dt.date().alias('date'))
-                    tmp_symbol = tmp_symbol.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                    tmp_trading_days = \
-                        tmp_symbol.group_by(['underlying_name',
-                                             'type']).agg(pl.col('date').n_unique().alias('Trading days')).collect()
                     tmp_n_obs = \
                         tmp_symbol.group_by(['underlying_name',
                                              'type']).agg(pl.col('date').len().alias('Total observations')).collect()
-                    tmp_trading_days = tmp_trading_days.to_pandas().set_index(['underlying_name', 'type']).transpose()
-                    tmp_trading_days.index = pd.MultiIndex.from_product([['Trading days'], ['']])
                     tmp_n_obs = tmp_n_obs.to_pandas().set_index(['underlying_name', 'type']).transpose()
                     tmp_n_obs.index = pd.MultiIndex.from_product([['Total observations'], ['']])
-                    trading_days[symbol] = tmp_trading_days if trading_days.get(symbol) is None else \
-                        trading_days[symbol].add(tmp_trading_days)
                     n_obs_eda[symbol] = tmp_n_obs if n_obs_eda.get(symbol) is None else n_obs_eda[symbol].add(tmp_n_obs)
             summary_eda = pd.concat([pd.concat(moneyness_eda.values(), axis=1), pd.concat(iv_eda.values(), axis=1),
                                      pd.concat(strikes_eda.values(), axis=1), pd.concat(time2mat_eda.values(), axis=1),
@@ -215,5 +207,4 @@ if __name__ == '__main__':
                         default='../data_centre')
     args = parser.parse_args()
     eda_obj = EDA(target_path=args.target_path)
-    eda_obj.summary(options=False)
-    # eda_obj.summary()
+    eda_obj.summary(options=True)
