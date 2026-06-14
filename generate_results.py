@@ -1,6 +1,7 @@
 import argparse
 import pdb
 
+import neuralforecast
 import polars as pl
 import pytz
 import sqlite3
@@ -12,6 +13,7 @@ import os
 from mlforecast import MLForecast
 import lightgbm as lgb
 from sklearn.linear_model import Lasso
+import neuralforecast
 from neuralforecast import NeuralForecast
 from neuralforecast.models import SOFTS
 from neuralforecast.losses.pytorch import MSE
@@ -307,7 +309,8 @@ if __name__ == "__main__":
     with tqdm_joblib(tqdm(desc='Test windows', total=len(date_grid_test))):
         results = Parallel(n_jobs=args.cpu_count, backend='loky')(
             delayed(process_one_test_window)(
-                trained_models[in_sample_dates[i]] if isinstance(trained_models[in_sample_dates[i]], list) else
+                trained_models[in_sample_dates[i]] if isinstance(trained_models[in_sample_dates[i]],
+                                                                 (list, neuralforecast.core.NeuralForecast)) else
                 trained_models[in_sample_dates[i] - pd.Timedelta(days=L_days)],
                 feature_cache[in_sample_dates[i]], main_features, args, idxs[i], date_grid_test[i],
                 horizon_dates[i]) for i in range(len(date_grid_test)))
