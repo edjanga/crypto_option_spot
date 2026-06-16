@@ -327,7 +327,6 @@ if __name__ == "__main__":
                 horizon_dates[idx], date_regression[1])
             for idx, date_regression in enumerate(date_regression_grid_test))
     forecasts, metrics, features_importance = map(list, zip(*results))
-    pdb.set_trace()
     forecasts = pd.concat(forecasts).set_index(['underlying_name', 'timestamp'])
     forecasts.index = forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1)
     metric = pd.concat(metrics).set_index(['underlying_name', 'timestamp'])
@@ -355,15 +354,14 @@ if __name__ == "__main__":
                                                                        freq=args.freq, market=args.options)
     forecasts = forecasts.join(volatility_regime, how='left').assign(target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
-    pdb.set_trace()
     if args.to_csv:
-        forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', mode='a',
-                         header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts.csv'))
-        metric.to_csv(f'{args.target_path}/crypto_option_spot/metric.csv', mode='a',
-                      header=not os.path.exists(f'{args.target_path}/crypto_option_spot/metric.csv'))
+        forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv', mode='a',
+                         header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv'))
+        metric.to_csv(f'{args.target_path}/crypto_option_spot/metric_{args.freq}.csv', mode='a',
+                      header=not os.path.exists(f'{args.target_path}/crypto_option_spot/metric_{args.freq}.csv'))
         features_importance.to_csv(
-            f'{args.target_path}/crypto_option_spot/features_importance.csv', mode='a',
-            header=not os.path.exists(f'{args.target_path}/crypto_option_spot/features_importance.csv'))
+            f'{args.target_path}/crypto_option_spot/features_importance_{args.freq}.csv', mode='a',
+            header=not os.path.exists(f'{args.target_path}/crypto_option_spot/features_importance_{args.freq}.csv'))
     else:
         forecasts.to_sql('forecasts', con=db_connect, if_exists='append')
         metric.to_sql('metric', con=db_connect, if_exists='append')
