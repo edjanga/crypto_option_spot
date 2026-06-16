@@ -27,9 +27,9 @@ def bs_price(S, K, T, sigma, option_type):
         return K * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 def daily_option_return_file(date: datetime, underlying_name: str, target_path: str) -> None:
-    if os.path.exists(f'{target_path}/{underlying_name}/{date.year}/options/{date.strftime(DATE_FORMAT)}'):
+    if os.path.exists(f'{target_path}/{date.year}/{underlying_name}/options/{date.strftime(DATE_FORMAT)}'):
         option_chain = (
-            pl.scan_parquet(f'{target_path}/{underlying_name}/{date.year}/options/{date.strftime(DATE_FORMAT)}'))
+            pl.scan_parquet(f'{target_path}/{date.year}/{underlying_name}/options/{date.strftime(DATE_FORMAT)}'))
         pdb.set_trace()
         option_chain = option_chain.filter(pl.col('underlying_name').eq(underlying_name))
         option_chain = option_chain.with_columns(
@@ -69,10 +69,10 @@ def daily_option_return_file(date: datetime, underlying_name: str, target_path: 
             option_chain_type = (
                 option_chain_type.agg([pl.col('mid_price').last(), pl.col('returns').sum(), pl.col('tau').last(),
                                        pl.col('moneyness').last(), pl.col('type').last()]))
-            os.makedirs(name=f'{args.target_path}/option_helper_files/{underlying_name}/{date.year}',
+            os.makedirs(name=f'{args.target_path}/option_helper_files/{date.year}/{underlying_name}',
                         exist_ok=True)
             file_name = \
-                f'{args.target_path}/option_helper_files/{underlying_name}/{date.year}/{date.strftime(DATE_FORMAT)}'
+                f'{args.target_path}/option_helper_files/{date.year}/{underlying_name}/{date.strftime(DATE_FORMAT)}'
             file_exists = os.path.isfile(file_name)
             option_chain_type.collect().to_pandas().to_csv(file_name, header=not file_exists, mode='a')
 
