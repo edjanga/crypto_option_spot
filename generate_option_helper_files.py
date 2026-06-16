@@ -89,10 +89,8 @@ if __name__ == '__main__':
     dates = pd.date_range(args.start_date, args.end_date, freq='1D',  inclusive='left').date.tolist()
     for underlying_name in tqdm(SYMBOLS):
         underlying_name_dates = list(itertools.product([underlying_name], dates))
-        # with tqdm_joblib(tqdm(desc='Option helper files', total=len(underlying_name_dates))):
-        #     results = Parallel(n_jobs=-args.cpu_count, backend='loky')(
-        #         delayed(daily_option_return_file)(underlying_name_date[1], underlying_name_date[0], args.target_path)
-        #         for underlying_name_date in underlying_name_dates)
-        for underlying_name_date in underlying_name_dates:
-            daily_option_return_file(underlying_name_date[1], underlying_name_date[0], args.target_path)
+        with tqdm_joblib(tqdm(desc='Option helper files', total=len(underlying_name_dates))):
+            results = Parallel(n_jobs=-args.cpu_count, backend='loky')(
+                delayed(daily_option_return_file)(underlying_name_date[1], underlying_name_date[0], args.target_path)
+                for underlying_name_date in underlying_name_dates)
 
