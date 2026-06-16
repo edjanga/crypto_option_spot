@@ -76,7 +76,7 @@ def daily_option_return_file(date: datetime, underlying_name: str, target_path: 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all performance tables.')
-    parser.add_argument('--start_date', type=str, help='Start date.', default='2025-01-01')
+    parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-01')
     parser.add_argument('--end_date', type=str, help='End date.', default='2025-07-01')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='./data_centre')
