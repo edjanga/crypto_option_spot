@@ -58,7 +58,8 @@ def daily_option_return_file(date: datetime, underlying_name: str, target_path: 
                                            x['type']), return_dtype=pl.Float64)).otherwise(pl.col('mid_price')))
             tau_min = pd.to_timedelta(15, unit='min')/pd.to_timedelta(360, unit='d')
             option_chain_type = (
-                option_chain_type.select(['symbol', 'timestamp', 'mid_price', 'tau', 'moneyness', 'type']))
+                option_chain_type.select(['symbol', 'timestamp', 'mid_price', 'tau', 'moneyness', 'type',
+                                          'underlying_price', 'spread']))
             option_chain_type = option_chain_type.filter(pl.col('mid_price').is_not_null() & (pl.col('tau') >= tau_min))
             option_chain_type = option_chain_type.sort(['symbol', 'timestamp'])
             option_chain_type = option_chain_type.with_columns(pl.col('mid_price').log()
@@ -68,7 +69,8 @@ def daily_option_return_file(date: datetime, underlying_name: str, target_path: 
                                                                      group_by='symbol'))
             option_chain_type = (
                 option_chain_type.agg([pl.col('mid_price').last(), pl.col('returns').sum(), pl.col('tau').last(),
-                                       pl.col('moneyness').last(), pl.col('type').last()]))
+                                       pl.col('moneyness').last(), pl.col('type').last(),
+                                       pl.col('underlying_price').last(), pl.col('spread').last()]))
             os.makedirs(name=f'{args.target_path}/option_helper_files/{date.year}/{underlying_name}',
                         exist_ok=True)
             file_name = \
