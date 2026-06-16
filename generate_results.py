@@ -1,13 +1,13 @@
 import argparse
 import pdb
-
-import neuralforecast
 import polars as pl
 import pytz
 import sqlite3
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 from joblib import Parallel, delayed
+from torch._dynamo.polyfills import itertools
+import itertools
 from constants import *
 import os
 from mlforecast import MLForecast
@@ -23,7 +23,7 @@ import random
 
 
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
-regression = {'ml': ['LGBMRegressor', 'Lasso'], 'dl': ['SOFTS']}
+regression_dd = {'ml': ['LGBMRegressor', 'Lasso'], 'dl': ['SOFTS']}
 rng = random.Random(123)
 
 def winsorise(df: pd.DataFrame) -> pd.DataFrame:
@@ -34,8 +34,8 @@ def winsorise(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def train_one_window(date, features, date_mask, args):
-    train_X = features.filter(date_mask[date]).to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
+def train_one_window(date, features, regression: str):
+    train_X = features.to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
     train_X = \
         train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
     ds_unique = train_X.ds.unique()
@@ -53,7 +53,7 @@ def train_one_window(date, features, date_mask, args):
     except ValueError:
         return date, None
     train_X = train_X.groupby('unique_id', group_keys=False).apply(lambda x: x.ffill().bfill())
-    if args.regression == 'dl':
+    if regression == 'dl':
         n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
         n_series = train_X['unique_id'].nunique()
         model = SOFTS(h=n_heads, input_size=train_X.shape[1], n_series=n_series, hidden_size=256,
@@ -74,7 +74,7 @@ def train_one_window(date, features, date_mask, args):
         train_X = train_X.set_index(['unique_id', 'ds']).subtract(mean).div(std).reset_index()
         model2.fit(train_X, fitted=False, static_features=[])
         model = [model, model2, train_group]
-    return date, model
+    return (date, regression), model
 
 
 def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
@@ -116,10 +116,10 @@ def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
     return full_mase_mean_shuffled.div(50).assign(features=col).reset_index()
 
 
-def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler,
-                        main_features):
+def evaluate_one_window(model, train_features, regression: str,
+                        args , n_steps_ahead_scaler, main_features):
     n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
-    if args.regression != 'dl':
+    if regression != 'dl':
         lightgbm_model, lasso_model, stats = model[0], model[1], model[2]
         mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
         idx_test = lightgbm_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
@@ -129,7 +129,7 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler,
         test_X = test_X.rename({'underlying_name': 'unique_id', 'timestamp': 'ds'}).to_pandas()
         test_X = test_X.drop_duplicates(subset=['unique_id', 'ds'])
         test_X = test_X.set_index(['unique_id', 'ds']).groupby(level=0, group_keys=False).apply(
-            lambda x: x.fillna(x.ffill())).reset_index()
+            lambda x: x.fillna(x.ffill().bfill())).reset_index()
         lightgbm_y = \
             lightgbm_model.predict(h=n_heads * n_steps_ahead_scaler,
                                    X_df=test_X.drop(columns=[args.target])).set_index(['unique_id', 'ds'])
@@ -157,7 +157,7 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler,
     #################################################### MASE ##########################################################
     train_features = train_features.to_pandas().rename(columns={'underlying_name': 'unique_id', args.target: 'y'})
     in_sample_avg = train_features.groupby('unique_id')['y'].diff().abs().groupby(train_features['unique_id']).mean()
-    delta_ys = -1*test_y[regression[args.regression]].subtract(test_y['y'], axis=0)
+    delta_ys = -1*test_y[regression_dd[regression]].subtract(test_y['y'], axis=0)
     in_sample_avg = in_sample_avg.reindex(delta_ys.index, level=0)
     mase_mean = delta_ys.div(in_sample_avg.values, axis=0).abs().rename(columns=model_names)
     mase_mean = mase_mean.stack().reset_index().rename(
@@ -167,14 +167,14 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler,
     perm_df = list()
     for col in sample_columns:
         perm_df.append(compute_feat_importance(col=col, test_X=test_X,
-                                test_lasso_X=test_lasso_X if args.regression == 'ml' else None, test_y=test_y,
-                                in_sample_avg=in_sample_avg, args=args, regression=args.regression,
+                                test_lasso_X=test_lasso_X if regression == 'ml' else None, test_y=test_y,
+                                in_sample_avg=in_sample_avg, args=args, regression=regression,
                                 model_names=model_names, n_heads=n_heads, n_steps_ahead_scaler=n_steps_ahead_scaler,
-                                lightgbm_model=lightgbm_model if args.regression == 'ml' else None,
-                                lasso_model=lasso_model if args.regression == 'ml' else None,
-                                softs_model=softs_model if args.regression == 'dl' else None,
-                                mean=mean if args.regression == 'ml' else None,
-                                std=std if args.regression == 'ml' else None))
+                                lightgbm_model=lightgbm_model if regression == 'ml' else None,
+                                lasso_model=lasso_model if regression == 'ml' else None,
+                                softs_model=softs_model if regression == 'dl' else None,
+                                mean=mean if regression == 'ml' else None,
+                                std=std if regression == 'ml' else None))
     perm_df = pd.concat(perm_df, ignore_index=True)
     ################################################ Forecasts #########################################################
     forecast_df = test_y.set_index('y', append=True).rename(columns=model_names)
@@ -184,8 +184,13 @@ def evaluate_one_window(model, train_features, args, n_steps_ahead_scaler,
     return forecast_df, mase_mean, perm_df
 
 def process_one_test_window(trained_model, features_df, main_features, args,
-                            tmp_sum, date_grid_test, horizon_date):
-    forecast, metric, feature_importance = evaluate_one_window(trained_model, features_df, args, tmp_sum, main_features)
+                            tmp_sum, date_grid_test, horizon_date, regression: str):
+    forecast, metric, feature_importance = evaluate_one_window(model=trained_model,
+                                                               train_features=features_df,
+                                                               regression=regression,
+                                                               args=args,
+                                                               n_steps_ahead_scaler=tmp_sum,
+                                                               main_features=main_features)
     start = pd.Timestamp(date_grid_test)
     end = horizon_date
     f_mask = (forecast.timestamp >= start) & (forecast.timestamp < end)
@@ -199,7 +204,7 @@ def process_one_test_window(trained_model, features_df, main_features, args,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Script generating all results presented in the associated paper.\n'
                                                  'Results are computed model by model.')
-    parser.add_argument('--regression', type=str, help='Regression technique to be used for modelling.')
+    # parser.add_argument('--regression', type=str, help='Regression technique to be used for modelling.')
     parser.add_argument('--L', type=str, help='Parameter controlling the size of the training set size.')
     parser.add_argument('--freq', type=str, help='Parameter controlling forcasting horizon.')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
@@ -210,7 +215,8 @@ if __name__ == "__main__":
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
     parser.add_argument('--options', type=int, default=0, help='Add option features or not.')
     parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
-    parser.add_argument('--cpu_count', type=int, default=10, help='Number of processes to use for the pipeline.')
+    parser.add_argument('--cpu_count', type=int, default=10,
+                        help='Number of processes to use for the pipeline.')
     args = parser.parse_args()
     print(args)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
@@ -286,9 +292,12 @@ if __name__ == "__main__":
                             (main_features['timestamp'] >=
                              pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.D]+DAYS_CONVERTER[args.D]))))
                         for d in date_grid_test}
+    date_grid_regressions = list(itertools.product(date_grid, list(regression_dd.keys())))
     with tqdm_joblib(tqdm(desc='Model training windows', total=len(date_grid))):
         trained_models = dict(Parallel(n_jobs=args.cpu_count)(
-            delayed(train_one_window)(d, main_features, date_masks, args) for d in date_grid
+            delayed(train_one_window)(date_grid_regression[0],
+                                      main_features.filter(date_masks[date_grid_regression[0]]),
+                                      date_grid_regression[1]) for date_grid_regression in date_grid_regressions
         ))
     forecasts, metrics, features_importance = [], [], []
     date_grid_np = np.array(date_grid)
@@ -306,15 +315,19 @@ if __name__ == "__main__":
     horizon_dates = np.minimum(dates + np.timedelta64(D_days, 'D'), end)
     feature_cache = {d: main_features.filter(date_masks[d])[['underlying_name', args.target]]
                      for d in np.unique(in_sample_dates)}
-    with tqdm_joblib(tqdm(desc='Test windows', total=len(date_grid_test))):
+    date_regression_grid_test = list(itertools.product(date_grid, regression_dd.keys()))
+    with tqdm_joblib(tqdm(desc='Test windows', total=len(date_regression_grid_test))):
         results = Parallel(n_jobs=args.cpu_count, backend='loky')(
             delayed(process_one_test_window)(
-                trained_models[in_sample_dates[i]] if isinstance(trained_models[in_sample_dates[i]],
-                                                                 (list, neuralforecast.core.NeuralForecast)) else
-                trained_models[in_sample_dates[i] - pd.Timedelta(days=L_days)],
-                feature_cache[in_sample_dates[i]], main_features, args, idxs[i], date_grid_test[i],
-                horizon_dates[i]) for i in range(len(date_grid_test)))
+                trained_models[(in_sample_dates[idx], date_regression[1])]
+                if isinstance(trained_models[(in_sample_dates[idx], date_regression[1])],
+                              (list, neuralforecast.core.NeuralForecast)) else
+                trained_models[(in_sample_dates[idx] - pd.Timedelta(days=L_days), date_regression[1])],
+                feature_cache[in_sample_dates[idx]], main_features, args, idxs[idx], date_grid_test[idx],
+                horizon_dates[idx], date_regression[1])
+            for idx, date_regression in enumerate(date_regression_grid_test))
     forecasts, metrics, features_importance = map(list, zip(*results))
+    pdb.set_trace()
     forecasts = pd.concat(forecasts).set_index(['underlying_name', 'timestamp'])
     forecasts.index = forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1)
     metric = pd.concat(metrics).set_index(['underlying_name', 'timestamp'])
@@ -342,6 +355,7 @@ if __name__ == "__main__":
                                                                        freq=args.freq, market=args.options)
     forecasts = forecasts.join(volatility_regime, how='left').assign(target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
+    pdb.set_trace()
     if args.to_csv:
         forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', mode='a',
                          header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts.csv'))
