@@ -27,10 +27,8 @@ def bs_price(S, K, T, sigma, option_type):
         return K * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 def daily_option_return_file(date: datetime, underlying_name: str, target_path: str) -> None:
-    if os.path.exists(f'{target_path}/{date.year}/{underlying_name}/options/{date.strftime(DATE_FORMAT)}'):
-        option_chain = (
-            pl.scan_parquet(f'{target_path}/{date.year}/{underlying_name}/options/{date.strftime(DATE_FORMAT)}'))
-        pdb.set_trace()
+    if os.path.exists(f'{target_path}/{date.year}/options/{date.strftime(DATE_FORMAT)}'):
+        option_chain = (pl.scan_parquet(f'{target_path}/{date.year}/options/{date.strftime(DATE_FORMAT)}'))
         option_chain = option_chain.filter(pl.col('underlying_name').eq(underlying_name))
         option_chain = option_chain.with_columns(
                         ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
