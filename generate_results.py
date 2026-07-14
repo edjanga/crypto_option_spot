@@ -1,15 +1,14 @@
 import argparse
+import os
 import pdb
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import polars as pl
 import pytz
-import sqlite3
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 from joblib import Parallel, delayed
-from torch._dynamo.polyfills import itertools
 import itertools
 from constants import *
-import os
 from mlforecast import MLForecast
 import lightgbm as lgb
 from sklearn.linear_model import Lasso
@@ -20,50 +19,63 @@ from neuralforecast.losses.pytorch import MSE
 from tqdm.auto import tqdm
 from tqdm_joblib import tqdm_joblib
 import random
+from constants import ENGINE, EARLY_STOPPING_PATIENCE
 
 
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
 regression_dd = {'ml': ['LGBMRegressor', 'Lasso'], 'dl': ['SOFTS']}
 rng = random.Random(123)
 
-def winsorise(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.replace([np.inf, -np.inf], np.nan).ffill()
-    q05 = df.quantile(0.05)
-    q95 = df.quantile(0.95)
-    return df.clip(lower=q05, upper=q95, axis=1)
 
+
+def winsorise_vectorized(df: pd.DataFrame, group_col: str = 'unique_id',
+                         exclude_cols=('ds',)) -> pd.DataFrame:
+    df = df.copy()
+    excluded = {group_col, *exclude_cols}
+    value_cols = [c for c in df.columns if c not in excluded]
+    df[value_cols] = df[value_cols].replace([np.inf, -np.inf], np.nan)
+    df[value_cols] = df.groupby(df[group_col])[value_cols].ffill()
+    q05 = df.groupby(group_col)[value_cols].quantile(0.05)
+    q95 = df.groupby(group_col)[value_cols].quantile(0.95)
+    lower = df[[group_col]].join(q05, on=group_col)[value_cols]
+    upper = df[[group_col]].join(q95, on=group_col)[value_cols]
+    df[value_cols] = df[value_cols].clip(lower=lower, upper=upper, axis=0)
+    return df
 
 
 def train_one_window(date, features, regression: str):
     train_X = features.to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
     train_X = \
         train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
-    ds_unique = train_X.ds.unique()
-    start, end = ds_unique[0], ds_unique[-1]
+    start, end = train_X.ds.min(), train_X.ds.max()
     full_dates = pd.date_range(start, end, freq=args.freq, inclusive='both')
     uids = train_X['unique_id'].unique()
     full_index = pd.MultiIndex.from_product([uids, full_dates], names=['unique_id', 'ds'])
     try:
         train_X = \
             train_X.drop_duplicates(subset=['unique_id', 'ds']).set_index(['unique_id', 'ds']).reindex(full_index)
-        train_X = train_X.groupby(level=0, group_keys=False).apply(winsorise)
         train_X = train_X.reset_index()
+        train_X = winsorise_vectorized(train_X, group_col='unique_id')
         if train_X.empty:
             raise ValueError
     except ValueError:
         return date, None
-    train_X = train_X.groupby('unique_id', group_keys=False).apply(lambda x: x.ffill().bfill())
+    fill_cols = [c for c in train_X.columns if c not in ('unique_id', 'ds')]
+    train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].ffill()
+    train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].bfill()
     if regression == 'dl':
         n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
         n_series = train_X['unique_id'].nunique()
         model = SOFTS(h=n_heads, input_size=train_X.shape[1], n_series=n_series, hidden_size=256,
-                      loss=MSE(), scaler_type='standard', learning_rate=1e-3, e_layers=1, d_ff=64, batch_size=128,
-                      max_steps=100, val_check_steps=10, early_stop_patience_steps=3, start_padding_enabled=True)
+                      loss=MSE(), scaler_type='standard', learning_rate=1e-3, e_layers=2, d_ff=512, batch_size=64,
+                      max_steps=1_000, val_check_steps=10, early_stop_patience_steps=EARLY_STOPPING_PATIENCE,
+                      start_padding_enabled=True, accelerator=ENGINE, devices=1)
         model = NeuralForecast(models=[model], freq=args.freq)
         model.fit(df=train_X, val_size=n_heads)
     else:
         model = \
-            MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=50),
+            MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=500,
+                                                n_jobs=1, subsample=0.8, colsample_bytree=0.8),
                        freq=args.freq, target_transforms=[])
         model.fit(train_X, fitted=False, static_features=[])
         model2 = MLForecast(models=Lasso(), freq=args.freq, target_transforms=[])
@@ -71,7 +83,7 @@ def train_one_window(date, features, regression: str):
         train_group = train_X.groupby('unique_id')[num_cols].agg(['mean', 'std'])
         mean = train_group.xs('mean', axis=1, level=1)
         std = train_group.xs('std', axis=1, level=1).clip(lower=1e-8)
-        train_X = train_X.set_index(['unique_id', 'ds']).subtract(mean).div(std).reset_index()
+        train_X = train_X.set_index(['unique_id', 'ds']).subtract(mean, axis=0).div(std, axis=0).reset_index()
         model2.fit(train_X, fitted=False, static_features=[])
         model = [model, model2, train_group]
     return (date, regression), model
@@ -79,31 +91,31 @@ def train_one_window(date, features, regression: str):
 
 def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
                             model_names, n_heads, n_steps_ahead_scaler, **kwargs):
-    shuffled_X = test_X.copy()
-    # shuffled_X[col] = \
-    #     (shuffled_X.groupby('unique_id')[col].transform(lambda x: np.random.permutation(x.to_numpy())))
+    jittered_X = test_X.copy()
     full_mase_mean_shuffled = pd.DataFrame()
-    jitter = np.random.normal(size=(shuffled_X[col].shape[0], 50))
-    for i in range(10):
-        shuffled_X[col] = shuffled_X[col] + jitter[:, i]
+    n_iter = 3
+    jitter = np.random.normal(size=(jittered_X[col].shape[0], n_iter))
+    original_col = test_X[col].copy()
+    for i in range(n_iter):
+        jittered_X[col] = original_col + jitter[:, i]
         if regression == 'ml':
             shuffled_lasso_X = kwargs['test_lasso_X'].copy()
-            # shuffled_lasso_X[col] = \
-            #     (shuffled_lasso_X.groupby('unique_id')[col].transform(
-            #         lambda x: np.random.permutation(x.to_numpy())))
-            shuffled_lasso_X[col] = shuffled_X[col] + jitter[:, i]
-            lightgbm_shuffled_y = kwargs['lightgbm_model'].predict(h=n_heads * n_steps_ahead_scaler, X_df=shuffled_X)
+            shuffled_lasso_X[col] = jittered_X[col]
+            lightgbm_shuffled_y = kwargs['lightgbm_model'].predict(h=n_heads * n_steps_ahead_scaler, X_df=jittered_X)
             lightgbm_shuffled_y = lightgbm_shuffled_y.set_index(['unique_id', 'ds'])
             lasso_shuffled_y = kwargs['lasso_model'].predict(h=n_heads * n_steps_ahead_scaler, X_df=shuffled_lasso_X)
             lasso_shuffled_y = lasso_shuffled_y.set_index(['unique_id', 'ds'])
-            lasso_shuffled_y['Lasso'] = (
+            lasso_shuffled_y['Lasso'] = \
                 lasso_shuffled_y['Lasso'].mul(kwargs['std']['y'], axis=0, level=0).add(kwargs['mean']['y'], axis=0,
-                                                                                       level=0))
-            test_shuffled_y = pd.concat([test_y['y'], lightgbm_shuffled_y, lasso_shuffled_y], axis=1)
+                                                                                       level=0)
+            test_shuffled_y = pd.concat([lightgbm_shuffled_y, lasso_shuffled_y], axis=1)
         else:
-            softs_shuffled_y = kwargs['softs_model'].predict(h=n_heads * n_steps_ahead_scaler, futr_df=shuffled_X)
+            softs_shuffled_y = kwargs['softs_model'].predict(h=n_heads * n_steps_ahead_scaler, futr_df=jittered_X)
             softs_shuffled_y = softs_shuffled_y.set_index(['unique_id', 'ds'])
-            test_shuffled_y = pd.concat([test_y['y'], softs_shuffled_y], axis=1)
+            test_shuffled_y = softs_shuffled_y
+        freq = kwargs['args'].freq
+        test_shuffled_y = test_shuffled_y.groupby([pd.Grouper(level=0), pd.Grouper(level=1, freq=freq)]).sum()
+        test_shuffled_y = pd.concat([test_y['y'], test_shuffled_y], axis=1)
         delta_shuffled_ys = -test_shuffled_y.iloc[:, 1:].subtract(test_shuffled_y['y'], axis=0)
         mase_mean_shuffled = delta_shuffled_ys.div(in_sample_avg.values, axis=0).abs().rename(columns=model_names)
         mase_mean_shuffled = mase_mean_shuffled.stack().reset_index()
@@ -113,32 +125,35 @@ def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
             full_mase_mean_shuffled = mase_mean_shuffled.set_index(['underlying_name', 'timestamp', 'regression'])
         else:
             full_mase_mean_shuffled += mase_mean_shuffled.set_index(['underlying_name', 'timestamp', 'regression'])
-    return full_mase_mean_shuffled.div(50).assign(features=col).reset_index()
+    return full_mase_mean_shuffled.div(n_iter).assign(features=col).reset_index()
 
 
-def evaluate_one_window(model, train_features, regression: str,
-                        args , n_steps_ahead_scaler, main_features):
+def evaluate_one_window(model, train_features, regression: str, args , n_steps_ahead_scaler, main_features):
     n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
     if regression != 'dl':
-        lightgbm_model, lasso_model, stats = model[0], model[1], model[2]
-        mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
+        lightgbm_model = model[0]
         idx_test = lightgbm_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
         test_X = pl.from_pandas(idx_test).with_columns(pl.col('ds').cast(pl.Datetime('us'))).rename(
             {'unique_id': 'underlying_name', 'ds': 'timestamp'}).join(main_features,
                                                                       on=['underlying_name', 'timestamp'], how='left')
         test_X = test_X.rename({'underlying_name': 'unique_id', 'timestamp': 'ds'}).to_pandas()
         test_X = test_X.drop_duplicates(subset=['unique_id', 'ds'])
-        test_X = test_X.set_index(['unique_id', 'ds']).groupby(level=0, group_keys=False).apply(
-            lambda x: x.fillna(x.ffill().bfill())).reset_index()
+        test_X = test_X.set_index(['unique_id', 'ds'])
+        fill_cols = test_X.columns
+        test_X[fill_cols] = test_X.groupby(level=0)[fill_cols].ffill()
+        test_X[fill_cols] = test_X.groupby(level=0)[fill_cols].bfill()
+        test_X = test_X.reset_index()
         lightgbm_y = \
             lightgbm_model.predict(h=n_heads * n_steps_ahead_scaler,
                                    X_df=test_X.drop(columns=[args.target])).set_index(['unique_id', 'ds'])
+        lasso_model, stats = model[1], model[2]
+        mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
         test_lasso_X = test_X.copy().rename(columns={args.target: 'y'}).set_index(['unique_id', 'ds'])
         test_lasso_X = test_lasso_X.subtract(mean, axis=0).div(std, axis=0).reset_index()
         lasso_y = lasso_model.predict(h=n_heads * n_steps_ahead_scaler, X_df=test_lasso_X.drop(columns='y'))
         lasso_y = lasso_y.set_index(['unique_id', 'ds'])
         lasso_y['Lasso'] = lasso_y['Lasso'].mul(std['y'], axis=0, level=0).add(mean['y'], axis=0, level=0)
-        tmp_model = [lasso_y, lightgbm_y]
+        tmp_model = [lightgbm_y, lasso_y]
     else:
         softs_model = model
         idx_test = softs_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
@@ -163,28 +178,29 @@ def evaluate_one_window(model, train_features, regression: str,
     mase_mean = mase_mean.stack().reset_index().rename(
         columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_2': 'regression', 0: 'MASE'}).dropna()
     ############################################# Feature Importance ###################################################
-    sample_columns = random.sample(test_X.columns[~test_X.columns.isin(['unique_id', 'ds'])].tolist(), k=5)
+    sample_columns = random.sample(test_X.columns[~test_X.columns.isin(['unique_id', 'ds'])].tolist(), k=3)
     perm_df = list()
     for col in sample_columns:
         perm_df.append(compute_feat_importance(col=col, test_X=test_X,
-                                test_lasso_X=test_lasso_X if regression == 'ml' else None, test_y=test_y,
-                                in_sample_avg=in_sample_avg, args=args, regression=regression,
-                                model_names=model_names, n_heads=n_heads, n_steps_ahead_scaler=n_steps_ahead_scaler,
-                                lightgbm_model=lightgbm_model if regression == 'ml' else None,
-                                lasso_model=lasso_model if regression == 'ml' else None,
-                                softs_model=softs_model if regression == 'dl' else None,
-                                mean=mean if regression == 'ml' else None,
-                                std=std if regression == 'ml' else None))
+                                               test_lasso_X=test_lasso_X if regression == 'ml' else None, test_y=test_y,
+                                               in_sample_avg=in_sample_avg, args=args, regression=regression,
+                                               model_names=model_names, n_heads=n_heads,
+                                               n_steps_ahead_scaler=n_steps_ahead_scaler,
+                                               lightgbm_model=lightgbm_model if regression == 'ml' else None,
+                                               lasso_model=lasso_model if regression == 'ml' else None,
+                                               softs_model=softs_model if regression == 'dl' else None,
+                                               mean=mean if regression == 'ml' else None,
+                                               std=std if regression == 'ml' else None))
     perm_df = pd.concat(perm_df, ignore_index=True)
     ################################################ Forecasts #########################################################
     forecast_df = test_y.set_index('y', append=True).rename(columns=model_names)
-    forecast_df = forecast_df.clip(lower=0.000001)
     forecast_df = forecast_df.stack().reset_index().rename(
         columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_3': 'regression', 0: 'y_hat'})
     return forecast_df, mase_mean, perm_df
 
-def process_one_test_window(trained_model, features_df, main_features, args,
-                            tmp_sum, date_grid_test, horizon_date, regression: str):
+
+def process_one_test_window(trained_model, features_df, main_features, args, tmp_sum, date_grid_test, horizon_date,
+                            regression: str):
     forecast, metric, feature_importance = evaluate_one_window(model=trained_model,
                                                                train_features=features_df,
                                                                regression=regression,
@@ -199,12 +215,9 @@ def process_one_test_window(trained_model, features_df, main_features, args,
     return forecast.loc[f_mask], metric.loc[m_mask], feature_importance.loc[fi_mask]
 
 
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Script generating all results presented in the associated paper.\n'
                                                  'Results are computed model by model.')
-    # parser.add_argument('--regression', type=str, help='Regression technique to be used for modelling.')
     parser.add_argument('--L', type=str, help='Parameter controlling the size of the training set size.')
     parser.add_argument('--freq', type=str, help='Parameter controlling forcasting horizon.')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
@@ -220,27 +233,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
-    db_connect = sqlite3.connect(f"{args.target_path}/crypto_option_spot.db", check_same_thread=False)
-    if not os.path.exists(f'{args.target_path}/spot_features.csv'):
-        SYMBOLS_QUERY = "(" + ",".join(f'"{s}"' for s in SYMBOLS) + ")"
-        features_query = \
-            f'WITH base AS(SELECT DISTINCT * FROM spot_features WHERE "underlying_name" IN {SYMBOLS_QUERY} ' \
-            f'AND "target" = "{args.target}" AND "freq" = "{args.freq}") SELECT underlying_name, timestamp, features, ' \
-            f'features_values FROM base ' \
-            f'UNION ALL SELECT underlying_name, timestamp, target AS features, target_values AS features_values ' \
-            f'FROM base;'
-        features = pl.read_database(query=features_query, connection=db_connect, iter_batches=True, batch_size=100_000,
-                                    infer_schema_length=None)
-        features = (df.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
-                                     pl.col('features_values').cast(pl.Float32, strict=False)]) for df in features)
-        features = (df.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
-                              (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))) for df in features)
-        features = pl.concat(features)
-    else:
-        features = pl.read_csv(f'{args.target_path}/spot_features.csv', batch_size=100_000)
-        features = features.filter(pl.col('target') == args.target)
-        features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
-                                          pl.col('features_values').cast(pl.Float32, strict=False)])
+    features = pl.scan_csv(f'{args.target_path}/spot_features.csv').filter(pl.col('target') == args.target).collect()
+    features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
+                                      pl.col('features_values').cast(pl.Float32, strict=False)])
     features = features.pivot(values='features_values',
                               index=['underlying_name', 'timestamp', 'target', 'target_values'], on='features',
                               aggregate_function='first')
@@ -248,26 +243,10 @@ if __name__ == "__main__":
     features = features.unique(maintain_order=True)
     global main_features
     if args.options == 1:
-        if not os.path.exists(f'{args.target_path}/option_features.csv'):
-            options_features_query = \
-                f'SELECT "features","features_values","underlying_name","timestamp" FROM option_features ' \
-                f'WHERE "underlying_name" IN {SYMBOLS_QUERY};'
-            options_features = \
-                pl.read_database(query=options_features_query, connection=db_connect, iter_batches=True,
-                                 batch_size=100_000, infer_schema_length=None)
-            options_features = \
-                (df.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
-                                  pl.col('features_values').cast(pl.Float32, strict=False)]) for df in options_features)
-            options_features = (df.filter((pl.col('timestamp') >= pl.lit(pd.to_datetime(args.start_date, utc=True))) &
-                                          (pl.col('timestamp') < pl.lit(pd.to_datetime(args.end_date, utc=True)))) for
-                                df in
-                                options_features)
-            options_features = pl.concat(options_features).drop(['is_retail', 'is_informed', 'is_institutional'])
-        else:
-            options_features = pl.read_csv(f'{args.target_path}/option_features.csv', batch_size=100_000)
-            options_features = options_features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime,
-                                                                                               '%Y-%m-%d %H:%M:%S%z'),
-                                                              pl.col('features_values').cast(pl.Float32, strict=False)])
+        options_features = pl.scan_csv(f'{args.target_path}/option_features.csv').collect()
+        options_features = options_features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime,
+                                                                                           '%Y-%m-%d %H:%M:%S%z'),
+                                                          pl.col('features_values').cast(pl.Float32, strict=False)])
         options_features = options_features.pivot(values='features_values', index=['underlying_name', 'timestamp'],
                                                   on='features', aggregate_function='first')
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='left')
@@ -306,26 +285,31 @@ if __name__ == "__main__":
     D_days = DAYS_CONVERTER[args.D]
     L_days = DAYS_CONVERTER[args.L]
     date_grid_np = np.array(date_grid)
-    idxs = np.searchsorted(date_grid_np, date_grid_test, side='right')
-    in_sample_dates = (
-        np.where(idxs < len(date_grid_np), date_grid_np[np.clip(idxs - 1, 0, len(date_grid_np) - 1)],
-                 date_grid_np[-1]))
+    retrain_idx = np.clip(np.searchsorted(date_grid_np, date_grid_test, side='right') - 1,
+                          0, len(date_grid_np) - 1)
+    in_sample_dates = date_grid_np[retrain_idx]
+    _test_ts = pd.to_datetime(date_grid_test)
+    _retrain_ts = pd.to_datetime(in_sample_dates)
+    n_steps_ahead_scaler = (((_test_ts - _retrain_ts).days // D_days) + 1).to_numpy()
     dates = pd.to_datetime(date_grid_test).to_numpy(dtype='datetime64[ns]')
     end = np.datetime64(args.end_date)
     horizon_dates = np.minimum(dates + np.timedelta64(D_days, 'D'), end)
     feature_cache = {d: main_features.filter(date_masks[d])[['underlying_name', args.target]]
                      for d in np.unique(in_sample_dates)}
-    date_regression_grid_test = list(itertools.product(date_grid, regression_dd.keys()))
+    main_features_test_cache = {d: main_features.filter(date_masks_tests[d]) for d in date_masks_tests}
+    date_regression_grid_test = list(itertools.product(range(len(date_grid_test)), regression_dd.keys()))
     with tqdm_joblib(tqdm(desc='Test windows', total=len(date_regression_grid_test))):
         results = Parallel(n_jobs=args.cpu_count, backend='loky')(
             delayed(process_one_test_window)(
-                trained_models[(in_sample_dates[idx], date_regression[1])]
-                if isinstance(trained_models[(in_sample_dates[idx], date_regression[1])],
+                trained_models[(in_sample_dates[i], regression)]
+                if isinstance(trained_models[(in_sample_dates[i], regression)],
                               (list, neuralforecast.core.NeuralForecast)) else
-                trained_models[(in_sample_dates[idx] - pd.Timedelta(days=L_days), date_regression[1])],
-                feature_cache[in_sample_dates[idx]], main_features, args, idxs[idx], date_grid_test[idx],
-                horizon_dates[idx], date_regression[1])
-            for idx, date_regression in enumerate(date_regression_grid_test))
+                trained_models[(in_sample_dates[i] - pd.Timedelta(days=L_days), regression)],
+                feature_cache[in_sample_dates[i]],
+                main_features_test_cache[date_grid_test[i]],
+                args, n_steps_ahead_scaler[i], date_grid_test[i],
+                horizon_dates[i], regression)
+            for i, regression in date_regression_grid_test)
     forecasts, metrics, features_importance = map(list, zip(*results))
     forecasts = pd.concat(forecasts).set_index(['underlying_name', 'timestamp'])
     forecasts.index = forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1)
@@ -354,6 +338,7 @@ if __name__ == "__main__":
                                                                        freq=args.freq, market=args.options)
     forecasts = forecasts.join(volatility_regime, how='left').assign(target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
+    pdb.set_trace()
     if args.to_csv:
         forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv', mode='a',
                          header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv'))
@@ -362,8 +347,4 @@ if __name__ == "__main__":
         features_importance.to_csv(
             f'{args.target_path}/crypto_option_spot/features_importance_{args.freq}.csv', mode='a',
             header=not os.path.exists(f'{args.target_path}/crypto_option_spot/features_importance_{args.freq}.csv'))
-    else:
-        forecasts.to_sql('forecasts', con=db_connect, if_exists='append')
-        metric.to_sql('metric', con=db_connect, if_exists='append')
-        features_importance.to_sql('feature_importance', con=db_connect, if_exists='append')
     print('[Done] All forecasts, MASE, and feature importance computed and stored.')
