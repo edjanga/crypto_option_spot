@@ -525,17 +525,20 @@ class FrameworkApplication:
             #     FrameworkApplication._option_chain[date.date()].to_parquet(
             #         f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
             # else:
-            tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
-                                     f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
+            try:
+                tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
+                                         f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
+            except FileNotFoundError:
+                tmp_df = pd.read_parquet(f"{directory}/{date.year-1}/options/"
+                                         f"{(date - relativedelta(days=1)).strftime(DATE_FORMAT)}")
+            tmp_df = tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last()
             sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
-            tmp_df['d1'] = \
-                (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
-                 0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
+            tmp_df['d1'] = (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
+                            0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
             tmp_df['d1'] = tmp_df['d1'] / sqrt_term
             tmp_df['d2'] = tmp_df['d1'] - sqrt_term
-            tmp_df['bs_price'] = \
-                (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
-                 tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
+            tmp_df['bs_price'] = (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
+                                  tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
             tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
             tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
             FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
