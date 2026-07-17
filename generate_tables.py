@@ -990,7 +990,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Factor Analysis
     ####################################################################################################################
-    if args.type == 'factor_analysis':
+    if args.type == 'features_importance':
         ################################################################################################################
         ## Features and target values
         ################################################################################################################
@@ -1052,6 +1052,7 @@ if __name__ == '__main__':
             feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
                                                             regex=True)
         feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
+        pdb.set_trace()
     ####################################################################################################################
     ## SVIX
     ####################################################################################################################
@@ -1128,8 +1129,7 @@ if __name__ == '__main__':
             vrp_0 = pd.concat([vrp[(0, symbol)] for symbol in pairs_order.categories])#.droplevel(axis=0, level=0)
             vrp_1 = pd.concat([vrp[(1, symbol)] for symbol in pairs_order.categories])
             vrp = pd.concat([vrp_0, vrp_1])
-            vrp.to_sql(name='vrp', con=framework_application_obj.db_connect, if_exists='replace')
-            print(f'[Insertion]: VRP has been inserted into the database.')
+            vrp.to_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
     # if args.type == 'svix_rv_vrp_effect':
     #     ################################################################################################################
     #     ## VRP vs RV/SVIX
