@@ -917,7 +917,7 @@ if __name__ == '__main__':
                                  'and market == @best_market') for chunk in chunks)
     data = data.set_index('timestamp')
     data.index = pd.to_datetime(data.index, utc=True)
-    data = data.rename(columns={'yhat': 'forecast', 'y': 'values'})
+    data = data.rename(columns={'y_hat': 'forecast', 'y': 'values'})
     data = \
         pd.pivot_table(data=data, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
                        index='timestamp')
