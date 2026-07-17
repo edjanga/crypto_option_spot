@@ -515,7 +515,7 @@ class FrameworkApplication:
     @staticmethod
     def process_daily_option_chain(freq: str, directory: str, date_range: pd.DatetimeIndex) -> None:
         for date in date_range:
-            if not os.path.exists(f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}'):
+            if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
                 date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
                 daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
                 daily_option_chain_date = daily_option_chain_date.with_columns(
@@ -525,7 +525,7 @@ class FrameworkApplication:
                 FrameworkApplication._option_chain[date.date()].to_parquet(
                     f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
             else:
-                tmp_df = pd.read_parquet(f"{directory}/option_helper_files/"
+                tmp_df = pd.read_parquet(f"{directory}/{date.year}/option_chain/"
                                          f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
                 sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
                 tmp_df['d1'] = \
