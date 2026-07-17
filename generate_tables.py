@@ -1052,7 +1052,7 @@ if __name__ == '__main__':
             feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
                                                             regex=True)
         feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
-        pdb.set_trace()
+        feature_importance_ranking.to_csv(f'{args.target_path}/crypto_option_spot/features_importance.csv')
     ####################################################################################################################
     ## SVIX
     ####################################################################################################################
