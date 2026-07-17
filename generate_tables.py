@@ -515,30 +515,30 @@ class FrameworkApplication:
     @staticmethod
     def process_daily_option_chain(freq: str, directory: str, date_range: pd.DatetimeIndex) -> None:
         for date in date_range:
-            if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
-                date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
-                daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
-                daily_option_chain_date = daily_option_chain_date.with_columns(
-                    ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
-                FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
-                os.makedirs(f'{directory}/option_chain', exist_ok=True)
-                FrameworkApplication._option_chain[date.date()].to_parquet(
-                    f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
-            else:
-                tmp_df = pd.read_parquet(f"{directory}/{date.year}/option_chain/"
-                                         f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
-                sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
-                tmp_df['d1'] = \
-                    (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
-                     0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
-                tmp_df['d1'] = tmp_df['d1'] / sqrt_term
-                tmp_df['d2'] = tmp_df['d1'] - sqrt_term
-                tmp_df['bs_price'] = \
-                    (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
-                     tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
-                tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
-                tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
-                FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
+            # if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
+            #     date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
+            #     daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
+            #     daily_option_chain_date = daily_option_chain_date.with_columns(
+            #         ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
+            #     FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
+            #     os.makedirs(f'{directory}/option_chain', exist_ok=True)
+            #     FrameworkApplication._option_chain[date.date()].to_parquet(
+            #         f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
+            # else:
+            tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
+                                     f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
+            sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
+            tmp_df['d1'] = \
+                (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
+                 0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
+            tmp_df['d1'] = tmp_df['d1'] / sqrt_term
+            tmp_df['d2'] = tmp_df['d1'] - sqrt_term
+            tmp_df['bs_price'] = \
+                (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
+                 tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
+            tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
+            tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
+            FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
         return None
 
     @staticmethod
