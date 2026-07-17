@@ -532,8 +532,7 @@ class FrameworkApplication:
                 tmp_df = pd.read_parquet(f"{directory}/{date.year-1}/options/"
                                          f"{(date - relativedelta(days=1)).strftime(DATE_FORMAT)}")
             tmp_df['tau'] = (tmp_df['expiration'] - tmp_df['timestamp']).dt.total_seconds() / (60 * 60 * 24 * 360)
-            tmp_df = \
-                tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last().reset_index()
+            tmp_df = tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last()
             sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
             tmp_df['d1'] = (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
                             0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
