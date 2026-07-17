@@ -483,9 +483,9 @@ class FrameworkApplication:
     def __init__(self, target_path: str):
         self._db_connect = sqlite3.connect(f'{target_path}/crypto_option_spot.db')
         self._underlying_prices = \
-            pl.scan_parquet(f'{target_path}/*/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
-                                                                     pl.col('timestamp'), pl.col('mid_price[0]'),
-                                                                     pl.col('spreads[0]')])
+            pl.scan_parquet(f'{target_path}/*/spot/*-*-*').select([pl.col('symbol').alias('underlying_name'),
+                                                                   pl.col('timestamp'), pl.col('mid_price[0]'),
+                                                                   pl.col('spreads[0]')])
         self._underlying_prices = self._underlying_prices.collect()
         self._underlying_spreads = self._underlying_prices.pivot(
             index='timestamp', on='underlying_name', values='spreads[0]').to_pandas().set_index('timestamp')
