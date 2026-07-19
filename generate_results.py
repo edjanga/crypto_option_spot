@@ -101,6 +101,10 @@ def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
         if regression == 'ml':
             shuffled_lasso_X = kwargs['test_lasso_X'].copy()
             shuffled_lasso_X[col] = jittered_X[col]
+            shuffled_lasso_feature_cols = [c for c in shuffled_lasso_X.columns if c not in ('unique_id', 'ds', 'y')]
+            if shuffled_lasso_X[shuffled_lasso_feature_cols].isna().any().any():
+                shuffled_lasso_X[shuffled_lasso_feature_cols] = \
+                    shuffled_lasso_X[shuffled_lasso_feature_cols].fillna(0)
             lightgbm_shuffled_y = kwargs['lightgbm_model'].predict(h=n_heads * n_steps_ahead_scaler, X_df=jittered_X)
             lightgbm_shuffled_y = lightgbm_shuffled_y.set_index(['unique_id', 'ds'])
             lasso_shuffled_y = kwargs['lasso_model'].predict(h=n_heads * n_steps_ahead_scaler, X_df=shuffled_lasso_X)
@@ -150,6 +154,19 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
         mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
         test_lasso_X = test_X.copy().rename(columns={args.target: 'y'}).set_index(['unique_id', 'ds'])
         test_lasso_X = test_lasso_X.subtract(mean, axis=0).div(std, axis=0).reset_index()
+        # Safety net: even with the D-aware column drop above, a window/unique_id could in
+        # principle still have no valid observations for some feature (all-NaN mean/std, or a
+        # gap ffill/bfill couldn't fill). Lasso.predict() -- unlike Lasso.fit() via mlforecast,
+        # which silently drops NaN rows -- raises on any NaN input. Post-z-score, 0 is a
+        # well-defined "at the training mean" fill, so this is a safe last resort, not a way to
+        # hide a real data problem (if this ever fires often, that's worth investigating).
+        lasso_feature_cols = [c for c in test_lasso_X.columns if c not in ('unique_id', 'ds', 'y')]
+        n_nan_before = test_lasso_X[lasso_feature_cols].isna().sum().sum()
+        if n_nan_before > 0:
+            print(f"WARNING: {n_nan_before} NaN value(s) remained in test_lasso_X after ffill/bfill and "
+                  f"z-scoring -- filling with 0 (= training mean) so Lasso.predict() doesn't crash. "
+                  f"If this happens often, investigate which columns/windows are all-null.")
+            test_lasso_X[lasso_feature_cols] = test_lasso_X[lasso_feature_cols].fillna(0)
         lasso_y = lasso_model.predict(h=n_heads * n_steps_ahead_scaler, X_df=test_lasso_X.drop(columns='y'))
         lasso_y = lasso_y.set_index(['unique_id', 'ds'])
         lasso_y['Lasso'] = lasso_y['Lasso'].mul(std['y'], axis=0, level=0).add(mean['y'], axis=0, level=0)
@@ -261,7 +278,12 @@ if __name__ == "__main__":
     date_grid = dates[start_idx::DAYS_CONVERTER[args.L]]
     date_masks = {d: ((main_features['timestamp'] >= pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.L]))) &
                       (main_features['timestamp'] < pl.lit(d))) for d in date_grid}
-    main_features = main_features.drop(contemporanous_features[args.target])
+    contemporaneous_cols_to_drop = [
+        col for col in
+        contemporanous_features[args.target] + [f'{c}_{args.D}' for c in contemporanous_features[args.target]]
+        if col in main_features.columns
+    ]
+    main_features = main_features.drop(contemporaneous_cols_to_drop)
     forecasts = list()
     metrics = list()
     features_importance = list()
@@ -338,7 +360,6 @@ if __name__ == "__main__":
                                                                        freq=args.freq, market=args.options)
     forecasts = forecasts.join(volatility_regime, how='left').assign(target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
-    pdb.set_trace()
     if args.to_csv:
         forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv', mode='a',
                          header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv'))
