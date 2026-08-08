@@ -241,10 +241,6 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
 def process_one_test_window(trained_model, features_df, main_features, args, tmp_sum, date_grid_test, horizon_date,
                             regression: str):
     if trained_model is None:
-        # No usable model was found for this window, not even by falling back to an earlier
-        # training window (see resolve_trained_model). Skip this window -- it contributes no
-        # signal -- rather than crashing (model[0] on None, or model.make_future_dataframe on
-        # None, would both raise and take down the whole test-window Parallel batch).
         print(f"WARNING: no trained model available (current window or any earlier fallback) "
               f"for test window {date_grid_test} / {regression} -- skipping (no signal produced).")
         return None
@@ -268,13 +264,6 @@ def process_one_test_window(trained_model, features_df, main_features, args, tmp
 
 
 def resolve_trained_model(trained_models, date_grid, date, regression, L_days):
-    """Return a usable model for (date, regression). If that exact window's training failed
-    (returned None) or is missing, fall back to the nearest EARLIER date_grid window that DID
-    train successfully for this regression, rather than the original single hard-coded
-    `date - L_days` step back (which could hit a KeyError if that's not a valid date_grid
-    entry, or itself be None with no further fallback). Returns None -- meaning "skip this
-    test window" -- only if no earlier window has a usable model either.
-    """
     for candidate_date in sorted((d for d in date_grid if d <= date), reverse=True):
         model = trained_models.get((candidate_date, regression))
         if isinstance(model, (list, neuralforecast.core.NeuralForecast)):
@@ -418,7 +407,6 @@ if __name__ == "__main__":
                                                                        freq=args.freq, market=args.options)
     forecasts = forecasts.join(volatility_regime, how='left').assign(target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
-    pdb.set_trace()
     if args.to_csv:
         forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv', mode='a',
                          header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv'))
