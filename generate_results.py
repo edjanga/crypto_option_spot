@@ -44,49 +44,57 @@ def winsorise_vectorized(df: pd.DataFrame, group_col: str = 'unique_id',
 
 
 def train_one_window(date, features, regression: str):
-    train_X = features.to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
-    train_X = \
-        train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
-    start, end = train_X.ds.min(), train_X.ds.max()
-    full_dates = pd.date_range(start, end, freq=args.freq, inclusive='both')
-    uids = train_X['unique_id'].unique()
-    full_index = pd.MultiIndex.from_product([uids, full_dates], names=['unique_id', 'ds'])
     try:
+        train_X = features.to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
+        train_X = \
+            train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
+        start, end = train_X.ds.min(), train_X.ds.max()
+        full_dates = pd.date_range(start, end, freq=args.freq, inclusive='both')
+        uids = train_X['unique_id'].unique()
+        full_index = pd.MultiIndex.from_product([uids, full_dates], names=['unique_id', 'ds'])
         train_X = \
             train_X.drop_duplicates(subset=['unique_id', 'ds']).set_index(['unique_id', 'ds']).reindex(full_index)
         train_X = train_X.reset_index()
         train_X = winsorise_vectorized(train_X, group_col='unique_id')
         if train_X.empty:
-            raise ValueError
-    except ValueError:
-        return date, None
-    fill_cols = [c for c in train_X.columns if c not in ('unique_id', 'ds')]
-    train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].ffill()
-    train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].bfill()
-    if regression == 'dl':
-        n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
-        n_series = train_X['unique_id'].nunique()
-        model = SOFTS(h=n_heads, input_size=train_X.shape[1], n_series=n_series, hidden_size=256,
-                      loss=MSE(), scaler_type='standard', learning_rate=1e-3, e_layers=2, d_ff=512, batch_size=64,
-                      max_steps=1_000, val_check_steps=10, early_stop_patience_steps=EARLY_STOPPING_PATIENCE,
-                      start_padding_enabled=True, accelerator=ENGINE, devices=1)
-        model = NeuralForecast(models=[model], freq=args.freq)
-        model.fit(df=train_X, val_size=n_heads)
-    else:
-        model = \
-            MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=500,
-                                                n_jobs=1, subsample=0.8, colsample_bytree=0.8),
-                       freq=args.freq, target_transforms=[])
-        model.fit(train_X, fitted=False, static_features=[])
-        model2 = MLForecast(models=Lasso(), freq=args.freq, target_transforms=[])
-        num_cols = train_X.select_dtypes(include='number').columns
-        train_group = train_X.groupby('unique_id')[num_cols].agg(['mean', 'std'])
-        mean = train_group.xs('mean', axis=1, level=1)
-        std = train_group.xs('std', axis=1, level=1).clip(lower=1e-8)
-        train_X = train_X.set_index(['unique_id', 'ds']).subtract(mean, axis=0).div(std, axis=0).reset_index()
-        model2.fit(train_X, fitted=False, static_features=[])
-        model = [model, model2, train_group]
-    return (date, regression), model
+            raise ValueError('empty training window after reindex/winsorisation')
+        fill_cols = [c for c in train_X.columns if c not in ('unique_id', 'ds')]
+        train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].ffill()
+        train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].bfill()
+        if regression == 'dl':
+            n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
+            n_series = train_X['unique_id'].nunique()
+            model = SOFTS(h=n_heads, input_size=train_X.shape[1], n_series=n_series, hidden_size=256,
+                          loss=MSE(), scaler_type='standard', learning_rate=1e-3, e_layers=2, d_ff=512,
+                          batch_size=64, max_steps=1_000, val_check_steps=10,
+                          early_stop_patience_steps=EARLY_STOPPING_PATIENCE,
+                          start_padding_enabled=True, accelerator=ENGINE, devices=1)
+            model = NeuralForecast(models=[model], freq=args.freq)
+            model.fit(df=train_X, val_size=n_heads)
+        else:
+            model = \
+                MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=500,
+                                                    n_jobs=1, subsample=0.8, colsample_bytree=0.8),
+                           freq=args.freq, target_transforms=[])
+            model.fit(train_X, fitted=False, static_features=[])
+            model2 = MLForecast(models=Lasso(), freq=args.freq, target_transforms=[])
+            num_cols = train_X.select_dtypes(include='number').columns
+            train_group = train_X.groupby('unique_id')[num_cols].agg(['mean', 'std'])
+            mean = train_group.xs('mean', axis=1, level=1)
+            std = train_group.xs('std', axis=1, level=1).clip(lower=1e-8)
+            train_X = train_X.set_index(['unique_id', 'ds']).subtract(mean, axis=0).div(std, axis=0).reset_index()
+            model2.fit(train_X, fitted=False, static_features=[])
+            model = [model, model2, train_group]
+        return (date, regression), model
+    except Exception as e:
+        # A single bad training window (empty after cleaning, degenerate data, a model-fit
+        # failure, etc.) must not take down the whole Parallel(...) batch that trains every
+        # (date, regression) window -- every other window's model would be lost too. Return a
+        # None model instead; test-window resolution below falls back to the nearest earlier
+        # window that DID train successfully, and skips (with a warning) if none did.
+        print(f"WARNING: training window ({date}, {regression}) failed ({type(e).__name__}: {e}) "
+              f"-- no model produced for this window.")
+        return (date, regression), None
 
 
 def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
@@ -195,20 +203,34 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
     mase_mean = mase_mean.stack().reset_index().rename(
         columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_2': 'regression', 0: 'MASE'}).dropna()
     ############################################# Feature Importance ###################################################
-    sample_columns = random.sample(test_X.columns[~test_X.columns.isin(['unique_id', 'ds'])].tolist(), k=3)
-    perm_df = list()
-    for col in sample_columns:
-        perm_df.append(compute_feat_importance(col=col, test_X=test_X,
-                                               test_lasso_X=test_lasso_X if regression == 'ml' else None, test_y=test_y,
-                                               in_sample_avg=in_sample_avg, args=args, regression=regression,
-                                               model_names=model_names, n_heads=n_heads,
-                                               n_steps_ahead_scaler=n_steps_ahead_scaler,
-                                               lightgbm_model=lightgbm_model if regression == 'ml' else None,
-                                               lasso_model=lasso_model if regression == 'ml' else None,
-                                               softs_model=softs_model if regression == 'dl' else None,
-                                               mean=mean if regression == 'ml' else None,
-                                               std=std if regression == 'ml' else None))
-    perm_df = pd.concat(perm_df, ignore_index=True)
+    sample_columns_pool = test_X.columns[~test_X.columns.isin(['unique_id', 'ds'])].tolist()
+    k = min(3, len(sample_columns_pool))
+    if k == 0:
+        # No feature columns at all in this window -- permutation importance has nothing to
+        # perturb. Produce an empty (but correctly-shaped) result instead of letting
+        # random.sample(..., k=3) raise ValueError('Sample larger than population...') and
+        # take down the whole test-window Parallel batch.
+        print("WARNING: no feature columns available for permutation importance in this "
+              "window -- feature_importance will be empty for this window.")
+        perm_df = pd.DataFrame(columns=['underlying_name', 'timestamp', 'regression', 'MASE', 'features'])
+    else:
+        if k < 3:
+            print(f"WARNING: only {k} feature column(s) available for permutation importance in "
+                  f"this window (expected 3) -- using all {k} instead of failing.")
+        sample_columns = random.sample(sample_columns_pool, k=k)
+        perm_df = list()
+        for col in sample_columns:
+            perm_df.append(compute_feat_importance(col=col, test_X=test_X,
+                                                   test_lasso_X=test_lasso_X if regression == 'ml' else None, test_y=test_y,
+                                                   in_sample_avg=in_sample_avg, args=args, regression=regression,
+                                                   model_names=model_names, n_heads=n_heads,
+                                                   n_steps_ahead_scaler=n_steps_ahead_scaler,
+                                                   lightgbm_model=lightgbm_model if regression == 'ml' else None,
+                                                   lasso_model=lasso_model if regression == 'ml' else None,
+                                                   softs_model=softs_model if regression == 'dl' else None,
+                                                   mean=mean if regression == 'ml' else None,
+                                                   std=std if regression == 'ml' else None))
+        perm_df = pd.concat(perm_df, ignore_index=True)
     ################################################ Forecasts #########################################################
     forecast_df = test_y.set_index('y', append=True).rename(columns=model_names)
     forecast_df = forecast_df.stack().reset_index().rename(
@@ -218,18 +240,46 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
 
 def process_one_test_window(trained_model, features_df, main_features, args, tmp_sum, date_grid_test, horizon_date,
                             regression: str):
-    forecast, metric, feature_importance = evaluate_one_window(model=trained_model,
-                                                               train_features=features_df,
-                                                               regression=regression,
-                                                               args=args,
-                                                               n_steps_ahead_scaler=tmp_sum,
-                                                               main_features=main_features)
+    if trained_model is None:
+        # No usable model was found for this window, not even by falling back to an earlier
+        # training window (see resolve_trained_model). Skip this window -- it contributes no
+        # signal -- rather than crashing (model[0] on None, or model.make_future_dataframe on
+        # None, would both raise and take down the whole test-window Parallel batch).
+        print(f"WARNING: no trained model available (current window or any earlier fallback) "
+              f"for test window {date_grid_test} / {regression} -- skipping (no signal produced).")
+        return None
+    try:
+        forecast, metric, feature_importance = evaluate_one_window(model=trained_model,
+                                                                   train_features=features_df,
+                                                                   regression=regression,
+                                                                   args=args,
+                                                                   n_steps_ahead_scaler=tmp_sum,
+                                                                   main_features=main_features)
+    except Exception as e:
+        print(f"WARNING: evaluate_one_window failed for test window {date_grid_test} / {regression} "
+              f"({type(e).__name__}: {e}) -- skipping this window (no signal produced).")
+        return None
     start = pd.Timestamp(date_grid_test)
     end = horizon_date
     f_mask = (forecast.timestamp >= start) & (forecast.timestamp < end)
     m_mask = (metric.timestamp >= start) & (metric.timestamp < end)
     fi_mask = (feature_importance.timestamp >= start) & (feature_importance.timestamp < end)
     return forecast.loc[f_mask], metric.loc[m_mask], feature_importance.loc[fi_mask]
+
+
+def resolve_trained_model(trained_models, date_grid, date, regression, L_days):
+    """Return a usable model for (date, regression). If that exact window's training failed
+    (returned None) or is missing, fall back to the nearest EARLIER date_grid window that DID
+    train successfully for this regression, rather than the original single hard-coded
+    `date - L_days` step back (which could hit a KeyError if that's not a valid date_grid
+    entry, or itself be None with no further fallback). Returns None -- meaning "skip this
+    test window" -- only if no earlier window has a usable model either.
+    """
+    for candidate_date in sorted((d for d in date_grid if d <= date), reverse=True):
+        model = trained_models.get((candidate_date, regression))
+        if isinstance(model, (list, neuralforecast.core.NeuralForecast)):
+            return model
+    return None
 
 
 if __name__ == "__main__":
@@ -323,15 +373,23 @@ if __name__ == "__main__":
     with tqdm_joblib(tqdm(desc='Test windows', total=len(date_regression_grid_test))):
         results = Parallel(n_jobs=args.cpu_count, backend='loky')(
             delayed(process_one_test_window)(
-                trained_models[(in_sample_dates[i], regression)]
-                if isinstance(trained_models[(in_sample_dates[i], regression)],
-                              (list, neuralforecast.core.NeuralForecast)) else
-                trained_models[(in_sample_dates[i] - pd.Timedelta(days=L_days), regression)],
+                resolve_trained_model(trained_models, date_grid, in_sample_dates[i], regression, L_days),
                 feature_cache[in_sample_dates[i]],
                 main_features_test_cache[date_grid_test[i]],
                 args, n_steps_ahead_scaler[i], date_grid_test[i],
                 horizon_dates[i], regression)
             for i, regression in date_regression_grid_test)
+    n_total_windows = len(results)
+    results = [r for r in results if r is not None]
+    n_skipped = n_total_windows - len(results)
+    if n_skipped > 0:
+        print(f"WARNING: {n_skipped} of {n_total_windows} test windows were skipped entirely "
+              f"(no trained model available, even via fallback, or evaluation failed) -- "
+              f"see the WARNING messages above for which ones. Forecasts/MASE/feature "
+              f"importance will have gaps for those windows.")
+    if not results:
+        raise RuntimeError("No test windows produced any results (all were skipped or failed) "
+                           "-- nothing to write out. Check the WARNING messages above.")
     forecasts, metrics, features_importance = map(list, zip(*results))
     forecasts = pd.concat(forecasts).set_index(['underlying_name', 'timestamp'])
     forecasts.index = forecasts.index.set_levels(pd.to_datetime(forecasts.index.levels[1], utc=True), level=1)
@@ -360,6 +418,7 @@ if __name__ == "__main__":
                                                                        freq=args.freq, market=args.options)
     forecasts = forecasts.join(volatility_regime, how='left').assign(target=args.target, D=args.D, freq=args.freq,
                                                                      market=args.options)
+    pdb.set_trace()
     if args.to_csv:
         forecasts.to_csv(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv', mode='a',
                          header=not os.path.exists(f'{args.target_path}/crypto_option_spot/forecasts_{args.freq}.csv'))
