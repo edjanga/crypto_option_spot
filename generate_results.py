@@ -87,11 +87,6 @@ def train_one_window(date, features, regression: str):
             model = [model, model2, train_group]
         return (date, regression), model
     except Exception as e:
-        # A single bad training window (empty after cleaning, degenerate data, a model-fit
-        # failure, etc.) must not take down the whole Parallel(...) batch that trains every
-        # (date, regression) window -- every other window's model would be lost too. Return a
-        # None model instead; test-window resolution below falls back to the nearest earlier
-        # window that DID train successfully, and skips (with a warning) if none did.
         print(f"WARNING: training window ({date}, {regression}) failed ({type(e).__name__}: {e}) "
               f"-- no model produced for this window.")
         return (date, regression), None
@@ -162,12 +157,6 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
         mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
         test_lasso_X = test_X.copy().rename(columns={args.target: 'y'}).set_index(['unique_id', 'ds'])
         test_lasso_X = test_lasso_X.subtract(mean, axis=0).div(std, axis=0).reset_index()
-        # Safety net: even with the D-aware column drop above, a window/unique_id could in
-        # principle still have no valid observations for some feature (all-NaN mean/std, or a
-        # gap ffill/bfill couldn't fill). Lasso.predict() -- unlike Lasso.fit() via mlforecast,
-        # which silently drops NaN rows -- raises on any NaN input. Post-z-score, 0 is a
-        # well-defined "at the training mean" fill, so this is a safe last resort, not a way to
-        # hide a real data problem (if this ever fires often, that's worth investigating).
         lasso_feature_cols = [c for c in test_lasso_X.columns if c not in ('unique_id', 'ds', 'y')]
         n_nan_before = test_lasso_X[lasso_feature_cols].isna().sum().sum()
         if n_nan_before > 0:
@@ -194,7 +183,6 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
     test_y = pd.concat([test_y]+tmp_model, axis=1)
     test_y = test_y.groupby([pd.Grouper(level=0), pd.Grouper(level=1, freq=args.freq)]).sum()
     test_X = test_X.drop(args.target, axis=1)
-    #################################################### MASE ##########################################################
     train_features = train_features.to_pandas().rename(columns={'underlying_name': 'unique_id', args.target: 'y'})
     in_sample_avg = train_features.groupby('unique_id')['y'].diff().abs().groupby(train_features['unique_id']).mean()
     delta_ys = -1*test_y[regression_dd[regression]].subtract(test_y['y'], axis=0)
@@ -202,14 +190,9 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
     mase_mean = delta_ys.div(in_sample_avg.values, axis=0).abs().rename(columns=model_names)
     mase_mean = mase_mean.stack().reset_index().rename(
         columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_2': 'regression', 0: 'MASE'}).dropna()
-    ############################################# Feature Importance ###################################################
     sample_columns_pool = test_X.columns[~test_X.columns.isin(['unique_id', 'ds'])].tolist()
     k = min(3, len(sample_columns_pool))
     if k == 0:
-        # No feature columns at all in this window -- permutation importance has nothing to
-        # perturb. Produce an empty (but correctly-shaped) result instead of letting
-        # random.sample(..., k=3) raise ValueError('Sample larger than population...') and
-        # take down the whole test-window Parallel batch.
         print("WARNING: no feature columns available for permutation importance in this "
               "window -- feature_importance will be empty for this window.")
         perm_df = pd.DataFrame(columns=['underlying_name', 'timestamp', 'regression', 'MASE', 'features'])
@@ -231,7 +214,6 @@ def evaluate_one_window(model, train_features, regression: str, args , n_steps_a
                                                    mean=mean if regression == 'ml' else None,
                                                    std=std if regression == 'ml' else None))
         perm_df = pd.concat(perm_df, ignore_index=True)
-    ################################################ Forecasts #########################################################
     forecast_df = test_y.set_index('y', append=True).rename(columns=model_names)
     forecast_df = forecast_df.stack().reset_index().rename(
         columns={'unique_id': 'underlying_name', 'ds': 'timestamp', 'level_3': 'regression', 0: 'y_hat'})
@@ -282,7 +264,7 @@ if __name__ == "__main__":
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
-    parser.add_argument('--options', type=int, default=0, help='Add option features or not.')
+    parser.add_argument('--options', type=int, default=1, help='Add option features or not.')
     parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
     parser.add_argument('--cpu_count', type=int, default=10,
                         help='Number of processes to use for the pipeline.')
@@ -309,7 +291,7 @@ if __name__ == "__main__":
         main_features = main_features.sort(['underlying_name', 'timestamp'])
         main_features = main_features.sort(['underlying_name', 'timestamp']).with_columns(
             pl.all().forward_fill().over('underlying_name')
-        ).drop_nulls()
+        )
     else:
         main_features = features
     main_features = main_features.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
@@ -398,7 +380,7 @@ if __name__ == "__main__":
     volatility_regime = underlying_rv.groupby('timestamp')['target_values'].mean().resample(args.freq).sum()
     volatility_regime = \
         volatility_regime.loc[(volatility_regime.index.date < pd.to_datetime(args.end_date, utc=True).date())]
-    volatility_regime = pd.qcut(volatility_regime, q=[0, .45, .9, 1], labels=VOL_REGIMES)
+    volatility_regime = pd.qcut(volatility_regime, q=[0, .33, .66, 1], labels=VOL_REGIMES)
     volatility_regime.name = 'volatility_regime'
     metric = metric.join(volatility_regime, how='left', on='timestamp').assign(target=args.target, D=args.D,
                                                                                freq=args.freq, market=args.options)
