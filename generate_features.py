@@ -14,6 +14,8 @@ from typing import List
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from model.lab import LABELS
+from constants import INTRADAY_LAGS, INTERDAY_LAGS
+LAGS = INTRADAY_LAGS+INTERDAY_LAGS
 
 
 def return_filename(filename: str) -> str:
