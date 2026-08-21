@@ -251,92 +251,92 @@ class FrameworkApplication:
     def underlying_rv(self) -> pd.DataFrame:
         return self._underlying_rv
 
-    @staticmethod
-    def process_daily_option_chain(freq: str, directory: str, date_range: pd.DatetimeIndex) -> None:
-        for date in date_range:
-            # if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
-            #     date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
-            #     daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
-            #     daily_option_chain_date = daily_option_chain_date.with_columns(
-            #         ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
-            #     FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
-            #     os.makedirs(f'{directory}/option_chain', exist_ok=True)
-            #     FrameworkApplication._option_chain[date.date()].to_parquet(
-            #         f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
-            # else:
-            try:
-                tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
-                                         f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
-            except FileNotFoundError:
-                tmp_df = pd.read_parquet(f"{directory}/{date.year-1}/options/"
-                                         f"{(date - relativedelta(days=1)).strftime(DATE_FORMAT)}")
-            tmp_df['tau'] = (tmp_df['expiration'] - tmp_df['timestamp']).dt.total_seconds() / (60 * 60 * 24 * 360)
-            tmp_df = tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last()
-            sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
-            tmp_df['d1'] = (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
-                            0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
-            tmp_df['d1'] = tmp_df['d1'] / sqrt_term
-            tmp_df['d2'] = tmp_df['d1'] - sqrt_term
-            tmp_df['bs_price'] = (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
-                                  tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
-            tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
-            tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
-            FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
-        return None
-
-    @staticmethod
-    def iv_regression(freq: str) -> None:
-        symbol = data.columns.get_level_values(1).unique().tolist()
-        iv_interpolation_data = \
-            dict([(sym, dict([(option_type, None) for option_type in ['call', 'put']])) for sym in symbol])
-        date_sym_option_type = \
-            list(itertools.product(FrameworkApplication._option_chain.keys(), symbol, ['call', 'put']))
-        for daily_date_sym_option_type_ls in date_sym_option_type:
-            if not FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].empty:
-                daily_option_chain = FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].query(
-                            f'underlying_name == "{daily_date_sym_option_type_ls[1]}"')
-                if not daily_option_chain.empty:
-                    sym, option_type, betas = \
-                        iv_regression_per_option_type(daily_option_chain, daily_date_sym_option_type_ls[2], freq)
-                    if iv_interpolation_data[sym][option_type] is None:
-                        iv_interpolation_data[sym][option_type] = betas
-                    else:
-                        iv_interpolation_data[sym][option_type] = \
-                            pd.concat([iv_interpolation_data[sym][option_type], betas])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(symbol), os.cpu_count() - 2)) as executor3:
-            futures3 = [executor3.submit(lambda x: x, x=sym) for sym in symbol]
-            for future3 in concurrent.futures.as_completed(futures3):
-                sym = future3.result()
-                try:
-                    iv_interpolation_data[sym] = pd.concat(iv_interpolation_data[sym], axis=1)
-                except ValueError:
-                    iv_interpolation_data.pop(sym)
-                    continue
-        FrameworkApplication._iv_interpolation_coef = pd.concat(iv_interpolation_data, axis=1)
-        FrameworkApplication._iv_interpolation_coef = \
-            FrameworkApplication._iv_interpolation_coef.groupby(
-                FrameworkApplication._iv_interpolation_coef.index).last()
-        return pd.concat(iv_interpolation_data, axis=1).ffill()
-
-    @staticmethod
-    def svix(freq: str, aggregated: bool = True) -> pd.DataFrame:
-        iv_interpolation_coef = FrameworkApplication._iv_interpolation_coef
-        svix = dict([(D, list()) for D in ['1d', '1w', '1m']])
-        dates = list(FrameworkApplication._option_chain.keys())
-        date_range_D = list(itertools.product(dates, ['1d', '1w', '1m']))
-        for date_D in date_range_D:
-            svix_s, D = svix_daily(date_D[0], FrameworkApplication._option_chain[date_D[0]],
-                                   iv_interpolation_coef.loc[iv_interpolation_coef.index.date == date_D[0]],
-                                   date_D[1], freq, aggregated)
-            svix[D].append(svix_s)
-        for D in svix.keys():
-            svix[D] = pd.concat(svix[D])
-            if aggregated:
-                svix[D].name = D
-        svix = pd.concat(svix, axis=1)
-        svix.index = pd.to_datetime(svix.index, utc=True)
-        svix.index.name = 'timestamp'
-        return svix
+    # @staticmethod
+    # def process_daily_option_chain(freq: str, directory: str, date_range: pd.DatetimeIndex) -> None:
+    #     for date in date_range:
+    #         # if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
+    #         #     date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
+    #         #     daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
+    #         #     daily_option_chain_date = daily_option_chain_date.with_columns(
+    #         #         ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
+    #         #     FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
+    #         #     os.makedirs(f'{directory}/option_chain', exist_ok=True)
+    #         #     FrameworkApplication._option_chain[date.date()].to_parquet(
+    #         #         f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
+    #         # else:
+    #         try:
+    #             tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
+    #                                      f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
+    #         except FileNotFoundError:
+    #             tmp_df = pd.read_parquet(f"{directory}/{date.year-1}/options/"
+    #                                      f"{(date - relativedelta(days=1)).strftime(DATE_FORMAT)}")
+    #         tmp_df['tau'] = (tmp_df['expiration'] - tmp_df['timestamp']).dt.total_seconds() / (60 * 60 * 24 * 360)
+    #         tmp_df = tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last()
+    #         sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
+    #         tmp_df['d1'] = (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
+    #                         0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
+    #         tmp_df['d1'] = tmp_df['d1'] / sqrt_term
+    #         tmp_df['d2'] = tmp_df['d1'] - sqrt_term
+    #         tmp_df['bs_price'] = (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
+    #                               tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
+    #         tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
+    #         tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
+    #         FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
+    #     return None
+    #
+    # @staticmethod
+    # def iv_regression(freq: str) -> None:
+    #     symbol = data.columns.get_level_values(1).unique().tolist()
+    #     iv_interpolation_data = \
+    #         dict([(sym, dict([(option_type, None) for option_type in ['call', 'put']])) for sym in symbol])
+    #     date_sym_option_type = \
+    #         list(itertools.product(FrameworkApplication._option_chain.keys(), symbol, ['call', 'put']))
+    #     for daily_date_sym_option_type_ls in date_sym_option_type:
+    #         if not FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].empty:
+    #             daily_option_chain = FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].query(
+    #                         f'underlying_name == "{daily_date_sym_option_type_ls[1]}"')
+    #             if not daily_option_chain.empty:
+    #                 sym, option_type, betas = \
+    #                     iv_regression_per_option_type(daily_option_chain, daily_date_sym_option_type_ls[2], freq)
+    #                 if iv_interpolation_data[sym][option_type] is None:
+    #                     iv_interpolation_data[sym][option_type] = betas
+    #                 else:
+    #                     iv_interpolation_data[sym][option_type] = \
+    #                         pd.concat([iv_interpolation_data[sym][option_type], betas])
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(symbol), os.cpu_count() - 2)) as executor3:
+    #         futures3 = [executor3.submit(lambda x: x, x=sym) for sym in symbol]
+    #         for future3 in concurrent.futures.as_completed(futures3):
+    #             sym = future3.result()
+    #             try:
+    #                 iv_interpolation_data[sym] = pd.concat(iv_interpolation_data[sym], axis=1)
+    #             except ValueError:
+    #                 iv_interpolation_data.pop(sym)
+    #                 continue
+    #     FrameworkApplication._iv_interpolation_coef = pd.concat(iv_interpolation_data, axis=1)
+    #     FrameworkApplication._iv_interpolation_coef = \
+    #         FrameworkApplication._iv_interpolation_coef.groupby(
+    #             FrameworkApplication._iv_interpolation_coef.index).last()
+    #     return pd.concat(iv_interpolation_data, axis=1).ffill()
+    #
+    # @staticmethod
+    # def svix(freq: str, aggregated: bool = True) -> pd.DataFrame:
+    #     iv_interpolation_coef = FrameworkApplication._iv_interpolation_coef
+    #     svix = dict([(D, list()) for D in ['1d', '1w', '1m']])
+    #     dates = list(FrameworkApplication._option_chain.keys())
+    #     date_range_D = list(itertools.product(dates, ['1d', '1w', '1m']))
+    #     for date_D in date_range_D:
+    #         svix_s, D = svix_daily(date_D[0], FrameworkApplication._option_chain[date_D[0]],
+    #                                iv_interpolation_coef.loc[iv_interpolation_coef.index.date == date_D[0]],
+    #                                date_D[1], freq, aggregated)
+    #         svix[D].append(svix_s)
+    #     for D in svix.keys():
+    #         svix[D] = pd.concat(svix[D])
+    #         if aggregated:
+    #             svix[D].name = D
+    #     svix = pd.concat(svix, axis=1)
+    #     svix.index = pd.to_datetime(svix.index, utc=True)
+    #     svix.index.name = 'timestamp'
+    #     return svix
 
 
     @property
@@ -548,76 +548,76 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## SVIX
     ####################################################################################################################
-    if args.type == 'svix_rv_vrp_effect':
-        if os.path.exists(f'{args.target_path}/crypto_option_spot/svix.csv'):
-            svix = pd.read_csv(f'{args.target_path}/crypto_option_spot/svix.csv', index_col='index')
-            svix['svix'] = svix['svix']/100
-            svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=True)
-            svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
-            svix_agg = \
-                pd.concat([svix.xs(1, axis=0, level=0,
-                                   drop_level=False).droplevel(axis=0, level=1).assign(underlying_name=underlying_name)
-                           for underlying_name in SYMBOLS]).set_index('underlying_name', append=True)
-            svix_agg = svix_agg.swaplevel(-1, 1).swaplevel(-1, 2)
-            svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
-            svix = pd.concat([svix_agg, svix_non_agg]).reset_index()
-        else:
-            framework_application_obj.iv_regression(best_model_tags[-1])
-            for aggregated in [True, False]:
-                svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
-                svix = ((scaling_factor * svix2) ** .5).unstack()
-                svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
-                    svix.index.set_names(['D', 'underlying_name', 'timestamp'])
-                svix.name = 'svix'
-                svix = pd.DataFrame(svix.reset_index())
-                if aggregated:
-                    svix = svix.assign(underlying_name=None)
-                svix.assign(aggregated={True: 1, False: 0}[aggregated]).to_sql(
-                    con=framework_application_obj.db_connect, name=f'svix', if_exists='append')
-                print(f'[Insertion]: SVIX {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
-                      f'into the database.')
-        ################################################################################################################
-        ## VRP
-        ################################################################################################################
-        returns = data.xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
-        returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
-        rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
-        rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
-        rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
-        if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
-            vrp = \
-                pd.merge(svix, rv.unstack().rename('rv').dropna().reset_index(),
-                         on=['underlying_name', 'D', 'timestamp'], how='right')
-            vrp['vrp'] = vrp['svix'] - vrp['rv']
-            vrp = vrp.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
-        else:
-            svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
-            svix = svix.set_index(['aggregated', 'timestamp'])
-            vrp = dict()
-            for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
-                tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
-                if aggregated:
-                    if 'agg_svix' not in vars():
-                        agg_svix = tmp_svix.drop('underlying_name', axis=1)
-                        agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
-                        agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
-                    vrp[(int(aggregated), underlying_name)] = \
-                        agg_svix.reindex(rv.index).subtract(rv[underlying_name].values).dropna()
-                else:
-                    tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns=['underlying_name', 'D'], values='svix',
-                                              index='timestamp')
-                    tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
-                    vrp[(int(aggregated), underlying_name)] = \
-                        tmp_svix.xs(underlying_name, axis=1,
-                                    level=0).reindex(rv.index).subtract(rv[underlying_name].values)
-                vrp[(int(aggregated), underlying_name)] = \
-                    vrp[(int(aggregated), underlying_name)].dropna(axis=1, how='all').dropna()
-                vrp[(int(aggregated), underlying_name)] = \
-                    pd.DataFrame(vrp[(int(aggregated), underlying_name)].unstack()).rename(columns={0: 'vrp'})
-                vrp[(int(aggregated), underlying_name)] = \
-                    vrp[(int(aggregated), underlying_name)].assign(underlying_name=underlying_name,
-                                                                   aggregated=int(aggregated))
-            vrp_0 = pd.concat([vrp[(0, symbol)] for symbol in pairs_order.categories])
-            vrp_1 = pd.concat([vrp[(1, symbol)] for symbol in pairs_order.categories])
-            vrp = pd.concat([vrp_0, vrp_1])
-            vrp.to_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
+    # if args.type == 'svix_rv_vrp_effect':
+    #     if os.path.exists(f'{args.target_path}/crypto_option_spot/svix.csv'):
+    #         svix = pd.read_csv(f'{args.target_path}/crypto_option_spot/svix.csv', index_col='index')
+    #         svix['svix'] = svix['svix']/100
+    #         svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=True)
+    #         svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
+    #         svix_agg = \
+    #             pd.concat([svix.xs(1, axis=0, level=0,
+    #                                drop_level=False).droplevel(axis=0, level=1).assign(underlying_name=underlying_name)
+    #                        for underlying_name in SYMBOLS]).set_index('underlying_name', append=True)
+    #         svix_agg = svix_agg.swaplevel(-1, 1).swaplevel(-1, 2)
+    #         svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
+    #         svix = pd.concat([svix_agg, svix_non_agg]).reset_index()
+    #     else:
+    #         framework_application_obj.iv_regression(best_model_tags[-1])
+    #         for aggregated in [True, False]:
+    #             svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
+    #             svix = ((scaling_factor * svix2) ** .5).unstack()
+    #             svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
+    #                 svix.index.set_names(['D', 'underlying_name', 'timestamp'])
+    #             svix.name = 'svix'
+    #             svix = pd.DataFrame(svix.reset_index())
+    #             if aggregated:
+    #                 svix = svix.assign(underlying_name=None)
+    #             svix.assign(aggregated={True: 1, False: 0}[aggregated]).to_sql(
+    #                 con=framework_application_obj.db_connect, name=f'svix', if_exists='append')
+    #             print(f'[Insertion]: SVIX {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
+    #                   f'into the database.')
+    #     ################################################################################################################
+    #     ## VRP
+    #     ################################################################################################################
+    #     returns = data.xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
+    #     returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
+    #     rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
+    #     rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
+    #     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
+    #     if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
+    #         vrp = \
+    #             pd.merge(svix, rv.unstack().rename('rv').dropna().reset_index(),
+    #                      on=['underlying_name', 'D', 'timestamp'], how='right')
+    #         vrp['vrp'] = vrp['svix'] - vrp['rv']
+    #         vrp = vrp.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
+    #     else:
+    #         svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
+    #         svix = svix.set_index(['aggregated', 'timestamp'])
+    #         vrp = dict()
+    #         for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
+    #             tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
+    #             if aggregated:
+    #                 if 'agg_svix' not in vars():
+    #                     agg_svix = tmp_svix.drop('underlying_name', axis=1)
+    #                     agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
+    #                     agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
+    #                 vrp[(int(aggregated), underlying_name)] = \
+    #                     agg_svix.reindex(rv.index).subtract(rv[underlying_name].values).dropna()
+    #             else:
+    #                 tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns=['underlying_name', 'D'], values='svix',
+    #                                           index='timestamp')
+    #                 tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
+    #                 vrp[(int(aggregated), underlying_name)] = \
+    #                     tmp_svix.xs(underlying_name, axis=1,
+    #                                 level=0).reindex(rv.index).subtract(rv[underlying_name].values)
+    #             vrp[(int(aggregated), underlying_name)] = \
+    #                 vrp[(int(aggregated), underlying_name)].dropna(axis=1, how='all').dropna()
+    #             vrp[(int(aggregated), underlying_name)] = \
+    #                 pd.DataFrame(vrp[(int(aggregated), underlying_name)].unstack()).rename(columns={0: 'vrp'})
+    #             vrp[(int(aggregated), underlying_name)] = \
+    #                 vrp[(int(aggregated), underlying_name)].assign(underlying_name=underlying_name,
+    #                                                                aggregated=int(aggregated))
+    #         vrp_0 = pd.concat([vrp[(0, symbol)] for symbol in pairs_order.categories])
+    #         vrp_1 = pd.concat([vrp[(1, symbol)] for symbol in pairs_order.categories])
+    #         vrp = pd.concat([vrp_0, vrp_1])
+    #         vrp.to_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
