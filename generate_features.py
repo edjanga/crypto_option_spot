@@ -117,6 +117,9 @@ if __name__ == '__main__':
                             pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]).cast(moneyness_dtype))
                         .otherwise(None).alias('moneyness_label'))
                     tmp_options = tmp_options.filter(pl.col('trades').is_not_null())
+                    if 'volume' not in tmp_options.collect_schema().names():
+                        tmp_options = \
+                            tmp_options.with_columns(((pl.col('ask_amount')+pl.col('bid_amount'))/2).alias('volume'))
                     tmp_options = \
                         tmp_options.with_columns(-(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
                     exposure = feature_builder.compute_exposure(data=tmp_options, freq=args.freq, collect=collect)
