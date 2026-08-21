@@ -13,6 +13,7 @@ from itertools import product
 from typing import List
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+from model.lab import LABELS
 
 
 def return_filename(filename: str) -> str:
