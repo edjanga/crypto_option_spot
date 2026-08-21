@@ -1,27 +1,19 @@
 import concurrent.futures
 import datetime
 import itertools
-import pdb
 import sqlite3
 import os
 import numpy as np
 import pandas as pd
-import optuna
 import pytz
-from model.lab import PnLExplained
-from optuna.samplers import RandomSampler
 from dateutil.relativedelta import relativedelta
-from constants import DATE_FORMAT, N_JOBS, N_TRIALS, FEES_SPOT, FEES_OPTIONS, DAYS_CONVERTER, SYMBOLS,\
-    LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, VOL_REGIMES, ATM_MONEYNESSES, ENGINE
-from functools import partial
-from typing import Dict, List, Tuple, Union
+from constants import DATE_FORMAT, DAYS_CONVERTER, SYMBOLS, VOL_REGIMES, ATM_MONEYNESSES
+from typing import Dict, List, Tuple
 from scipy.optimize import minimize
 from scipy.stats.distributions import norm
-import statsmodels.api as sm
 from pandas.api.types import CategoricalDtype
 import polars as pl
 from itertools import product
-from sklearn.linear_model import LinearRegression
 import argparse
 
 
@@ -373,8 +365,6 @@ if __name__ == '__main__':
     market_order = CategoricalDtype(categories=[0, 1], ordered=True)
     ####################################################################################################################
     framework_application_obj = FrameworkApplication(target_path=args.target_path)
-    pnl_explained_obj = PnLExplained(underlying_rv=framework_application_obj.underlying_rv,
-                                     underlying_returns=framework_application_obj.underlying_returns)
     top_features = args.top_features
     rv_mkt = framework_application_obj.underlying_rv.set_index('timestamp').stack().swaplevel(0, 1)
     df_idx = rv_mkt.index.to_frame()
