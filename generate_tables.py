@@ -22,16 +22,16 @@ import argparse
 ########################################################################################################################
 
 
-def process_daily_option_chain_date(date: datetime.datetime, directory: str,
-                                    freq: str) -> Tuple[datetime.datetime, pl.LazyFrame]:
-    print(f'Option chain data for {date.strftime(DATE_FORMAT)} is being generated.........')
-    option_chain_data = pl.scan_parquet(f'{directory}/*/{date.year}/options/{date.strftime(DATE_FORMAT)}')
-    option_chain_data = option_chain_data.sort(['underlying_name', 'timestamp'])
-    option_chain_data = (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
-                                                            group_by='underlying_name', include_boundaries=False,
-                                                            period=None).agg([pl.all().last()]))
-    print(f'Option chain data for {date.strftime(DATE_FORMAT)} has been generated.')
-    return date, option_chain_data
+# def process_daily_option_chain_date(date: datetime.datetime, directory: str,
+#                                     freq: str) -> Tuple[datetime.datetime, pl.LazyFrame]:
+#     print(f'Option chain data for {date.strftime(DATE_FORMAT)} is being generated.........')
+#     option_chain_data = pl.scan_parquet(f'{directory}/*/{date.year}/options/{date.strftime(DATE_FORMAT)}')
+#     option_chain_data = option_chain_data.sort(['underlying_name', 'timestamp'])
+#     option_chain_data = (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
+#                                                             group_by='underlying_name', include_boundaries=False,
+#                                                             period=None).agg([pl.all().last()]))
+#     print(f'Option chain data for {date.strftime(DATE_FORMAT)} has been generated.')
+#     return date, option_chain_data
 
 
 def daily_date_sym_option_type(date_sym_option_type: List[str]):
@@ -424,7 +424,7 @@ if __name__ == '__main__':
     data.loc[:, rv_idx[:, :, 'RV', :]] = data.loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor ** .5)
     framework_application_obj.symbol = framework_application_obj.data.columns.get_level_values(1).unique().tolist()
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
-    framework_application_obj.process_daily_option_chain(best_model_tags[-1], f'{args.target_path}', date_range)
+    # framework_application_obj.process_daily_option_chain(best_model_tags[-1], f'{args.target_path}', date_range)
     ####################################################################################################################
     ## MASE Reporting
     ####################################################################################################################
