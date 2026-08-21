@@ -379,7 +379,7 @@ if __name__ == '__main__':
                              pd.Grouper(level=1)]).mean().rename(columns={0: 'volatility_regime'})
     volatility_regime = rv_mkt.groupby(pd.Grouper(level='D'), group_keys=False)
     volatility_regime = \
-        volatility_regime.apply(lambda x: pd.qcut(x['volatility_regime'], q=[0, .33, .66], labels=VOL_REGIMES))
+        volatility_regime.apply(lambda x: pd.qcut(x['volatility_regime'], q=[0, .33, .66, 1], labels=VOL_REGIMES))
     ####################################################################################################################
     ## Model selection
     ####################################################################################################################
