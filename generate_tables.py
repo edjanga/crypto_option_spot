@@ -352,7 +352,7 @@ if __name__ == '__main__':
                         help='Number of top features to consider in feature importance analysis', default=5)
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
-    parser.add_argument('--type', type=str, help='Type of table to generate', default='../data_centre')
+    parser.add_argument('--type', type=str, help='Type of table to generate', default='mase_reporting')
     args = parser.parse_args()
     print(args)
     ####################################################################################################################
@@ -402,12 +402,16 @@ if __name__ == '__main__':
         mase_comparison.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
     mase_comparison['timestamp'] = pd.to_datetime(mase_comparison['timestamp'], utc=True)
     mase_comparison = mase_comparison.set_index(['D', 'timestamp'])
-    mase_comparison = mase_comparison.groupby(by=pd.Grouper(key='market'))['MASE'].mean()
-    best_market = mase_comparison.idxmin()
+    mase_comparison = \
+        model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
     best_model = mase.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
-    chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
-    data = pd.concat(chunk.query('regression == @best_model_tags[0].lower() and freq == @best_model_tags[-1] '
-                                 'and market == @best_market') for chunk in chunks)
+    data_per_target = dict()
+    for target, values in mase_comparison.items():
+        chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
+        tmp = pd.concat(chunk.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
+                        for chunk in chunks)
+        data_per_target[target] = tmp
+    data = pd.concat(data_per_target.values())
     data = data.set_index('timestamp')
     data.index = pd.to_datetime(data.index, utc=True)
     data = data.rename(columns={'y_hat': 'forecast', 'y': 'values'})
