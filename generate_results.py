@@ -19,7 +19,7 @@ from neuralforecast.losses.pytorch import MSE
 from tqdm.auto import tqdm
 from tqdm_joblib import tqdm_joblib
 import random
-from constants import ENGINE, EARLY_STOPPING_PATIENCE
+from constants import EARLY_STOPPING_PATIENCE
 
 
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
@@ -27,9 +27,7 @@ regression_dd = {'ml': ['LGBMRegressor', 'Lasso'], 'dl': ['SOFTS']}
 rng = random.Random(123)
 
 
-
-def winsorise_vectorized(df: pd.DataFrame, group_col: str = 'unique_id',
-                         exclude_cols=('ds',)) -> pd.DataFrame:
+def winsorise_vectorized(df: pd.DataFrame, group_col: str = 'unique_id', exclude_cols=('ds',)) -> pd.DataFrame:
     df = df.copy()
     excluded = {group_col, *exclude_cols}
     value_cols = [c for c in df.columns if c not in excluded]
@@ -96,7 +94,7 @@ def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
                             model_names, n_heads, n_steps_ahead_scaler, **kwargs):
     jittered_X = test_X.copy()
     full_mase_mean_shuffled = pd.DataFrame()
-    n_iter = 3
+    n_iter = 50
     jitter = np.random.normal(size=(jittered_X[col].shape[0], n_iter))
     original_col = test_X[col].copy()
     for i in range(n_iter):
@@ -264,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
     parser.add_argument('--to_csv', type=int, help='Saving results in .csv files or not', default=1)
-    parser.add_argument('--options', type=int, default=1, help='Add option features or not.')
+    parser.add_argument('--options', type=int, default=0, help='Add option features or not.')
     parser.add_argument('--D', type=str, help='Parameter controlling forcasting horizon.')
     parser.add_argument('--cpu_count', type=int, default=10,
                         help='Number of processes to use for the pipeline.')
