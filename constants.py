@@ -6,11 +6,10 @@ MAX_ITER = 250
 N_TRIALS = 100
 N_JOBS = 1
 EPOCH = 50
-EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_PATIENCE = 10
 DATE_FORMAT = '%Y-%m-%d'
-DAYS_CONVERTER = {'1D': 1, '1W': 7, '1M': 30, '3M': 90, '6M': 180, '1Y': 360}
+DAYS_CONVERTER = {'1d': 1, '1D': 1, '1w': 7, '1W': 7, '1m': 30, '1M': 30, '3M': 90,}
 FREQUENCY_CONVERTER = {'1D': 360, '1W': 52}
-# Maturity tags
 zeroDTE, SHORT, MID = 1/360, 7/360, 30/360
 MATURITY_BINS = [-np.inf, zeroDTE, SHORT, MID, np.inf]
 MATURITY_LABELS = ['0DTE', 'Short', 'Mid', 'Long']
@@ -22,22 +21,12 @@ SUPERSCRIPT = {1: 'st', 2: 'nd', 3: 'rd'}
 EXPOSURE = ['gex', 'vax', 'vex', 'vox']
 GREEKS_EXPOSURE = {exp: greek for exp, greek in zip(['gex'], ['gamma'])}
 GREEKS_EXPOSURE.update({exp: None for exp in EXPOSURE[1:]})
-# Transaction costs
 FEES_SPOT = .0003
 FEES_OPTIONS = .125
-# Core lags
-INTRADAY_LAGS = ['15min', '30min', '1h', '1D']
+INTRADAY_LAGS = ['15min', '30min', '1h', '3h', '6h', '1D']
 INTERDAY_LAGS = ['1W', '1M']
-# Volatility regimes
 VOL_REGIMES = ['Low', 'Normal', 'High']
-# Number of times features get shuffled
-N_SHUFFLES = 50
-# Params for DL architecture
-PARAMS_DL = {'hidden_size': [128, 256, 512], 'num_layers': [2, 3],
-             'learning_rate': [1e-4, 1e-3], 'beta': list(np.linspace(1, 10, 10)), 'dropout': [.1, .2],
-             'batch_size': [512]}
 MARKETS = {'returns': 'spot', 'RV': 'options'}
-# Font sizes for plots
 TITLE_FONT_SIZE = 40
 LABEL_AXIS_FONT_SIZE = 30
 LEGEND_FONT_SIZE = 20
@@ -49,5 +38,10 @@ HIGH_ATM_MONEYNESS = 1.15
 ATM_MONEYNESSES = \
     np.log(np.linspace(LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, int(100*(HIGH_ATM_MONEYNESS-LOW_ATM_MONEYNESS)+1)))
 BINARY_PATTERN = ['retail', 'informed', 'institutions', 'is_']
-ENGINE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = 'cpu'
+if torch.cuda.is_available():
+    ENGINE = 'cuda'
+elif torch.backends.mps.is_available():
+    ENGINE = 'mps'
 model_names = {'Lasso': 'lasso', 'LGBMRegressor': 'lightgbm', 'SOFTS': 'softs'}
+OPTION_PREFIXES = ('gex', 'vax', 'vex', 'vox', 'pcr', 'spread_', 'is_retail', 'is_informed', 'is_institutional')

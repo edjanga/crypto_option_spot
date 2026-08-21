@@ -2,34 +2,10 @@ from constants import *
 from itertools import product
 import pandas as pd
 import torch
-from typing import List, Tuple
+from typing import List
 import polars as pl
-import statsmodels.api as sm
-
+from constants import DEVICE
 torch.set_float32_matmul_precision('high')
-DEVICE = 'cpu'
-if torch.backends.mps.is_available():
-    DEVICE = 'mps'
-elif torch.cuda.is_available():
-    DEVICE = 'cuda'
-
-
-def run_pnl_ols(x, data, targets, pnl) -> pd.Series|pd.DataFrame:
-    list_factors = x.features.values.tolist()
-    target = x.target.unique()[0]
-    targets = targets.xs(target, axis=1, level=-1).filter(regex='|'.join(list_factors)).unstack()
-    targets = targets.loc[targets.index.get_level_values(0).isin(list_factors)]
-    X = data.filter(regex='|'.join(list_factors))
-    pnl = pnl.xs(x.name[1], axis=1, level=1).xs(x.name[-1], axis=0, level=1).stack()
-    pnl.name = 'P&L'
-    X = pnl.reset_index(0).swaplevel(0, 1).join(X, on=['underlying_name', 'timestamp']).set_index('aggregated',
-                                                                                                  append=True)
-    X['P&L'] = X['P&L'] + np.random.uniform(0, 1e-8, X.shape[0])
-    X = X.apply(lambda x: pd.to_numeric(x, errors='coerce').astype('float32'))
-    X = (X - X.min()).div(X.max()-X.min()).replace([-np.inf, np.inf], np.nan).dropna()
-    params = sm.OLS(X['P&L'], sm.add_constant(X.drop(columns=['P&L']))).fit().params
-    params.index = ['α'] + [f'β<sub>{i}</sub>' for i in range(1, params.shape[0])]
-    return params
 
 
 class FeatureBuilder:
@@ -154,7 +130,7 @@ class FeatureBuilder:
                                          pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by=['underlying_name', 'type']).agg(
             pl.col('moneyness_label').mode())
-        mkt_participants = mkt_participants.collect(engine=ENGINE).to_pandas()
+        mkt_participants = mkt_participants.collect(engine=DEVICE).to_pandas()
         mkt_participants.moneyness_label = [participants[0] for participants in mkt_participants.moneyness_label]
         mkt_participants = pl.from_dataframe(mkt_participants)
         mkt_participants_call = mkt_participants.filter(pl.col('type') == 'call').drop('type')
@@ -175,34 +151,6 @@ class FeatureBuilder:
         mkt_participants_put = mkt_participants_put.drop('moneyness_label')
         mkt_participants = mkt_participants.join(mkt_participants_put, on=['underlying_name', 'timestamp'])
         return mkt_participants
-
-
-class PnLExplained:
-
-    def __init__(self, underlying_returns: pd.DataFrame, underlying_rv: pd.DataFrame):
-        self._returns = underlying_returns.set_index('timestamp')
-        self._rv = underlying_rv.set_index('timestamp')
-
-    def resample_moments(self, freq: str) -> None:
-        self._returns = self._returns.resample(freq).sum()
-        self._rv = self._rv.resample(freq).sum()
-
-    def pnl_analysis(self, pnl: pd.DataFrame, ranking: pd.DataFrame,
-                     features: pd.DataFrame, targets: pd.DataFrame, freq: str) -> Tuple[pd.DataFrame]:
-        self.resample_moments(freq)
-        rv_mkt = pd.qcut(self._rv.mean(axis=1), q=[0, .45, .9, 1], labels=VOL_REGIMES)
-        rv_mkt.name = 'volatility_regime'
-        ranking['features'] = ranking.features.str.replace(r'^is_(BTCUSDT|ETHUSDT|XRPUSDT|BNBUSDT|SOLUSDT)$', r'\1',
-                                                           regex=True)
-        ranking['features'] = \
-            ['_'.join(name.split('_')[:-1]+[name.split('_')[-1].upper()])
-             if ('_1m' in name) | ('_1w' in name) | ('_1d' in name) else name for name in ranking['features']]
-        factor_analysis = ranking.groupby(by=[pd.Grouper(key='volatility_regime'), pd.Grouper(key='D'),
-                                              pd.Grouper(key='target')],
-                                          group_keys=True).apply(
-            lambda x, data, targets, pnl: run_pnl_ols(x, data, targets, pnl), data=features,
-            targets=targets.xs('1D', axis=1, level=-1), pnl=pnl).unstack()
-        return factor_analysis
 
 
 

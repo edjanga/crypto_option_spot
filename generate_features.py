@@ -13,7 +13,6 @@ from itertools import product
 from typing import List
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-LAGS = INTRADAY_LAGS+INTERDAY_LAGS
 
 
 def return_filename(filename: str) -> str:
@@ -102,11 +101,18 @@ if __name__ == '__main__':
                                                  .then(-1).otherwise(None).alias('trades'))
                     is_put = pl.col('type') == 'put'
                     is_call = ~is_put
-                    tmp_options = \
-                        tmp_options.with_columns(
-                            pl.when(is_put).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS))
-                            .when(is_call).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
-                            .otherwise(None).alias('moneyness_label'))
+                    # tmp_options = \
+                    #     tmp_options.with_columns(
+                    #         pl.when(is_put).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS))
+                    #         .when(is_call).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
+                    #         .otherwise(None).alias('moneyness_label'))
+                    moneyness_dtype = pl.Enum(LABELS)
+                    tmp_options = tmp_options.with_columns(
+                        pl.when(is_put).then(
+                            pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS).cast(moneyness_dtype))
+                        .when(is_call).then(
+                            pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]).cast(moneyness_dtype))
+                        .otherwise(None).alias('moneyness_label'))
                     tmp_options = tmp_options.filter(pl.col('trades').is_not_null())
                     tmp_options = \
                         tmp_options.with_columns(-(pl.col('volume') * pl.col('trades')).alias('netDealerExposure'))
