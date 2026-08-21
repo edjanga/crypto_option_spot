@@ -1,7 +1,5 @@
-import concurrent.futures
 import datetime
 import itertools
-import sqlite3
 import os
 import numpy as np
 import pandas as pd
@@ -15,6 +13,7 @@ from pandas.api.types import CategoricalDtype
 import polars as pl
 from itertools import product
 import argparse
+import concurrent
 
 
 ########################################################################################################################
@@ -22,16 +21,16 @@ import argparse
 ########################################################################################################################
 
 
-# def process_daily_option_chain_date(date: datetime.datetime, directory: str,
-#                                     freq: str) -> Tuple[datetime.datetime, pl.LazyFrame]:
-#     print(f'Option chain data for {date.strftime(DATE_FORMAT)} is being generated.........')
-#     option_chain_data = pl.scan_parquet(f'{directory}/*/{date.year}/options/{date.strftime(DATE_FORMAT)}')
-#     option_chain_data = option_chain_data.sort(['underlying_name', 'timestamp'])
-#     option_chain_data = (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
-#                                                             group_by='underlying_name', include_boundaries=False,
-#                                                             period=None).agg([pl.all().last()]))
-#     print(f'Option chain data for {date.strftime(DATE_FORMAT)} has been generated.')
-#     return date, option_chain_data
+def process_daily_option_chain_date(date: datetime.datetime, directory: str,
+                                    freq: str) -> Tuple[datetime.datetime, pl.LazyFrame]:
+    print(f'Option chain data for {date.strftime(DATE_FORMAT)} is being generated.........')
+    option_chain_data = pl.scan_parquet(f'{directory}/*/{date.year}/options/{date.strftime(DATE_FORMAT)}')
+    option_chain_data = option_chain_data.sort(['underlying_name', 'timestamp'])
+    option_chain_data = (option_chain_data.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
+                                                            group_by='underlying_name', include_boundaries=False,
+                                                            period=None).agg([pl.all().last()]))
+    print(f'Option chain data for {date.strftime(DATE_FORMAT)} has been generated.')
+    return date, option_chain_data
 
 
 def daily_date_sym_option_type(date_sym_option_type: List[str]):
@@ -251,107 +250,102 @@ class FrameworkApplication:
     def underlying_rv(self) -> pd.DataFrame:
         return self._underlying_rv
 
-    # @staticmethod
-    # def process_daily_option_chain(freq: str, directory: str, date_range: pd.DatetimeIndex) -> None:
-    #     for date in date_range:
-    #         # if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
-    #         #     date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
-    #         #     daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
-    #         #     daily_option_chain_date = daily_option_chain_date.with_columns(
-    #         #         ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
-    #         #     FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
-    #         #     os.makedirs(f'{directory}/option_chain', exist_ok=True)
-    #         #     FrameworkApplication._option_chain[date.date()].to_parquet(
-    #         #         f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
-    #         # else:
-    #         try:
-    #             tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
-    #                                      f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
-    #         except FileNotFoundError:
-    #             tmp_df = pd.read_parquet(f"{directory}/{date.year-1}/options/"
-    #                                      f"{(date - relativedelta(days=1)).strftime(DATE_FORMAT)}")
-    #         tmp_df['tau'] = (tmp_df['expiration'] - tmp_df['timestamp']).dt.total_seconds() / (60 * 60 * 24 * 360)
-    #         tmp_df = tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last()
-    #         sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
-    #         tmp_df['d1'] = (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
-    #                         0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
-    #         tmp_df['d1'] = tmp_df['d1'] / sqrt_term
-    #         tmp_df['d2'] = tmp_df['d1'] - sqrt_term
-    #         tmp_df['bs_price'] = (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
-    #                               tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
-    #         tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
-    #         tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
-    #         FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
-    #     return None
-    #
-    # @staticmethod
-    # def iv_regression(freq: str) -> None:
-    #     symbol = data.columns.get_level_values(1).unique().tolist()
-    #     iv_interpolation_data = \
-    #         dict([(sym, dict([(option_type, None) for option_type in ['call', 'put']])) for sym in symbol])
-    #     date_sym_option_type = \
-    #         list(itertools.product(FrameworkApplication._option_chain.keys(), symbol, ['call', 'put']))
-    #     for daily_date_sym_option_type_ls in date_sym_option_type:
-    #         if not FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].empty:
-    #             daily_option_chain = FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].query(
-    #                         f'underlying_name == "{daily_date_sym_option_type_ls[1]}"')
-    #             if not daily_option_chain.empty:
-    #                 sym, option_type, betas = \
-    #                     iv_regression_per_option_type(daily_option_chain, daily_date_sym_option_type_ls[2], freq)
-    #                 if iv_interpolation_data[sym][option_type] is None:
-    #                     iv_interpolation_data[sym][option_type] = betas
-    #                 else:
-    #                     iv_interpolation_data[sym][option_type] = \
-    #                         pd.concat([iv_interpolation_data[sym][option_type], betas])
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(symbol), os.cpu_count() - 2)) as executor3:
-    #         futures3 = [executor3.submit(lambda x: x, x=sym) for sym in symbol]
-    #         for future3 in concurrent.futures.as_completed(futures3):
-    #             sym = future3.result()
-    #             try:
-    #                 iv_interpolation_data[sym] = pd.concat(iv_interpolation_data[sym], axis=1)
-    #             except ValueError:
-    #                 iv_interpolation_data.pop(sym)
-    #                 continue
-    #     FrameworkApplication._iv_interpolation_coef = pd.concat(iv_interpolation_data, axis=1)
-    #     FrameworkApplication._iv_interpolation_coef = \
-    #         FrameworkApplication._iv_interpolation_coef.groupby(
-    #             FrameworkApplication._iv_interpolation_coef.index).last()
-    #     return pd.concat(iv_interpolation_data, axis=1).ffill()
-    #
-    # @staticmethod
-    # def svix(freq: str, aggregated: bool = True) -> pd.DataFrame:
-    #     iv_interpolation_coef = FrameworkApplication._iv_interpolation_coef
-    #     svix = dict([(D, list()) for D in ['1d', '1w', '1m']])
-    #     dates = list(FrameworkApplication._option_chain.keys())
-    #     date_range_D = list(itertools.product(dates, ['1d', '1w', '1m']))
-    #     for date_D in date_range_D:
-    #         svix_s, D = svix_daily(date_D[0], FrameworkApplication._option_chain[date_D[0]],
-    #                                iv_interpolation_coef.loc[iv_interpolation_coef.index.date == date_D[0]],
-    #                                date_D[1], freq, aggregated)
-    #         svix[D].append(svix_s)
-    #     for D in svix.keys():
-    #         svix[D] = pd.concat(svix[D])
-    #         if aggregated:
-    #             svix[D].name = D
-    #     svix = pd.concat(svix, axis=1)
-    #     svix.index = pd.to_datetime(svix.index, utc=True)
-    #     svix.index.name = 'timestamp'
-    #     return svix
+    @staticmethod
+    def process_daily_option_chain(freq: str, directory: str, date_range: pd.DatetimeIndex) -> None:
+        for date in date_range:
+            if not os.path.exists(f'{directory}/{date.year}/option_chain/{date.strftime(DATE_FORMAT)}'):
+                date, daily_option_chain_date = process_daily_option_chain_date(date, directory, freq)
+                daily_option_chain_date = daily_option_chain_date.filter(pl.col('underlying_name').is_in(SYMBOLS))
+                daily_option_chain_date = daily_option_chain_date.with_columns(
+                    ((pl.col('expiration')-pl.col('timestamp')).dt.total_days() / 360).alias('tau'))
+                FrameworkApplication._option_chain[date.date()] = daily_option_chain_date.collect().to_pandas()
+                os.makedirs(f'{directory}/option_chain', exist_ok=True)
+                FrameworkApplication._option_chain[date.date()].to_parquet(
+                    f'{directory}/option_chain/{date.strftime(DATE_FORMAT)}')
+            else:
+                try:
+                    tmp_df = pd.read_parquet(f"{directory}/{date.year}/options/"
+                                             f"{(date-relativedelta(days=1)).strftime(DATE_FORMAT)}")
+                except FileNotFoundError:
+                    tmp_df = pd.read_parquet(f"{directory}/{date.year-1}/options/"
+                                             f"{(date - relativedelta(days=1)).strftime(DATE_FORMAT)}")
+            tmp_df['tau'] = (tmp_df['expiration'] - tmp_df['timestamp']).dt.total_seconds() / (60 * 60 * 24 * 360)
+            tmp_df = tmp_df.set_index('timestamp').groupby('symbol').resample(freq.replace('in', '')).last()
+            sqrt_term = np.sqrt(tmp_df['mark_iv'] * tmp_df['tau'])
+            tmp_df['d1'] = (np.log(tmp_df['underlying_price'] / tmp_df['strike_price']) +
+                            0.5 * tmp_df['mark_iv'] * tmp_df['tau'])
+            tmp_df['d1'] = tmp_df['d1'] / sqrt_term
+            tmp_df['d2'] = tmp_df['d1'] - sqrt_term
+            tmp_df['bs_price'] = (tmp_df['underlying_price'] * norm.cdf(tmp_df['d1']) -
+                                  tmp_df['strike_price'] * norm.cdf(tmp_df['d2']))
+            tmp_df['mid_price'] = tmp_df['mid_price'].fillna(tmp_df['bs_price'])
+            tmp_df = tmp_df.drop(columns=['bs_price', 'd1', 'd2'])
+            FrameworkApplication._option_chain[(date-relativedelta(days=1)).date()] = tmp_df
+        return None
 
+    @staticmethod
+    def iv_regression(freq: str) -> None:
+        symbol = SYMBOLS
+        iv_interpolation_data = \
+            dict([(sym, dict([(option_type, None) for option_type in ['call', 'put']])) for sym in symbol])
+        date_sym_option_type = \
+            list(itertools.product(FrameworkApplication._option_chain.keys(), symbol, ['call', 'put']))
+        for daily_date_sym_option_type_ls in date_sym_option_type:
+            if not FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].empty:
+                daily_option_chain = FrameworkApplication._option_chain[daily_date_sym_option_type_ls[0]].query(
+                            f'underlying_name == "{daily_date_sym_option_type_ls[1]}"')
+                if not daily_option_chain.empty:
+                    sym, option_type, betas = \
+                        iv_regression_per_option_type(daily_option_chain, daily_date_sym_option_type_ls[2], freq)
+                    if iv_interpolation_data[sym][option_type] is None:
+                        iv_interpolation_data[sym][option_type] = betas
+                    else:
+                        iv_interpolation_data[sym][option_type] = \
+                            pd.concat([iv_interpolation_data[sym][option_type], betas])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(symbol), os.cpu_count() - 2)) as executor3:
+            futures3 = [executor3.submit(lambda x: x, x=sym) for sym in symbol]
+            for future3 in concurrent.futures.as_completed(futures3):
+                sym = future3.result()
+                try:
+                    iv_interpolation_data[sym] = pd.concat(iv_interpolation_data[sym], axis=1)
+                except ValueError:
+                    iv_interpolation_data.pop(sym)
+                    continue
+        FrameworkApplication._iv_interpolation_coef = pd.concat(iv_interpolation_data, axis=1)
+        FrameworkApplication._iv_interpolation_coef = \
+            FrameworkApplication._iv_interpolation_coef.groupby(
+                FrameworkApplication._iv_interpolation_coef.index).last()
+        return pd.concat(iv_interpolation_data, axis=1).ffill()
 
-    @property
-    def db_connect(self) -> sqlite3.Connection:
-        return self._db_connect
+    @staticmethod
+    def svix(freq: str, aggregated: bool = True) -> pd.DataFrame:
+        iv_interpolation_coef = FrameworkApplication._iv_interpolation_coef
+        svix = dict([(D, list()) for D in ['1d', '1w', '1m']])
+        dates = list(FrameworkApplication._option_chain.keys())
+        date_range_D = list(itertools.product(dates, ['1d', '1w', '1m']))
+        for date_D in date_range_D:
+            svix_s, D = svix_daily(date_D[0], FrameworkApplication._option_chain[date_D[0]],
+                                   iv_interpolation_coef.loc[iv_interpolation_coef.index.date == date_D[0]],
+                                   date_D[1], freq, aggregated)
+            svix[D].append(svix_s)
+        for D in svix.keys():
+            svix[D] = pd.concat(svix[D])
+            if aggregated:
+                svix[D].name = D
+        svix = pd.concat(svix, axis=1)
+        svix.index = pd.to_datetime(svix.index, utc=True)
+        svix.index.name = 'timestamp'
+        return svix
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all performance tables.')
-    parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-01')
+    parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-02')
     parser.add_argument('--end_date', type=str, help='End date.', default='2025-07-01')
     parser.add_argument('--top_features', type=int,
                         help='Number of top features to consider in feature importance analysis', default=5)
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
-                        default='../data_centre')
+                        default='./data_centre')
     parser.add_argument('--type', type=str, help='Type of table to generate', default='mase_reporting')
     args = parser.parse_args()
     print(args)
@@ -396,228 +390,157 @@ if __name__ == '__main__':
                 mase_per_regression_freq_pair_file_tmp.writelines(
                     model_ranking_tmp.unstack(0).droplevel(axis=1, level=0).loc[
                     ['1h', '3h', '6h'], ['lasso', 'lightgbm', 'softs']].to_latex())
-    best_model_tags = list(model_ranking.sort_values(by='MASE').index[0])
-    mase_comparison = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
-    mase_comparison = \
-        mase_comparison.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
-    mase_comparison['timestamp'] = pd.to_datetime(mase_comparison['timestamp'], utc=True)
-    mase_comparison = mase_comparison.set_index(['D', 'timestamp'])
+    best_model_tags = model_ranking.groupby('target').idxmin().to_dict()['MASE']
     mase_comparison = \
         model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
-    best_model = mase.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
     data_per_target = dict()
     for target, values in mase_comparison.items():
         chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
         tmp = pd.concat(chunk.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
                         for chunk in chunks)
+        tmp = tmp.rename(columns={'y_hat': 'forecast', 'y': 'values'})
+        tmp = tmp.set_index('timestamp')
+        tmp.index = pd.to_datetime(tmp.index, utc=True)
+        tmp = pd.pivot_table(data=tmp, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
+                             index='timestamp')
         data_per_target[target] = tmp
-    data = pd.concat(data_per_target.values())
-    data = data.set_index('timestamp')
-    data.index = pd.to_datetime(data.index, utc=True)
-    data = data.rename(columns={'y_hat': 'forecast', 'y': 'values'})
-    data = \
-        pd.pivot_table(data=data, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
-                       index='timestamp')
-    framework_application_obj.data = data.resample(best_model_tags[-1]).sum().dropna()
-    scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags[-1])
+    framework_application_obj.data = data_per_target
+    scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags['RV'][-1])
     rv_idx = pd.IndexSlice
-    data.loc[:, rv_idx[:, :, 'RV', :]] = data.loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor ** .5)
-    framework_application_obj.symbol = framework_application_obj.data.columns.get_level_values(1).unique().tolist()
+    data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :]] = \
+        data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor ** .5)
+    framework_application_obj.symbol = SYMBOLS
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
-    # framework_application_obj.process_daily_option_chain(best_model_tags[-1], f'{args.target_path}', date_range)
+    framework_application_obj.process_daily_option_chain(best_model_tags['RV'][-1],
+                                                         f'{args.target_path}', date_range)
     ####################################################################################################################
     ## MASE Reporting
     ####################################################################################################################
     if args.type == 'mase_reporting':
-        if os.path.exists(f'{args.target_path}/crypto_option_spot/metric.csv'):
-            mase_comparison = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
-            mase_comparison = \
-                mase_comparison.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
-        else:
-            mase_comparison = \
-                pd.read_sql(con=framework_application_obj.db_connect,
-                            sql=f'SELECT "timestamp","MASE","regression","target","D","market","freq","volatility_regime" '
-                                f'FROM metric WHERE regression="{best_model_tags[0]}" AND freq="{best_model_tags[-1]}";')
-        mase_comparison['timestamp'] = pd.to_datetime(mase_comparison['timestamp'], utc=True)
-        mase_comparison = mase_comparison.set_index(['D', 'timestamp'])
-        mase_comparison = mase_comparison.groupby(by=pd.Grouper(key='market'))['MASE'].mean()
-        best_market = mase_comparison.idxmin()
-        best_model = mase.query(f'(regression == "{best_model_tags[0]}") & (freq == "{best_model_tags[-1]}")')
-        mase_global = \
-            best_model.groupby(by=[pd.Grouper(level='D'), pd.Grouper(key='volatility_regime'),
-                                   pd.Grouper(key='market')])[['MASE']].mean().reset_index()
-        mase_global['D'] = mase_global['D'].transform(lambda x: f'<i>{x.lower()}</i>')
-        mase_global['market'] = np.where(mase_global['market'] == 1, '<i>X<sup>(S,O)</sup></i>', '<i>X<sup>S</sup></i>')
-        mase_conditional = \
-            best_model.groupby(by=[pd.Grouper(level='D'),
-                                   pd.Grouper(key='volatility_regime'), pd.Grouper(key='market')])[['MASE']].mean()
-        mase_conditional_copy = mase_conditional.copy()
-        mase_conditional_copy = \
-            mase_conditional.groupby(by=[pd.Grouper(level='D'),
-                                         pd.Grouper(level='volatility_regime')],
-                                     group_keys=False).apply(lambda x: 100 * x.pct_change()).round(4)
-        mase_conditional = mase_conditional_copy.fillna(mase_conditional)
-        mase_conditional = mase_conditional.unstack([1, -1])
-        mase_conditional = mase_conditional.loc[:, [('MASE', 'Low', 0), ('MASE', 'Low', 1),
-                                                    ('MASE', 'Normal', 0), ('MASE', 'Normal', 1),
-                                                    ('MASE', 'High', 0), ('MASE', 'High', 1)]]
-        mase_conditional.index = mase_conditional.index.str.lower()
-        mase_conditional = mase_conditional.loc[d_order.categories, :]
-        mase_conditional.loc[:, mase_conditional.columns.get_level_values(2) == 1] = \
-            mase_conditional.loc[:, mase_conditional.columns.get_level_values(2) == 1].round(2)
-        mase_conditional.columns = mase_conditional.columns.set_names('Market Regimes', level=0)
-        mase_unconditional = best_model.groupby(by=[pd.Grouper(level='D'), pd.Grouper(key='market')])[['MASE']].mean()
-        mase_unconditional_copy = mase_unconditional.copy()
-        mase_unconditional = mase_unconditional.groupby(by=pd.Grouper(level='D'), group_keys=False).apply(
-            lambda x: 100 * x.pct_change()).round(4)
-        mase_unconditional = mase_unconditional.fillna(mase_unconditional_copy)
-        mase_unconditional = mase_unconditional.unstack(-1)
-        mase_unconditional.index = mase_unconditional.index.str.lower()
-        mase_unconditional = mase_unconditional.loc[d_order.categories, :]
-        mase_unconditional.columns = pd.MultiIndex.from_product([['MASE'], [''], [0, 1]],
-                                                                names=['Market Regimes', 'volatility_regime', 'market'])
-        mase_performance = pd.concat([mase_unconditional, mase_conditional], axis=1)
-        mase_performance = mase_performance.style.format(decimal='.', thousands=',', precision=4)
-        with open(f'{args.target_path}/crypto_option_spot/mase_performance.txt', 'w') as mase_performance_file:
-            mase_performance_file.writelines(mase_performance.to_latex())
-    ####################################################################################################################
-    ## Factor Analysis
-    ####################################################################################################################
-    if args.type == 'features_importance':
-        ################################################################################################################
-        ## Features and target values
-        ################################################################################################################
-        if os.path.exists(f'{args.target_path}/spot_features.csv'):
-            features = pd.read_csv(f'{args.target_path}/spot_features.csv')
-        else:
-            features = pd.read_sql(con=framework_application_obj.db_connect, sql='SELECT * FROM spot_features;')
-        features['timestamp'] = pd.to_datetime(features['timestamp'], utc=pytz.UTC)
-        targets = features[['underlying_name', 'timestamp', 'target', 'target_values']]
-        targets = pd.pivot_table(targets, index=['target', 'timestamp'], columns='underlying_name',
-                                 values='target_values')
-        features = features.drop(['target', 'target_values'], axis=1)
-        features = pd.pivot_table(features, index=['underlying_name', 'timestamp'], columns='features',
-                                  values='features_values')
-        ################################################################################################################
-        ## Feature importance
-        ################################################################################################################
-        if os.path.exists(f'{args.target_path}/crypto_option_spot/option_features.csv'):
-            option_features = pd.read_csv(f'{args.target_path}/crypto_option_spot/option_features.csv')
-        else:
-            option_features = pd.read_sql(con=framework_application_obj.db_connect,
-                                          sql='SELECT * FROM option_features;')
-        option_features['timestamp'] = pd.to_datetime(option_features['timestamp'], utc=pytz.UTC)
-        option_features = pd.pivot_table(option_features, index=['underlying_name', 'timestamp'], columns='features',
-                                         values='features_values')
-        features = features.join(option_features)
-        if os.path.exists(f'{args.target_path}/crypto_option_spot/features_importance.csv'):
-            feature_importance = pd.read_csv(f'{args.target_path}/crypto_option_spot/features_importance.csv')
-            feature_importance = \
-                feature_importance.query(
-                    f'regression == "{best_model_tags[0].lower()}" & '
-                    f'(freq == "{best_model_tags[-1]}") & (market == {best_market})').drop('volatility_regime', axis=1)
-        else:
-            feature_importance = pd.read_sql(con=framework_application_obj.db_connect,
-                                             sql=f'SELECT "features","D","freq","market","MASE","target","timestamp" '
-                                                 f"FROM features_importance "
-                                                 f"WHERE regression = '{best_model_tags[0].lower()}' AND "
-                                                 f"freq = '{best_model_tags[-1]}' AND market = '{best_market}'")
-        feature_importance = feature_importance.drop(['freq', 'market'], axis=1)
-        feature_importance['timestamp'] = pd.to_datetime(feature_importance['timestamp'], utc=pytz.UTC)
-        feature_importance = feature_importance.set_index(['D', 'timestamp'])
-        feature_importance = \
-            pd.concat([feature_importance, volatility_regime.reindex(feature_importance.index).ffill()], axis=1)
-        feature_importance_ranking = feature_importance.groupby(by=[pd.Grouper(key='target'),
-                                                                    pd.Grouper(key='volatility_regime'),
-                                                                    pd.Grouper(key='features'),
-                                                                    pd.Grouper(level='D')])[['MASE']].mean().dropna()
-        feature_importance_ranking = \
-            feature_importance_ranking.groupby(by=[pd.Grouper(level='target'), pd.Grouper(level='volatility_regime'),
-                                                   pd.Grouper(level='D')],
-                                               group_keys=False).apply(
-                lambda g: g.nlargest(top_features, 'MASE')).reset_index()
-        feature_importance_ranking = \
-            feature_importance_ranking.sort_values('MASE', ascending=False).groupby(
-                ['target', 'D', 'volatility_regime'],
-                group_keys=False).apply(
-                lambda g: g.assign(rank=g['MASE'].rank(method='first', ascending=False).astype(int).astype(str)))
-        feature_importance_ranking['features'] = \
-            feature_importance_ranking.features.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
-                                                            regex=True)
-        feature_importance_ranking['D'] = feature_importance_ranking['D'].str.lower()
+        metric_per_target = dict()
+        for target, values in mase_comparison.items():
+            chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv', chunksize=1_000_000)
+            tmp = pd.concat(chunk.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
+                            for chunk in chunks)
+            metric_per_target[target] = tmp
+        mase_comparison = pd.concat(metric_per_target.values())
+        for target, values in best_model_tags.items():
+            regression = best_model_tags[target][1]
+            freq = best_model_tags[target][-1]
+            best_model = mase_comparison.query('regression == @regression and freq == @freq and target == @target')
+            mase_global = \
+                best_model.groupby(by=[pd.Grouper(key='D'), pd.Grouper(key='volatility_regime'),
+                                       pd.Grouper(key='market')])[['MASE']].mean().reset_index()
+            mase_global['D'] = mase_global['D'].transform(lambda x: f'<i>{x.lower()}</i>')
+            mase_global['market'] = \
+                np.where(mase_global['market'] == 1, '<i>X<sup>(S,O)</sup></i>', '<i>X<sup>S</sup></i>')
+            mase_conditional = \
+                best_model.groupby(by=[pd.Grouper(key='D'),
+                                       pd.Grouper(key='volatility_regime'), pd.Grouper(key='market')])[['MASE']].mean()
+            mase_conditional_copy = mase_conditional.copy()
+            mase_conditional_copy = \
+                mase_conditional.groupby(by=[pd.Grouper(level='D'),
+                                             pd.Grouper(level='volatility_regime')],
+                                         group_keys=False).apply(lambda x: 100 * x.pct_change()).round(4)
+            mase_conditional = mase_conditional_copy.fillna(mase_conditional)
+            mase_conditional = mase_conditional.unstack([1, -1])
+            mase_conditional = mase_conditional.loc[:, [('MASE', 'Low', 0), ('MASE', 'Low', 1),
+                                                        ('MASE', 'Normal', 0), ('MASE', 'Normal', 1),
+                                                        ('MASE', 'High', 0), ('MASE', 'High', 1)]]
+            mase_conditional.index = mase_conditional.index.str.lower()
+            mase_conditional = mase_conditional.loc[d_order.categories, :]
+            mase_conditional.loc[:, mase_conditional.columns.get_level_values(2) == 1] = \
+                mase_conditional.loc[:, mase_conditional.columns.get_level_values(2) == 1].round(2)
+            mase_conditional.columns = mase_conditional.columns.set_names('Market Regimes', level=0)
+            mase_unconditional = best_model.groupby(by=[pd.Grouper(key='D'), pd.Grouper(key='market')])[['MASE']].mean()
+            mase_unconditional_copy = mase_unconditional.copy()
+            mase_unconditional = mase_unconditional.groupby(by=pd.Grouper(level='D'), group_keys=False).apply(
+                lambda x: 100 * x.pct_change()).round(4)
+            mase_unconditional = mase_unconditional.fillna(mase_unconditional_copy)
+            mase_unconditional = mase_unconditional.unstack(-1)
+            mase_unconditional.index = mase_unconditional.index.str.lower()
+            mase_unconditional = mase_unconditional.loc[d_order.categories, :]
+            mase_unconditional.columns = \
+                pd.MultiIndex.from_product([['MASE'], [''], [0, 1]],
+                                           names=['Market Regimes', 'volatility_regime', 'market'])
+            mase_performance = pd.concat([mase_unconditional, mase_conditional], axis=1)
+            mase_performance = mase_performance.style.format(decimal='.', thousands=',', precision=4)
+            with open(f'{args.target_path}/crypto_option_spot/mase_performance_{target}.txt', 'w') as \
+                    mase_performance_file:
+                mase_performance_file.writelines(mase_performance.to_latex())
     ####################################################################################################################
     ## SVIX
     ####################################################################################################################
-    # if args.type == 'svix_rv_vrp_effect':
-    #     if os.path.exists(f'{args.target_path}/crypto_option_spot/svix.csv'):
-    #         svix = pd.read_csv(f'{args.target_path}/crypto_option_spot/svix.csv', index_col='index')
-    #         svix['svix'] = svix['svix']/100
-    #         svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=True)
-    #         svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
-    #         svix_agg = \
-    #             pd.concat([svix.xs(1, axis=0, level=0,
-    #                                drop_level=False).droplevel(axis=0, level=1).assign(underlying_name=underlying_name)
-    #                        for underlying_name in SYMBOLS]).set_index('underlying_name', append=True)
-    #         svix_agg = svix_agg.swaplevel(-1, 1).swaplevel(-1, 2)
-    #         svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
-    #         svix = pd.concat([svix_agg, svix_non_agg]).reset_index()
-    #     else:
-    #         framework_application_obj.iv_regression(best_model_tags[-1])
-    #         for aggregated in [True, False]:
-    #             svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
-    #             svix = ((scaling_factor * svix2) ** .5).unstack()
-    #             svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
-    #                 svix.index.set_names(['D', 'underlying_name', 'timestamp'])
-    #             svix.name = 'svix'
-    #             svix = pd.DataFrame(svix.reset_index())
-    #             if aggregated:
-    #                 svix = svix.assign(underlying_name=None)
-    #             svix.assign(aggregated={True: 1, False: 0}[aggregated]).to_sql(
-    #                 con=framework_application_obj.db_connect, name=f'svix', if_exists='append')
-    #             print(f'[Insertion]: SVIX {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
-    #                   f'into the database.')
-    #     ################################################################################################################
-    #     ## VRP
-    #     ################################################################################################################
-    #     returns = data.xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
-    #     returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
-    #     rv = data.xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
-    #     rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
-    #     rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
-    #     if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
-    #         vrp = \
-    #             pd.merge(svix, rv.unstack().rename('rv').dropna().reset_index(),
-    #                      on=['underlying_name', 'D', 'timestamp'], how='right')
-    #         vrp['vrp'] = vrp['svix'] - vrp['rv']
-    #         vrp = vrp.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
-    #     else:
-    #         svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
-    #         svix = svix.set_index(['aggregated', 'timestamp'])
-    #         vrp = dict()
-    #         for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
-    #             tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
-    #             if aggregated:
-    #                 if 'agg_svix' not in vars():
-    #                     agg_svix = tmp_svix.drop('underlying_name', axis=1)
-    #                     agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
-    #                     agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
-    #                 vrp[(int(aggregated), underlying_name)] = \
-    #                     agg_svix.reindex(rv.index).subtract(rv[underlying_name].values).dropna()
-    #             else:
-    #                 tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns=['underlying_name', 'D'], values='svix',
-    #                                           index='timestamp')
-    #                 tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
-    #                 vrp[(int(aggregated), underlying_name)] = \
-    #                     tmp_svix.xs(underlying_name, axis=1,
-    #                                 level=0).reindex(rv.index).subtract(rv[underlying_name].values)
-    #             vrp[(int(aggregated), underlying_name)] = \
-    #                 vrp[(int(aggregated), underlying_name)].dropna(axis=1, how='all').dropna()
-    #             vrp[(int(aggregated), underlying_name)] = \
-    #                 pd.DataFrame(vrp[(int(aggregated), underlying_name)].unstack()).rename(columns={0: 'vrp'})
-    #             vrp[(int(aggregated), underlying_name)] = \
-    #                 vrp[(int(aggregated), underlying_name)].assign(underlying_name=underlying_name,
-    #                                                                aggregated=int(aggregated))
-    #         vrp_0 = pd.concat([vrp[(0, symbol)] for symbol in pairs_order.categories])
-    #         vrp_1 = pd.concat([vrp[(1, symbol)] for symbol in pairs_order.categories])
-    #         vrp = pd.concat([vrp_0, vrp_1])
-    #         vrp.to_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
+    if args.type == 'svix_rv_vrp_effect':
+        if os.path.exists(f'{args.target_path}/crypto_option_spot/svix.csv'):
+            svix = pd.read_csv(f'{args.target_path}/crypto_option_spot/svix.csv', index_col='index')
+            svix['svix'] = svix['svix']/100
+            svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=True)
+            svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
+            svix_agg = \
+                pd.concat([svix.xs(1, axis=0, level=0,
+                                   drop_level=False).droplevel(axis=0, level=1).assign(underlying_name=underlying_name)
+                           for underlying_name in SYMBOLS]).set_index('underlying_name', append=True)
+            svix_agg = svix_agg.swaplevel(-1, 1).swaplevel(-1, 2)
+            svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
+            svix = pd.concat([svix_agg, svix_non_agg]).reset_index()
+        else:
+            framework_application_obj.iv_regression(best_model_tags[-1])
+            for aggregated in [True, False]:
+                svix2 = framework_application_obj.svix(best_model_tags[-1], aggregated)
+                svix = ((scaling_factor * svix2) ** .5).unstack()
+                svix.index = svix.index.set_names(['D', 'timestamp']) if aggregated else \
+                    svix.index.set_names(['D', 'underlying_name', 'timestamp'])
+                svix.name = 'svix'
+                svix = pd.DataFrame(svix.reset_index())
+                if aggregated:
+                    svix = svix.assign(underlying_name=None)
+                svix.assign(aggregated={True: 1, False: 0}[aggregated]).to_sql(
+                    con=framework_application_obj.db_connect, name=f'svix', if_exists='append')
+                print(f'[Insertion]: SVIX {dict([(True, "aggregated"), (False, "")])[aggregated]} has been inserted '
+                      f'into the database.')
+        ################################################################################################################
+        ## VRP
+        ################################################################################################################
+        returns = data_per_target['returns'].xs('values', axis=1, level=0).xs('returns', axis=1, level=1).dropna()
+        returns.columns = returns.columns.set_levels(returns.columns.levels[-1].str.lower(), level=-1)
+        rv = data_per_target['RV'].xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
+        rv = rv.resample(best_model_tags[-1]).sum().replace(0, np.nan)
+        rv.columns = rv.columns.set_levels(rv.columns.levels[-1].str.lower(), level=-1).dropna()
+        if os.path.exists(f'{args.target_path}/crypto_option_spot/vrp.csv'):
+            vrp = \
+                pd.merge(svix, rv.unstack().rename('rv').dropna().reset_index(),
+                         on=['underlying_name', 'D', 'timestamp'], how='right')
+            vrp['vrp'] = vrp['svix'] - vrp['rv']
+            vrp = vrp.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
+        else:
+            svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=pytz.UTC)
+            svix = svix.set_index(['aggregated', 'timestamp'])
+            vrp = dict()
+            for aggregated, underlying_name in list(product([False, True], list(pairs_order.categories))):
+                tmp_svix = svix.xs(int(aggregated), level=0, axis=0)
+                if aggregated:
+                    if 'agg_svix' not in vars():
+                        agg_svix = tmp_svix.drop('underlying_name', axis=1)
+                        agg_svix = pd.pivot_table(agg_svix.reset_index(), columns='D', values='svix', index='timestamp')
+                        agg_svix.index = pd.to_datetime(agg_svix.index, utc=pytz.UTC)
+                    vrp[(int(aggregated), underlying_name)] = \
+                        agg_svix.reindex(rv.index).subtract(rv[underlying_name].values).dropna()
+                else:
+                    tmp_svix = pd.pivot_table(tmp_svix.reset_index(), columns=['underlying_name', 'D'], values='svix',
+                                              index='timestamp')
+                    tmp_svix.index = pd.to_datetime(tmp_svix.index, utc=pytz.UTC)
+                    vrp[(int(aggregated), underlying_name)] = \
+                        tmp_svix.xs(underlying_name, axis=1,
+                                    level=0).reindex(rv.index).subtract(rv[underlying_name].values)
+                vrp[(int(aggregated), underlying_name)] = \
+                    vrp[(int(aggregated), underlying_name)].dropna(axis=1, how='all').dropna()
+                vrp[(int(aggregated), underlying_name)] = \
+                    pd.DataFrame(vrp[(int(aggregated), underlying_name)].unstack()).rename(columns={0: 'vrp'})
+                vrp[(int(aggregated), underlying_name)] = \
+                    vrp[(int(aggregated), underlying_name)].assign(underlying_name=underlying_name,
+                                                                   aggregated=int(aggregated))
+            vrp_0 = pd.concat([vrp[(0, symbol)] for symbol in pairs_order.categories])
+            vrp_1 = pd.concat([vrp[(1, symbol)] for symbol in pairs_order.categories])
+            vrp = pd.concat([vrp_0, vrp_1])
+            vrp.to_csv(f'{args.target_path}/crypto_option_spot/vrp.csv')
