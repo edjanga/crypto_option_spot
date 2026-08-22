@@ -1,6 +1,5 @@
 import argparse
 import os
-import pdb
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import polars as pl
 import pytz
@@ -66,7 +65,7 @@ def train_one_window(date, features, regression: str):
                           loss=MSE(), scaler_type='standard', learning_rate=1e-3, e_layers=2, d_ff=512,
                           batch_size=64, max_steps=1_000, val_check_steps=10,
                           early_stop_patience_steps=EARLY_STOPPING_PATIENCE,
-                          start_padding_enabled=True, accelerator=ENGINE, devices=1)
+                          start_padding_enabled=True, accelerator=DEVICE, devices=1)
             model = NeuralForecast(models=[model], freq=args.freq)
             model.fit(df=train_X, val_size=n_heads)
         else:
