@@ -369,8 +369,8 @@ if __name__ == "__main__":
         pd.to_datetime(features_importance.index.levels[1], utc=True), level=1)
     underlying_rv = pl.scan_csv(f'{args.target_path}/spot_features.csv')
     underlying_rv = (
-        underlying_rv.filter((pl.col('freq') == '15min') & (pl.col('target') == 'RV') &
-                             (pl.col('features') == 'RV_15min')))
+        underlying_rv.filter((pl.col('freq') == '1h') & (pl.col('target') == 'RV') &
+                             (pl.col('features') == 'RV_1h')))
     underlying_rv = underlying_rv.select(['timestamp', 'target_values'])
     underlying_rv = underlying_rv.with_columns(pl.col('timestamp')
                                                .str.strptime(pl.Datetime, format='%Y-%m-%d %H:%M:%S%z', strict=False)
