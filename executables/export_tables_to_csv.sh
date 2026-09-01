@@ -1,13 +1,10 @@
-sqlite3 ../data_centre/crypto_option_spot.db <<EOF
+sqlite3 /bitbcuket/djanga/data_centre2/crypto_option_spot.db <<EOF
 .headers on
 .mode csv
-.output ../feature_importance.csv
-SELECT * FROM feature_importance;
+.output /bitbucket/djanga/data_centre2/spot_features.csv
+SELECT * FROM spot_features;
 .output stdout
-.output ../forecasts.csv
-SELECT * FROM forecasts;
-.output stdout
-.output ../metric.csv
-SELECT * FROM metric;
+.output /bitbucket/djanga/data_centre2/option_features.csv
+SELECT * FROM option_features;
 .output stdout
 EOF
