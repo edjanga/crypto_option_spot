@@ -36,29 +36,54 @@ class FeatureBuilder:
                                            .forward_fill().over('underlying_name').alias(f'm{m}'))
         return moments.collect()
 
+    # @staticmethod
+    # def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
+    #     intraday_lags_exprs = [pl.col(feature) for feature in features]
+    #     for lag in INTRADAY_LAGS:
+    #         window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
+    #         for feature in features:
+    #             intraday_lags_exprs.append((pl.col(f'{feature}').rolling_mean(window_size)).shift().over
+    #                                        ('underlying_name').alias(f'{feature}_{lag}'))
+    #     for lag in INTERDAY_LAGS:
+    #         feature_lag = list(product(features, [lag]))
+    #         pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
+    #         if 'feature_lags' not in vars():
+    #             feature_lags = data.with_columns(intraday_lags_exprs)
+    #         feature_interday_lag = \
+    #             (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),  by='underlying_name')
+    #              .agg([(pl.col(f'{feature}').mean()).alias(f'{feature}_{lag}') for feature, lag in feature_lag]))
+    #         feature_interday_lag = feature_interday_lag.select(
+    #             [pl.col('underlying_name'), pl.col('timestamp')]+
+    #             [(pl.col(f'{feature}_{lag}').shift(1).over('underlying_name')) for feature, lag in feature_lag])
+    #     feature_lags = feature_lags.join(feature_interday_lag, on=['underlying_name', 'timestamp'], how='left')
+    #     feature_lags = \
+    #         feature_lags.with_columns([pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
+    #              for feature, lag in feature_lag])
+    #     return feature_lags
     @staticmethod
-    def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
+    def lags(data: pl.DataFrame, features: List[str] = ['RV'] + [f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
         intraday_lags_exprs = [pl.col(feature) for feature in features]
         for lag in INTRADAY_LAGS:
             window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
             for feature in features:
                 intraday_lags_exprs.append((pl.col(f'{feature}').rolling_mean(window_size)).shift().over
                                            ('underlying_name').alias(f'{feature}_{lag}'))
+        feature_lags = data.with_columns(intraday_lags_exprs)
+        all_feature_lag_pairs = []
         for lag in INTERDAY_LAGS:
             feature_lag = list(product(features, [lag]))
+            all_feature_lag_pairs.extend(feature_lag)
             pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
-            if 'feature_lags' not in vars():
-                feature_lags = data.with_columns(intraday_lags_exprs)
             feature_interday_lag = \
-                (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),  by='underlying_name')
+                (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(), by='underlying_name')
                  .agg([(pl.col(f'{feature}').mean()).alias(f'{feature}_{lag}') for feature, lag in feature_lag]))
             feature_interday_lag = feature_interday_lag.select(
-                [pl.col('underlying_name'), pl.col('timestamp')]+
+                [pl.col('underlying_name'), pl.col('timestamp')] +
                 [(pl.col(f'{feature}_{lag}').shift(1).over('underlying_name')) for feature, lag in feature_lag])
-        feature_lags = feature_lags.join(feature_interday_lag, on=['underlying_name', 'timestamp'], how='left')
-        feature_lags = \
-            feature_lags.with_columns([pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
-                 for feature, lag in feature_lag])
+            feature_lags = feature_lags.join(feature_interday_lag, on=['underlying_name', 'timestamp'], how='left')
+        feature_lags = feature_lags.with_columns(
+            [pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
+             for feature, lag in all_feature_lag_pairs])
         return feature_lags
 
     @staticmethod

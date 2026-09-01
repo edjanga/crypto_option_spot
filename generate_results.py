@@ -1,5 +1,7 @@
 import argparse
 import os
+import pdb
+
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import polars as pl
 import pytz
@@ -24,6 +26,10 @@ from constants import EARLY_STOPPING_PATIENCE
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
 regression_dd = {'ml': ['LGBMRegressor', 'Lasso'], 'dl': ['SOFTS']}
 rng = random.Random(123)
+
+
+def get_n_heads(args) -> int:
+    return 1
 
 
 def winsorise_vectorized(df: pd.DataFrame, group_col: str = 'unique_id', exclude_cols=('ds',)) -> pd.DataFrame:
@@ -59,15 +65,16 @@ def train_one_window(date, features, regression: str):
         train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].ffill()
         train_X[fill_cols] = train_X.groupby('unique_id')[fill_cols].bfill()
         if regression == 'dl':
-            n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
+            n_heads = get_n_heads(args)
             n_series = train_X['unique_id'].nunique()
+            val_size = min(30, max(2, len(train_X) // 20))
             model = SOFTS(h=n_heads, input_size=train_X.shape[1], n_series=n_series, hidden_size=256,
                           loss=MSE(), scaler_type='standard', learning_rate=1e-3, e_layers=2, d_ff=512,
                           batch_size=64, max_steps=1_000, val_check_steps=10,
                           early_stop_patience_steps=EARLY_STOPPING_PATIENCE,
-                          start_padding_enabled=True, accelerator=DEVICE, devices=1)
+                          start_padding_enabled=True, accelerator='cpu', devices=1)
             model = NeuralForecast(models=[model], freq=args.freq)
-            model.fit(df=train_X, val_size=n_heads)
+            model.fit(df=train_X, val_size=val_size)
         else:
             model = \
                 MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=500,
@@ -133,7 +140,7 @@ def compute_feat_importance(col, test_X, test_y, in_sample_avg, regression,
 
 
 def evaluate_one_window(model, train_features, regression: str, args , n_steps_ahead_scaler, main_features):
-    n_heads = pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq)
+    n_heads = get_n_heads(args)
     if regression != 'dl':
         lightgbm_model = model[0]
         idx_test = lightgbm_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
@@ -268,9 +275,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
-    features = pl.scan_csv(f'{args.target_path}/spot_features.csv').filter(pl.col('target') == args.target).collect()
-    features = features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S%z'),
-                                      pl.col('features_values').cast(pl.Float32, strict=False)])
+    features = pl.scan_parquet(f'{args.target_path}/spot_features.parquet').filter(pl.col('target') == args.target).collect()
+    features = features.with_columns([pl.col('features_values').cast(pl.Float32, strict=False)])
     features = features.pivot(values='features_values',
                               index=['underlying_name', 'timestamp', 'target', 'target_values'], on='features',
                               aggregate_function='first')
@@ -278,10 +284,8 @@ if __name__ == "__main__":
     features = features.unique(maintain_order=True)
     global main_features
     if args.options == 1:
-        options_features = pl.scan_csv(f'{args.target_path}/option_features.csv').collect()
-        options_features = options_features.with_columns([pl.col('timestamp').str.strptime(pl.Datetime,
-                                                                                           '%Y-%m-%d %H:%M:%S%z'),
-                                                          pl.col('features_values').cast(pl.Float32, strict=False)])
+        options_features = pl.scan_parquet(f'{args.target_path}/option_features.parquet').collect()
+        options_features = options_features.with_columns([pl.col('features_values').cast(pl.Float32, strict=False)])
         options_features = options_features.pivot(values='features_values', index=['underlying_name', 'timestamp'],
                                                   on='features', aggregate_function='first')
         main_features = features.join(options_features, on=['underlying_name', 'timestamp'], how='left')
@@ -292,6 +296,12 @@ if __name__ == "__main__":
     else:
         main_features = features
     main_features = main_features.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
+    n_heads_agg = int(pd.to_timedelta(DAYS_CONVERTER[args.D], unit='d') // pd.to_timedelta(args.freq))
+    main_features = main_features.sort(['underlying_name', 'timestamp'])
+    main_features = main_features.with_columns(
+        pl.col(args.target).rolling_sum(window_size=n_heads_agg, min_samples=n_heads_agg)
+          .shift(-(n_heads_agg - 1)).over('underlying_name').alias(args.target)
+    )
     start_idx = np.searchsorted(dates, dates[0] + relativedelta(days=DAYS_CONVERTER[args.L]))
     date_grid = dates[start_idx::DAYS_CONVERTER[args.L]]
     date_masks = {d: ((main_features['timestamp'] >= pl.lit(d - relativedelta(days=DAYS_CONVERTER[args.L]))) &
@@ -366,14 +376,12 @@ if __name__ == "__main__":
     features_importance = pd.concat(features_importance).set_index(['underlying_name', 'timestamp'])
     features_importance.index = features_importance.index.set_levels(
         pd.to_datetime(features_importance.index.levels[1], utc=True), level=1)
-    underlying_rv = pl.scan_csv(f'{args.target_path}/spot_features.csv')
+    underlying_rv = pl.scan_parquet(f'{args.target_path}/spot_features.parquet')
     underlying_rv = (
         underlying_rv.filter((pl.col('freq') == '1h') & (pl.col('target') == 'RV') &
                              (pl.col('features') == 'RV_1h')))
     underlying_rv = underlying_rv.select(['timestamp', 'target_values'])
-    underlying_rv = underlying_rv.with_columns(pl.col('timestamp')
-                                               .str.strptime(pl.Datetime, format='%Y-%m-%d %H:%M:%S%z', strict=False)
-                                               .dt.convert_time_zone('UTC')).collect().to_pandas()
+    underlying_rv = underlying_rv.collect().to_pandas()
     volatility_regime = underlying_rv.groupby('timestamp')['target_values'].mean().resample(args.freq).sum()
     volatility_regime = \
         volatility_regime.loc[(volatility_regime.index.date < pd.to_datetime(args.end_date, utc=True).date())]
