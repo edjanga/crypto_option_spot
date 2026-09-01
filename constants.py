@@ -23,7 +23,7 @@ GREEKS_EXPOSURE = {exp: greek for exp, greek in zip(['gex'], ['gamma'])}
 GREEKS_EXPOSURE.update({exp: None for exp in EXPOSURE[1:]})
 FEES_SPOT = .0003
 FEES_OPTIONS = .125
-INTRADAY_LAGS = ['15min', '30min', '1h', '3h', '6h', '1D']
+INTRADAY_LAGS = ['15min', '30min', '1h', '1D']
 INTERDAY_LAGS = ['1W', '1M']
 VOL_REGIMES = ['Low', 'Normal', 'High']
 MARKETS = {'returns': 'spot', 'RV': 'options'}
