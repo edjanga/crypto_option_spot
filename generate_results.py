@@ -51,10 +51,20 @@ def train_one_window(date, features, regression: str):
         train_X = features.to_pandas().set_index(['underlying_name', 'timestamp']).dropna()
         train_X = \
             train_X.reset_index().rename(columns={'underlying_name': 'unique_id', 'timestamp': 'ds', args.target: 'y'})
-        start, end = train_X.ds.min(), train_X.ds.max()
-        full_dates = pd.date_range(start, end, freq=args.freq, inclusive='both')
-        uids = train_X['unique_id'].unique()
-        full_index = pd.MultiIndex.from_product([uids, full_dates], names=['unique_id', 'ds'])
+        # Reindex each symbol only within its OWN observed date range for this window, not a shared
+        # global range. A shared range (uids x [global_min, global_max]) would insert NaN rows for any
+        # symbol before its own first valid observation in this window (e.g. before its options-listing
+        # date) -- and the ffill/bfill below would then backfill those synthetic rows using that symbol's
+        # first *post*-listing values, silently leaking future data into the pre-listing period instead of
+        # correctly excluding it. Building the index per unique_id from its own min/max prevents that: no
+        # reindexed row can exist before a symbol's first genuine observation, so there is nothing there
+        # for bfill to leak into.
+        per_uid_range = train_X.groupby('unique_id')['ds'].agg(['min', 'max'])
+        full_index = pd.MultiIndex.from_tuples(
+            [(uid, d) for uid, (lo, hi) in per_uid_range.iterrows()
+             for d in pd.date_range(lo, hi, freq=args.freq, inclusive='both')],
+            names=['unique_id', 'ds']
+        )
         train_X = \
             train_X.drop_duplicates(subset=['unique_id', 'ds']).set_index(['unique_id', 'ds']).reindex(full_index)
         train_X = train_X.reset_index()
