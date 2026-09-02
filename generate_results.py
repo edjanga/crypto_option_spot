@@ -388,8 +388,8 @@ if __name__ == "__main__":
         pd.to_datetime(features_importance.index.levels[1], utc=True), level=1)
     underlying_rv = pl.scan_parquet(f'{args.target_path}/spot_features.parquet')
     underlying_rv = (
-        underlying_rv.filter((pl.col('freq') == '1h') & (pl.col('target') == 'RV') &
-                             (pl.col('features') == 'RV_1h')))
+        underlying_rv.filter((pl.col('freq') == '15min') & (pl.col('target') == 'RV') &
+                             (pl.col('features') == f'RV_15min')))
     underlying_rv = underlying_rv.select(['timestamp', 'target_values'])
     underlying_rv = underlying_rv.collect().to_pandas()
     volatility_regime = underlying_rv.groupby('timestamp')['target_values'].mean().resample(args.freq).sum()
