@@ -64,7 +64,6 @@ def convert_spot_features(csv_path: Path, parquet_path: Path) -> None:
           f"(was {csv_path.stat().st_size / 1024**2:.1f} MB as CSV)")
 
 
-
 def convert_option_features(csv_path: Path, parquet_path: Path) -> None:
     print(f"Converting {csv_path} -> {parquet_path} ...")
     (
@@ -95,11 +94,11 @@ if __name__ == "__main__":
     spot_features_csv = base / "spot_features.csv"
     option_features_csv = base / "option_features.csv"
     if spot_features_csv.exists():
-        convert_forecasts(spot_features_csv, base / "spot_features.parquet")
+        convert_spot_features(spot_features_csv, base / "spot_features.parquet")
     else:
         print(f"NOTE: {spot_features_csv} not found, skipping.")
     if option_features_csv.exists():
-        convert_svix(option_features_csv, base / "option_features.parquet")
+        convert_option_features(option_features_csv, base / "option_features.parquet")
     else:
         print(f"NOTE: {option_features_csv} not found, skipping.")
     print("\nDone. Re-run generate_pnl.py -- it will automatically prefer the .parquet "
