@@ -1,6 +1,8 @@
 import datetime
 import itertools
 import os
+import pdb
+
 import numpy as np
 import pandas as pd
 import pytz
@@ -340,10 +342,10 @@ class FrameworkApplication:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all performance tables.')
-    parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-02')
-    parser.add_argument('--end_date', type=str, help='End date.', default='2025-07-01')
-    parser.add_argument('--top_features', type=int,
-                        help='Number of top features to consider in feature importance analysis', default=5)
+    # parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-02')
+    # parser.add_argument('--end_date', type=str, help='End date.', default='2025-07-01')
+    # parser.add_argument('--top_features', type=int,
+    #                     help='Number of top features to consider in feature importance analysis', default=5)
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='./data_centre')
     parser.add_argument('--type', type=str, help='Type of table to generate', default='mase_reporting')
@@ -357,29 +359,27 @@ if __name__ == '__main__':
     volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
     market_order = CategoricalDtype(categories=[0, 1], ordered=True)
     ####################################################################################################################
-    framework_application_obj = FrameworkApplication(target_path=args.target_path)
-    top_features = args.top_features
-    rv_mkt = framework_application_obj.underlying_rv.set_index('timestamp').stack().swaplevel(0, 1)
-    df_idx = rv_mkt.index.to_frame()
-    df_idx['timestamp'] = df_idx['timestamp'].astype('datetime64[ns, UTC]')
-    rv_mkt.index = pd.MultiIndex.from_frame(df_idx)
-    rv_mkt = \
-        pd.concat([pd.DataFrame(rv_mkt.groupby(
-            by=[pd.Grouper(level=0),
-                pd.Grouper(level=1, freq=f'{d.upper()}E' if d == 'M' else d.upper())]).sum() *
-                   ((pd.to_timedelta('360D')//pd.to_timedelta(f'{DAYS_CONVERTER[d.upper()]}D')) ** .5)).assign(
-            D=d.upper()) for d in d_order.categories])
-    rv_mkt = rv_mkt.groupby([pd.Grouper(key='D'),
-                             pd.Grouper(level=1)]).mean().rename(columns={0: 'volatility_regime'})
-    volatility_regime = rv_mkt.groupby(pd.Grouper(level='D'), group_keys=False)
-    volatility_regime = \
-        volatility_regime.apply(lambda x: pd.qcut(x['volatility_regime'], q=[0, .33, .66, 1], labels=VOL_REGIMES))
+    # framework_application_obj = FrameworkApplication(target_path=args.target_path)
+    # top_features = args.top_features
+    # rv_mkt = framework_application_obj.underlying_rv.set_index('timestamp').stack().swaplevel(0, 1)
+    # df_idx = rv_mkt.index.to_frame()
+    # df_idx['timestamp'] = df_idx['timestamp'].astype('datetime64[ns, UTC]')
+    # rv_mkt.index = pd.MultiIndex.from_frame(df_idx)
+    # rv_mkt = \
+    #     pd.concat([pd.DataFrame(rv_mkt.groupby(
+    #         by=[pd.Grouper(level=0),
+    #             pd.Grouper(level=1, freq=f'{d.upper()}E' if d == 'M' else d.upper())]).sum() *
+    #                ((pd.to_timedelta('360D')//pd.to_timedelta(f'{DAYS_CONVERTER[d.upper()]}D')) ** .5)).assign(
+    #         D=d.upper()) for d in d_order.categories])
+    # rv_mkt = rv_mkt.groupby([pd.Grouper(key='D'),
+    #                          pd.Grouper(level=1)]).mean().rename(columns={0: 'volatility_regime'})
+    # volatility_regime = rv_mkt.groupby(pd.Grouper(level='D'), group_keys=False)
+    # volatility_regime = \
+    #     volatility_regime.apply(lambda x: pd.qcut(x['volatility_regime'], q=[0, .33, .66, 1], labels=VOL_REGIMES))
     ####################################################################################################################
     ## Model selection
     ####################################################################################################################
     mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
-    mase['timestamp'] = pd.to_datetime(mase['timestamp'], utc=True)
-    mase = mase.set_index(['D', 'timestamp'])
     model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
                                      pd.Grouper(key='regression'),
                                      pd.Grouper(key='freq')])[['MASE']].mean()
@@ -389,7 +389,7 @@ if __name__ == '__main__':
                 mase_per_regression_freq_pair_file_tmp:
                 mase_per_regression_freq_pair_file_tmp.writelines(
                     model_ranking_tmp.unstack(0).droplevel(axis=1, level=0).loc[
-                    ['1h', '3h', '6h'], ['lasso', 'lightgbm', 'softs']].to_latex())
+                    ['15min', '30min', '1h'], ['lasso', 'lightgbm', 'softs']].to_latex())
     best_model_tags = model_ranking.groupby('target').idxmin().to_dict()['MASE']
     mase_comparison = \
         model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
@@ -404,32 +404,34 @@ if __name__ == '__main__':
         tmp = pd.pivot_table(data=tmp, columns=['underlying_name', 'target', 'D'], values=['values', 'forecast'],
                              index='timestamp')
         data_per_target[target] = tmp
-    framework_application_obj.data = data_per_target
-    scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags['RV'][-1])
-    rv_idx = pd.IndexSlice
-    data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :]] = \
-        data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor ** .5)
-    framework_application_obj.symbol = SYMBOLS
-    date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
-    framework_application_obj.process_daily_option_chain(best_model_tags['RV'][-1],
-                                                         f'{args.target_path}', date_range)
+    # framework_application_obj.data = data_per_target
+    # scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags['RV'][-1])
+    # rv_idx = pd.IndexSlice
+    # data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :]] = \
+    #     data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :]].pow(.5).mul(scaling_factor ** .5)
+    # framework_application_obj.symbol = SYMBOLS
+    # date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='1D').tolist()
+    # framework_application_obj.process_daily_option_chain(best_model_tags['RV'][-1],
+    #                                                      f'{args.target_path}', date_range)
     ####################################################################################################################
     ## MASE Reporting
     ####################################################################################################################
     if args.type == 'mase_reporting':
         metric_per_target = dict()
+        tmp = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
         for target, values in mase_comparison.items():
-            chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv', chunksize=1_000_000)
-            tmp = pd.concat(chunk.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
-                            for chunk in chunks)
-            metric_per_target[target] = tmp
+            # chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv', chunksize=1_000_000)
+            # tmp = pd.concat(chunk.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
+            #                 for chunk in chunks)
+            metric_per_target[target] = \
+                tmp.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
         mase_comparison = pd.concat(metric_per_target.values())
         for target, values in best_model_tags.items():
             regression = best_model_tags[target][1]
             freq = best_model_tags[target][-1]
             best_model = mase_comparison.query('regression == @regression and freq == @freq and target == @target')
             mase_global = \
-                best_model.groupby(by=[pd.Grouper(key='D'), pd.Grouper(key='volatility_regime'),
+                best_model.groupby(by=[pd.Grouper(key='D'),#, pd.Grouper(key='volatility_regime'),
                                        pd.Grouper(key='market')])[['MASE']].mean().reset_index()
             mase_global['D'] = mase_global['D'].transform(lambda x: f'<i>{x.lower()}</i>')
             mase_global['market'] = \
