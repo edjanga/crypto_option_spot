@@ -719,9 +719,12 @@ if __name__ == '__main__':
         # pnl['RV'][underlying_name] = pnl['RV'][underlying_name].groupby(daily_grouper_level).sum()
         # pnl['returns'][underlying_name] = pd.concat(pnl['returns'][underlying_name])
         # pnl['returns'][underlying_name] = pnl['returns'][underlying_name].groupby(daily_grouper_level).sum()
-        pnl[target][underlying_name] = pd.concat(pnl[target][underlying_name])
-        pnl[target][underlying_name] = pnl[target][underlying_name].groupby(daily_grouper_level).sum()
-        gc.collect()
+        try:
+            pnl[target][underlying_name] = pd.concat(pnl[target][underlying_name])
+            pnl[target][underlying_name] = pnl[target][underlying_name].groupby(daily_grouper_level).sum()
+            gc.collect()
+        except ValueError:
+            print((target, underlying_name))
     pnl = pd.concat(pd.concat([reduce(lambda l, r: l.join(r, how='outer'), pnl[target].values())])
                     for target in pnl.keys())
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
