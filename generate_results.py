@@ -453,28 +453,31 @@ def run_feature_importance(target_path: str, target: str, args):
         parsed_rows = [split_row(r) for r in rows]
         header = parsed_rows[0]
         col_labels = header[1:]
-
         data_rows = parsed_rows[1:]
         if data_rows and all(c == '' for c in data_rows[0][1:]):
-            data_rows = data_rows[1:]  # skip pandas' index-name spacer row
+            data_rows = data_rows[1:]
 
         index_labels = [r[0] for r in data_rows]
         values = [[float(c) for c in r[1:]] for r in data_rows]
         return pd.DataFrame(values, index=index_labels, columns=col_labels)
 
     def best_row_col(df: pd.DataFrame) -> tuple[str, str, float]:
-        row, col = df.stack().idxmin()
-        return row, col
+        stacked = df.stack()
+        idx = stacked.idxmin()
+        value = float(stacked.loc[idx])
+        row, col = idx
+        return row, col, value
+
     mase_target_table = parse_latex_table('/'.join([target_path,
                                                     'crypto_option_spot',
                                                     f'mase_per_regression_freq_pair_{target}.txt']))
-    champion_freq, champion_regression = best_row_col(mase_target_table)
+    champion_freq, champion_regression, champion_mase = best_row_col(mase_target_table)
     model_names_reverse = {v: k for k, v in model_names.items()}
-    champion_model_key = model_names_reverse[champion_regression]      # 'Lasso' / 'LGBMRegressor' / 'SOFTS'
+    champion_model_key = model_names_reverse[champion_regression]
     champion_regression_type = 'dl' if champion_model_key == 'SOFTS' else 'ml'
     print(f'[FeatureImportance] target={target}: champion freq={champion_freq!r}, '
-          f'regression={champion_regression!r} ({champion_model_key}, type={champion_regression_type})')
-
+          f'regression={champion_regression!r} ({champion_model_key}, type={champion_regression_type}), '
+          f'champion_mase={champion_mase:.6f}')
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
     volatility_regime = pl.scan_parquet(f'{args.target_path}/spot_features.parquet').filter(
         (pl.col('target') == 'RV') & (pl.col('freq') == '15min')
@@ -569,80 +572,94 @@ def run_feature_importance(target_path: str, target: str, args):
         mase = (merged['y_hat'] / merged['avg_1s']).abs()
         mase = mase / (pd.to_timedelta(DAYS_CONVERTER[D], unit='d') / pd.to_timedelta(freq))
         return float(mase.mean())
-    rng_np = np.random.default_rng(123)
-    importance_records = []
+
+    def _run_one_window(market, D, i):
+        date_grid_test = date_grid_test_by_D[D]
+        date_test = date_grid_test[i]
+        trained_entry = resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[D][i],
+                                              champion_regression_type, market, D)
+        if trained_entry is None:
+            return []
+        model, avg_1s = trained_entry
+        if avg_1s is None:
+            return []
+        main_features_i = filter_market_features(
+            main_features_by_D[D].filter(date_masks_tests_by_D[D][date_test]), target, market)
+        tmp_sum = n_steps_ahead_scaler_by_D[D][i]
+        start, horizon_end = pd.Timestamp(date_test), horizon_dates_by_D[D][i]
+
+        def champion_forecast(mf: pl.DataFrame):
+            fc = evaluate_one_window(model=model, regression=champion_regression_type, target=target,
+                                     freq=champion_freq, n_steps_ahead_scaler=tmp_sum, main_features=mf)
+            fc = fc.loc[(fc.timestamp >= start) & (fc.timestamp < horizon_end) &
+                       (fc.regression == champion_regression)]
+            return fc
+        try:
+            baseline_forecast = champion_forecast(main_features_i)
+        except Exception as e:
+            print(f"WARNING: baseline evaluate_one_window failed for feature importance "
+                  f"window {date_test}/{champion_regression}/market={market}/D={D} "
+                  f"({type(e).__name__}: {e}) -- skipping window.")
+            return []
+        if baseline_forecast.empty:
+            return []
+        main_features_pd = main_features_i.to_pandas()
+        feature_cols = [c for c in main_features_pd.columns if c not in ('underlying_name', 'timestamp', target)]
+        rng_local = np.random.default_rng(123 + i)
+        records = []
+        for col in feature_cols:
+            col_std = main_features_pd[col].std()
+            noise_scale = col_std if col_std and not np.isnan(col_std) else 1.0
+            original_col = main_features_pd[col].copy()
+            window_mases = []
+            for _ in range(FEAT_IMP_N_ITER):
+                main_features_pd[col] = original_col + rng_local.normal(scale=noise_scale,
+                                                                        size=len(main_features_pd))
+                try:
+                    jittered_forecast = champion_forecast(pl.from_pandas(main_features_pd))
+                except Exception:
+                    continue
+                if jittered_forecast.empty:
+                    continue
+                window_mases.append(window_mase(jittered_forecast, avg_1s, D, champion_freq))
+            main_features_pd[col] = original_col
+            if not window_mases:
+                continue
+            records.append({
+                'target': target, 'market': market, 'D': D, 'freq': champion_freq,
+                'regression': champion_regression, 'timestamp': date_test, 'feature': col,
+                'MASE': float(np.mean(window_mases)),
+            })
+        return records
+    window_stride = 5
+    tasks = []
     for market in [1, 0]:
         for D in D_LIST:
-            main_features_test_cache = {
-                d: filter_market_features(main_features_by_D[D].filter(mask), target, market)
-                for d, mask in date_masks_tests_by_D[D].items()
-            }
             date_grid_test = date_grid_test_by_D[D]
-            windows_to_run = [i for i in range(len(date_grid_test)) if i % FEAT_IMP_EVERY_N_WINDOWS == 0]
-            with tqdm_joblib(tqdm(desc=f'Feature importance windows (target={target}, market={market}, D={D})',
-                                  total=len(windows_to_run))):
-                for i in windows_to_run:
-                    date_test = date_grid_test[i]
-                    trained_entry = resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[D][i],
-                                                          champion_regression_type, market, D)
-                    if trained_entry is None:
-                        continue
-                    model, avg_1s = trained_entry
-                    if avg_1s is None:
-                        continue
-                    main_features_i = filter_market_features(main_features_test_cache[date_test], target, market)
-                    tmp_sum = n_steps_ahead_scaler_by_D[D][i]
-                    start, horizon_end = pd.Timestamp(date_test), horizon_dates_by_D[D][i]
+            windows_to_run = [i for i in range(len(date_grid_test)) if i % window_stride == 0]
+            tasks += [(market, D, i) for i in windows_to_run]
+    print(f'[FeatureImportance] {len(tasks)} (market, D, window) tasks to evaluate across '
+          f'{args.cpu_count} worker(s) for target={target}.')
+    with tqdm_joblib(tqdm(desc=f'Feature importance windows (target={target})', total=len(tasks))):
+        results = Parallel(n_jobs=args.cpu_count, backend='loky')(
+            delayed(_run_one_window)(market, D, i) for market, D, i in tasks
+        )
+    importance_records = [record for window_records in results for record in window_records]
 
-                    def champion_forecast(mf: pl.DataFrame):
-                        fc = evaluate_one_window(model=model, regression=champion_regression_type, target=target,
-                                                 freq=champion_freq, n_steps_ahead_scaler=tmp_sum, main_features=mf)
-                        fc = fc.loc[(fc.timestamp >= start) & (fc.timestamp < horizon_end) &
-                                   (fc.regression == champion_regression)]
-                        return fc
-                    try:
-                        baseline_forecast = champion_forecast(main_features_i)
-                    except Exception as e:
-                        print(f"WARNING: baseline evaluate_one_window failed for feature importance "
-                              f"window {date_test}/{champion_regression}/market={market}/D={D} "
-                              f"({type(e).__name__}: {e}) -- skipping window.")
-                        continue
-                    if baseline_forecast.empty:
-                        continue
-                    baseline_mase = window_mase(baseline_forecast, avg_1s, D, champion_freq)
-                    main_features_pd = main_features_i.to_pandas()
-                    feature_cols = \
-                        [c for c in main_features_pd.columns if c not in ('underlying_name', 'timestamp', target)]
-                    if FEAT_IMP_MAX_COLS is not None and len(feature_cols) > FEAT_IMP_MAX_COLS:
-                        feature_cols = list(rng_np.choice(feature_cols, size=FEAT_IMP_MAX_COLS, replace=False))
-                    for col in feature_cols:
-                        col_std = main_features_pd[col].std()
-                        noise_scale = col_std if col_std and not np.isnan(col_std) else 1.0
-                        deltas = []
-                        for _ in range(FEAT_IMP_N_ITER):
-                            jittered = main_features_pd.copy()
-                            jittered[col] = jittered[col] + rng_np.normal(scale=noise_scale, size=len(jittered))
-                            try:
-                                jittered_forecast = champion_forecast(pl.from_pandas(jittered))
-                            except Exception:
-                                continue
-                            if jittered_forecast.empty:
-                                continue
-                            jittered_mase = window_mase(jittered_forecast, avg_1s, D, champion_freq)
-                            deltas.append(jittered_mase - baseline_mase)
-                        importance_records.append({
-                            'target': target, 'market': market, 'D': D, 'freq': champion_freq,
-                            'regression': champion_regression, 'timestamp': date_test, 'feature': col,
-                            'importance': float(np.mean(deltas)),
-                        })
     importance_df = pd.DataFrame(importance_records)
     importance_df['timestamp'] = pd.to_datetime(importance_df['timestamp'], utc=True)
     volatility_regime_champion = volatility_regime[volatility_regime['freq'] == champion_freq].drop(columns='freq')
     importance_df = pd.merge(importance_df, volatility_regime_champion, on='timestamp', how='left')
+    averaged = importance_df.groupby(
+        ['target', 'market', 'D', 'volatility_regime', 'freq', 'regression', 'feature']
+    )[['MASE']].mean().reset_index()
+    averaged['MASE'] = (averaged['MASE'] / champion_mase) - 1
     detail_path = f'{args.target_path}/crypto_option_spot/features_importance_{target}.csv'
-    importance_df.to_csv(detail_path, mode='a', header=not os.path.exists(detail_path), index=False)
-    print(f'[Done] target={target}: feature importance computed for champion '
-          f'(freq={champion_freq!r}, regression={champion_regression!r}) and stored.')
+    averaged.to_csv(detail_path, mode='a', header=not os.path.exists(detail_path), index=False)
+    print(f'[Done] target={target}: feature MASE computed for champion '
+          f'(freq={champion_freq!r}, regression={champion_regression!r}, champion_mase={champion_mase:.6f}), '
+          f'averaged over every {window_stride}th test window across all {averaged["feature"].nunique()} '
+          f'features, and stored with relative_MASE.')
 
 
 if __name__ == "__main__":
