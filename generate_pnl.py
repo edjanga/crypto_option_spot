@@ -745,7 +745,6 @@ if __name__ == '__main__':
         {'returns': diff_cum_pnl.xs('returns', level='target', drop_level=True).xs('', level='aggregated',
                                                                                    drop_level=True),
          'RV': diff_cum_pnl.loc[pd.IndexSlice[:, 'RV', :], :].xs('RV', level='target', drop_level=True)}
-    pdb.set_trace()
     for target in ['RV', 'returns']:
         tmp_diff_cum_pnl = all_diff_tmp_cum_pnl[target]
         fig = make_subplots(rows=3, cols=len(d_order.categories), shared_xaxes=False,
