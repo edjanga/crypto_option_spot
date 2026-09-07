@@ -411,14 +411,14 @@ if __name__ == '__main__':
                                      pd.to_datetime(f.split('/')[-1])+relativedelta(days=1) >= file_cutoff]
             for idx_file in range(1, len(underlying_name_dates)):
                 yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
-                yesterday_file = pl.scan_csv(f'./data_centre/option_helper_files/'
+                yesterday_file = pl.scan_csv(f'{args.target_path}/option_helper_files/'
                                              f'{underlying_name_dates[idx_file-1].split("-")[0]}/{underlying_name}/'
                                              f'{underlying_name_dates[idx_file-1]}',
                                              schema_overrides={'timestamp': pl.Datetime(time_unit='ms')})
                 yesterday_file = (
                     yesterday_file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type']))
                 yesterday_spot_underlying_file = \
-                    pl.scan_parquet(f'./data_centre/{underlying_name}/*/spot/{underlying_name_dates[idx_file-1]}')
+                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file-1]}')
                 yesterday_underlying_price = \
                     return_underlying_price_table(yesterday_spot_underlying_file).collect()
                 yesterday_straddle_data = \
@@ -460,13 +460,13 @@ if __name__ == '__main__':
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
                     continue
-                file = pl.scan_csv(f'./data_centre/option_helper_files/'
+                file = pl.scan_csv(f'{args.target_path}/option_helper_files/'
                                    f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
                                    f'{underlying_name_dates[idx_file]}',
                                    schema_overrides={'timestamp': pl.Datetime(time_unit='ms')})
                 file = file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type'])
                 today_spot_underlying_file = \
-                    pl.scan_parquet(f'./data_centre/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
+                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
                 today_underlying_price = return_underlying_price_table(today_spot_underlying_file).collect()
                 straddle_data = return_straddle_table(data=file, freq=best_model_tags['RV'][1:][-1].replace('in', ''),
                                                       underlying_price=today_underlying_price)
@@ -596,7 +596,7 @@ if __name__ == '__main__':
                                      pd.to_datetime(f.split('/')[-1]) + relativedelta(days=1) >= file_cutoff][:-1]
             for idx_file in range(1, len(underlying_name_dates)):
                 yesterday_date = pd.to_datetime(underlying_name_dates[idx_file - 1])
-                yesterday_file = pl.scan_parquet(f'./data_centre/{underlying_name}/*/spot/'
+                yesterday_file = pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/'
                                                  f'{underlying_name_dates[idx_file - 1]}')
                 yesterday_spot = return_spot_table(yesterday_file)
                 yesterday_data = \
@@ -627,7 +627,7 @@ if __name__ == '__main__':
                     continue
                 today_date = pd.to_datetime(underlying_name_dates[idx_file])
                 today_file = \
-                    pl.scan_parquet(f'./data_centre/{underlying_name}/{today_date.year}/spot/'
+                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/{today_date.year}/spot/'
                                     f'{underlying_name_dates[idx_file]}')
                 today_spot = return_spot_table(today_file)
                 today_data = \
@@ -882,7 +882,7 @@ if __name__ == '__main__':
             sharpe_file.writelines(tmp_sharpe.to_latex(escape=False, float_format='%.2f'))
     start = datetime.fromisoformat(str(args.start_date))
     end = datetime.fromisoformat(str(args.end_date))
-    rv = pl.scan_parquet('./data_centre/*/*/spot/*').select(['symbol', 'timestamp', 'mid_price[0]'])
+    rv = pl.scan_parquet(f'{args.target_path}/*/*/spot/*').select(['symbol', 'timestamp', 'mid_price[0]'])
     rv = rv.rename({'symbol': 'underlying_name',
                     'mid_price[0]': 'mid_price'}).with_columns([pl.col('timestamp').cast(pl.Datetime(time_unit='ms'))])
     rv = rv.filter(pl.col('timestamp').is_between(pl.lit(start), pl.lit(end), closed='left'))
