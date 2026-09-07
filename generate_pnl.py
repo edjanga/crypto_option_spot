@@ -411,7 +411,7 @@ if __name__ == '__main__':
                                      pd.to_datetime(f.split('/')[-1])+relativedelta(days=1) >= file_cutoff]
             for idx_file in range(1, len(underlying_name_dates)):
                 yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
-                yesterday_file = pl.scan_csv(f'{args.target_path}/option_helper_files/'
+                yesterday_file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
                                              f'{underlying_name_dates[idx_file-1].split("-")[0]}/{underlying_name}/'
                                              f'{underlying_name_dates[idx_file-1]}',
                                              schema_overrides={'timestamp': pl.Datetime(time_unit='ms')})
@@ -460,7 +460,7 @@ if __name__ == '__main__':
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
                     continue
-                file = pl.scan_csv(f'{args.target_path}/option_helper_files/'
+                file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
                                    f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
                                    f'{underlying_name_dates[idx_file]}',
                                    schema_overrides={'timestamp': pl.Datetime(time_unit='ms')})
