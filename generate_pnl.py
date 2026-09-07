@@ -404,7 +404,7 @@ if __name__ == '__main__':
     for target_underlying_name in tqdm(target_underlying_names):
         target, underlying_name = tuple(target_underlying_name)
         if target == 'RV':
-            files = glob.glob(f'./data_centre/option_helper_files/*/{underlying_name}/*')
+            files = glob.glob(f'{args.target_path}/crypto_option_spot/option_helper_files/*/{underlying_name}/*')
             files.sort()
             underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
             underlying_name_dates = [f for f in underlying_name_dates if
@@ -589,7 +589,7 @@ if __name__ == '__main__':
                 if idx_file % 20 == 0:
                     gc.collect()
         elif target == 'returns':
-            files = glob.glob(f'./data_centre/{underlying_name}/*/spot/*')
+            files = glob.glob(f'{args.target_path}/{underlying_name}/*/spot/*')
             files.sort()
             underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
             underlying_name_dates = [f for f in underlying_name_dates if
@@ -715,16 +715,9 @@ if __name__ == '__main__':
                            pd.Grouper(level='transaction_fees'), pd.Grouper(level='spread'),
                            pd.Grouper(level='timestamp', freq='D')]
     for underlying_name, target in list(itertools.product(SYMBOLS, ['RV', 'returns'])):
-        # pnl['RV'][underlying_name] = pd.concat(pnl['RV'][underlying_name])
-        # pnl['RV'][underlying_name] = pnl['RV'][underlying_name].groupby(daily_grouper_level).sum()
-        # pnl['returns'][underlying_name] = pd.concat(pnl['returns'][underlying_name])
-        # pnl['returns'][underlying_name] = pnl['returns'][underlying_name].groupby(daily_grouper_level).sum()
-        try:
-            pnl[target][underlying_name] = pd.concat(pnl[target][underlying_name])
-            pnl[target][underlying_name] = pnl[target][underlying_name].groupby(daily_grouper_level).sum()
-            gc.collect()
-        except ValueError:
-            print((target, underlying_name))
+        pnl[target][underlying_name] = pd.concat(pnl[target][underlying_name])
+        pnl[target][underlying_name] = pnl[target][underlying_name].groupby(daily_grouper_level).sum()
+        gc.collect()
     pnl = pd.concat(pd.concat([reduce(lambda l, r: l.join(r, how='outer'), pnl[target].values())])
                     for target in pnl.keys())
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
