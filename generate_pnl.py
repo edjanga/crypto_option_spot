@@ -329,18 +329,10 @@ if __name__ == '__main__':
     market_order = CategoricalDtype(categories=['$X^S$', '$X^{(S,O)}$'], ordered=True)
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='D', inclusive='left', tz='UTC')
     mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
-    # mase['timestamp'] = pd.to_datetime(mase['timestamp'], utc=True)
-    mase = mase.set_index('D')#mase.set_index(['D', 'timestamp'])
+    mase = mase.set_index('D')
     model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
                                      pd.Grouper(key='regression'),
                                      pd.Grouper(key='freq')])[['MASE']].mean()
-    # for target in ['returns', 'RV']:
-    #     model_ranking_tmp = model_ranking.xs(target, axis=0, level=0, drop_level=True)
-    #     with open(f'{args.target_path}/crypto_option_spot/mase_per_regression_freq_pair_{target}.txt', 'w') as \
-    #             mase_per_regression_freq_pair_file_tmp:
-    #         mase_per_regression_freq_pair_file_tmp.writelines(
-    #             model_ranking_tmp.unstack(0).droplevel(axis=1, level=0).loc[
-    #                 ['15min', '30min', '1h'], ['lasso', 'lightgbm', 'softs']].to_latex())
     best_model_tags = model_ranking.groupby('target').idxmin().to_dict()['MASE']
     mase_comparison = \
         model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
