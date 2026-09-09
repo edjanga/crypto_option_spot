@@ -53,7 +53,7 @@ if __name__ == '__main__':
             tmp.index = \
                 [f'${freq[:2]}\\mathrm{{{freq[2:]}}}$' if 'min' in freq else f'${freq[0]}\\mathrm{{{freq[1]}}}$'
                  for freq in tmp.index]
-            tmp.columns = ['LASSO', 'LightGBM', 'SOFTS']
+            tmp.columns = ['LightGBM', 'SOFTS']
             mase_min = tmp.min().min()
             tmp = tmp.map(lambda x, y: f'$\\mathbf{{{x:.4}}}$' if x == y else x, y=mase_min)
             tmp = tmp.style.format(decimal='.', thousands=',', precision=4)
