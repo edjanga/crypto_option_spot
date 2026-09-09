@@ -1,6 +1,5 @@
 import argparse
 import pdb
-
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 from tqdm_joblib import tqdm_joblib
@@ -14,6 +13,7 @@ from sklearn.linear_model import LinearRegression
 import numpy as np
 from scipy.stats import norm
 
+
 def bs_price(S, K, T, sigma, option_type):
     if T <= 0 or sigma <= 0:
         return max(S - K, 0) if option_type == 'call' else max(K - S, 0)
@@ -25,6 +25,7 @@ def bs_price(S, K, T, sigma, option_type):
         return S * norm.cdf(d1) - K * norm.cdf(d2)
     else:
         return K * norm.cdf(-d2) - S * norm.cdf(-d1)
+
 
 def daily_option_return_file(date: datetime, underlying_name: str, target_path: str) -> None:
     if os.path.exists(f'{target_path}/{date.year}/options/{date.strftime(DATE_FORMAT)}'):
@@ -71,12 +72,14 @@ def daily_option_return_file(date: datetime, underlying_name: str, target_path: 
                 option_chain_type.agg([pl.col('mid_price').last(), pl.col('returns').sum(), pl.col('tau').last(),
                                        pl.col('moneyness').last(), pl.col('type').last(),
                                        pl.col('underlying_price').last(), pl.col('spread').last()]))
-            os.makedirs(name=f'{args.target_path}/option_helper_files/{date.year}/{underlying_name}',
+            os.makedirs(name=f'{args.target_path}/crypto_option_spot/option_helper_files/{date.year}/{underlying_name}',
                         exist_ok=True)
             file_name = \
-                f'{args.target_path}/option_helper_files/{date.year}/{underlying_name}/{date.strftime(DATE_FORMAT)}'
+                f'{args.target_path}/crypto_option_spot/option_helper_files/{date.year}/{underlying_name}' \
+                f'/{date.strftime(DATE_FORMAT)}'
             file_exists = os.path.isfile(file_name)
             option_chain_type.collect().to_pandas().to_csv(file_name, header=not file_exists, mode='a')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all performance tables.')
@@ -84,14 +87,13 @@ if __name__ == '__main__':
     parser.add_argument('--end_date', type=str, help='End date.', default='2025-07-01')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='./data_centre')
-    parser.add_argument('--cpu_count', type=int, default=3,
-                        help='Number of processes to use for the pipeline.')
+    parser.add_argument('--cpu_count', type=int, default=3, help='Number of processes to use for the pipeline.')
     args = parser.parse_args()
     print(args)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D',  inclusive='left').date.tolist()
     for underlying_name in tqdm(SYMBOLS):
         underlying_name_dates = list(itertools.product([underlying_name], dates))
         with tqdm_joblib(tqdm(desc='Option helper files', total=len(underlying_name_dates))):
-            results = Parallel(n_jobs=-args.cpu_count, backend='loky')(
+            results = Parallel(n_jobs=args.cpu_count, backend='loky')(
                 delayed(daily_option_return_file)(underlying_name_date[1], underlying_name_date[0], args.target_path)
                 for underlying_name_date in underlying_name_dates)

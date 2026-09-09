@@ -1,7 +1,5 @@
 import argparse
 import os
-import pdb
-
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import polars as pl
 import pytz
@@ -10,10 +8,7 @@ from dateutil.relativedelta import relativedelta
 from joblib import Parallel, delayed
 import itertools
 from constants import *
-from mlforecast import MLForecast
 import lightgbm as lgb
-from sklearn.linear_model import Lasso
-from lightgbm import LGBMRegressor
 import neuralforecast
 from neuralforecast import NeuralForecast
 from neuralforecast.models import SOFTS
@@ -24,8 +19,7 @@ import random
 from constants import EARLY_STOPPING_PATIENCE
 
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
-regression_dd = {'ml': ['LGBMRegressor', 'Lasso'], 'dl': ['SOFTS']}
-regression_champion_dd = {'lasso': Lasso, 'lightgbm': LGBMRegressor, 'softs': SOFTS}
+regression_dd = {'ml': ['LGBMRegressor'], 'dl': ['SOFTS']}
 rng = random.Random(123)
 D_LIST = ['1D', '1W', '1M']
 TARGET_LIST = ['RV', 'returns']
@@ -35,13 +29,7 @@ SOFTS_MAX_INPUT_SIZE = 64
 SOFTS_VAL_FRACTION = 5
 SOFTS_MAX_VAL_SIZE = 30
 SOFTS_H_FRACTION = 0.5
-# Permutation-importance cost knobs: total evaluate_one_window() calls for feature importance
-# ~= (test windows / FEAT_IMP_EVERY_N_WINDOWS) * FEAT_IMP_MAX_COLS * FEAT_IMP_N_ITER, each
-# carrying the champion model's own forecast cost -- lower these to trade estimate precision
-# for runtime, same tradeoff as everywhere else jitter-based importance shows up in this file.
-FEAT_IMP_N_ITER = 10          # noise-jitter repeats per feature per window
-FEAT_IMP_MAX_COLS = 8         # feature columns sampled per window (None = all)
-FEAT_IMP_EVERY_N_WINDOWS = 3  # compute importance on every Nth test window; 1 = every window
+FEAT_IMP_N_ITER = 10
 
 
 def filter_market_features(features: pl.DataFrame, target: str, market: int) -> pl.DataFrame:
@@ -126,19 +114,12 @@ def train_one_window(date, features, regression: str, market: int, D: str, targe
             model = NeuralForecast(models=[model], freq=freq)
             model.fit(df=train_X, val_size=val_size)
         else:
-            model = \
-                MLForecast(models=lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=500,
-                                                    n_jobs=1, subsample=0.8, colsample_bytree=0.8),
-                           freq=freq, target_transforms=[])
-            model.fit(train_X, fitted=False, static_features=[])
-            model2 = MLForecast(models=Lasso(alpha=0.001), freq=freq, target_transforms=[])
-            num_cols = train_X.select_dtypes(include='number').columns
-            train_group = train_X.groupby('unique_id')[num_cols].agg(['mean', 'std'])
-            mean = train_group.xs('mean', axis=1, level=1)
-            std = train_group.xs('std', axis=1, level=1).clip(lower=1e-8)
-            train_X = train_X.set_index(['unique_id', 'ds']).subtract(mean, axis=0).div(std, axis=0).reset_index()
-            model2.fit(train_X, fitted=False, static_features=[])
-            model = [model, model2, train_group]
+            feature_cols = [c for c in train_X.columns if c not in ('unique_id', 'ds', 'y')]
+            lgb_model = lgb.LGBMRegressor(force_col_wise=True, learning_rate=1e-1, n_estimators=500,
+                                          n_jobs=1, subsample=0.8, colsample_bytree=0.8)
+            lgb_model.fit(train_X[feature_cols], train_X['y'])
+            model = {'lightgbm': lgb_model, 'feature_cols': feature_cols,
+                     'last_date': train_X.groupby('unique_id')['ds'].max()}
         return (date, regression, market, D), (model, avg_1s)
     except Exception as e:
         print(f"WARNING: training window ({date}, {regression}, market={market}, D={D}) failed "
@@ -150,23 +131,18 @@ def get_n_heads(regression: str) -> int:
     return 1
 
 
-def direct_predict(fitted_mlforecast, model_name: str, X_df: pd.DataFrame) -> pd.DataFrame:
-    features_order = fitted_mlforecast.ts.features_order_
-    missing = [c for c in features_order if c not in X_df.columns]
-    if missing:
-        raise ValueError(f'direct_predict: X_df is missing required feature columns {missing}')
-    fitted_est = fitted_mlforecast.models_[model_name]
-    preds = fitted_est.predict(X_df[features_order])
-    out = X_df[['unique_id', 'ds']].copy()
-    out[model_name] = preds
-    return out
-
-
 def evaluate_one_window(model, regression: str, target: str, freq: str, n_steps_ahead_scaler, main_features):
     n_heads = 1
     if regression != 'dl':
-        lightgbm_model = model[0]
-        idx_test = lightgbm_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
+        h = n_heads * n_steps_ahead_scaler
+        lgb_model = model['lightgbm']
+        feature_cols = model['feature_cols']
+        last_date = model['last_date']
+        idx_test = pd.concat([
+            pd.DataFrame({'unique_id': uid,
+                         'ds': pd.date_range(start=ld + pd.Timedelta(freq), periods=h, freq=freq)})
+            for uid, ld in last_date.items()
+        ], ignore_index=True)
         test_X = pl.from_pandas(idx_test).with_columns(pl.col('ds').cast(pl.Datetime('us'))).rename(
             {'unique_id': 'underlying_name', 'ds': 'timestamp'}).join(main_features,
                                                                       on=['underlying_name', 'timestamp'], how='left')
@@ -177,22 +153,14 @@ def evaluate_one_window(model, regression: str, target: str, freq: str, n_steps_
         test_X[fill_cols] = test_X.groupby(level=0)[fill_cols].ffill()
         test_X[fill_cols] = test_X.groupby(level=0)[fill_cols].bfill()
         test_X = test_X.reset_index()
-        lightgbm_y = direct_predict(lightgbm_model, 'LGBMRegressor',
-                                    test_X.drop(columns=[target])).set_index(['unique_id', 'ds'])
-        lasso_model, stats = model[1], model[2]
-        mean, std = stats.xs('mean', axis=1, level=1), stats.xs('std', axis=1, level=1).clip(lower=1e-8)
-        test_lasso_X = test_X.copy().rename(columns={target: 'y'}).set_index(['unique_id', 'ds'])
-        test_lasso_X = test_lasso_X.subtract(mean, axis=0).div(std, axis=0).reset_index()
-        lasso_feature_cols = [c for c in test_lasso_X.columns if c not in ('unique_id', 'ds', 'y')]
-        n_nan_before = test_lasso_X[lasso_feature_cols].isna().sum().sum()
-        if n_nan_before > 0:
-            print(f"WARNING: {n_nan_before} NaN value(s) remained in test_lasso_X after ffill/bfill and "
-                  f"z-scoring -- filling with 0 (= training mean) so Lasso.predict() doesn't crash.")
-            test_lasso_X[lasso_feature_cols] = test_lasso_X[lasso_feature_cols].fillna(0)
-        lasso_y = direct_predict(lasso_model, 'Lasso', test_lasso_X.drop(columns='y'))
-        lasso_y = lasso_y.set_index(['unique_id', 'ds'])
-        lasso_y['Lasso'] = lasso_y['Lasso'].mul(std['y'], axis=0, level=0).add(mean['y'], axis=0, level=0)
-        tmp_model = [lightgbm_y, lasso_y]
+
+        missing_cols = [c for c in feature_cols if c not in test_X.columns]
+        if missing_cols:
+            raise ValueError(f'evaluate_one_window: test_X is missing required feature columns {missing_cols}')
+        lightgbm_y = test_X[['unique_id', 'ds']].copy()
+        lightgbm_y['LGBMRegressor'] = lgb_model.predict(test_X[feature_cols])
+        lightgbm_y = lightgbm_y.set_index(['unique_id', 'ds'])
+        tmp_model = [lightgbm_y]
     else:
         softs_model = model
         idx_test = softs_model.make_future_dataframe(h=n_heads * n_steps_ahead_scaler)
@@ -252,7 +220,7 @@ def resolve_trained_entry(trained_models, date_grid, date, regression, market, D
         if entry is None:
             continue
         model, avg_1s = entry
-        if isinstance(model, (list, neuralforecast.core.NeuralForecast)):
+        if isinstance(model, (dict, neuralforecast.core.NeuralForecast)):
             return (model, avg_1s)
     return None
 

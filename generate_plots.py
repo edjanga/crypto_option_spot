@@ -1,11 +1,6 @@
-import os.path
-import pdb
 import plotly.express as px
-import numpy as np
 import pandas as pd
-import pytz
 import argparse
-import re
 from constants import TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, HEIGHT, WIDTH, SYMBOLS
 from pandas.api.types import CategoricalDtype
 import plotly.graph_objects as go
@@ -22,58 +17,6 @@ d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
 volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
 market_order = CategoricalDtype(categories=[0, 1], ordered=True)
 
-
-# def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool) -> None:
-#     fig = make_subplots(rows=1 if aggregated else len(SYMBOLS), cols=1, vertical_spacing=.1, shared_xaxes=False,
-#                         row_titles=None if aggregated else SYMBOLS,
-#                         row_heights=None if aggregated else [.18] * len(SYMBOLS))
-#     tmp_crypto_svix = crypto_svix.xs(int(aggregated), axis=0, level=0, drop_level=True)
-#     if aggregated:
-#         tmp_crypto_svix = tmp_crypto_svix.drop('underlying_name', axis=1)
-#         for idx, D in enumerate(d_order.categories):
-#             tmp_svix = tmp_crypto_svix.xs(D, level=0, axis=0, drop_level=True)
-#             tmp_svix = tmp_svix.resample('7D').mean()
-#             fig.add_trace(trace=go.Scatter(x=tmp_svix.index.tz_convert(None), y=tmp_svix['svix'].values,
-#                                            line=dict(color=px.colors.qualitative.Plotly[idx], width=3),
-#                                            name=f'Crypto SVIX<sub>0<span>&#10230;</span>{D}</sub>', showlegend=True),
-#                           row=1, col=1)
-#         fig.update_xaxes(tickangle=45)
-#         fig.update_layout(title=dict(text='<b>Term Structure of Crypto SVIX</b>', font=dict(size=TITLE_FONT_SIZE)),
-#                           font=dict(size=LABEL_AXIS_FONT_SIZE), width=1.25 * WIDTH, height=.75 * HEIGHT,
-#                           legend=dict(font=dict(size=LABEL_AXIS_FONT_SIZE)))
-#         fig.update_annotations(font=dict(size=LABEL_AXIS_FONT_SIZE))
-#     else:
-#         for pair in (pairs_order.categories):
-#             tmp_svix = crypto_svix.dropna().query('underlying_name == @pair').drop('underlying_name', axis=1)
-#             tmp_svix = tmp_svix.droplevel(level=0, axis=0).reset_index(0)
-#             tmp_svix = \
-#                 pd.pivot_table(tmp_svix, columns='D', values='svix', index='timestamp').resample('7D').mean()
-#             tmp_svix = tmp_svix.loc[:, d_order.categories]
-#             for idx in range(0, 3):
-#                 fig.add_trace(
-#                     trace=go.Scatter(
-#                         x=tmp_svix.index.tz_convert(None), y=tmp_svix.iloc[:, idx].values,
-#                         line=dict(color=px.colors.qualitative.Plotly[idx], width=3),
-#                         showlegend=pair == 'BTCUSDT'), row=list(pairs_order.categories).index(pair)+1, col=1)
-#         fig.update_xaxes(tickangle=45)
-#         fig.for_each_annotation(lambda x: x.update({'text': f'{x["text"].split("=")[-1].replace("USDT","/USDT")}'}),
-#                                 selector=lambda x: 'USDT' in x['text'])
-#         fig.update_layout(title=dict(text=f'<b>Term Structure of Crypto SVIX across Crypto Pairs</b>',
-#                                      font=dict(size=2 * TITLE_FONT_SIZE)), font=dict(size=2 * LABEL_AXIS_FONT_SIZE),
-#                           width=2 * WIDTH, height=len(SYMBOLS) * HEIGHT,
-#                           legend=dict(font=dict(size=2 * LABEL_AXIS_FONT_SIZE)))
-#         fig.update_annotations(font=dict(size=2 * LABEL_AXIS_FONT_SIZE))
-#     fig.update_xaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False)
-#     fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False)
-#     fig.update_traces(line=dict(width=5))
-#     fig.update_layout(title=dict(x=0.5, y=1, xanchor='center', yanchor='top', pad=dict(b=150, t=10)),
-#                       legend=dict(orientation='h', yanchor='top',
-#                                   y=dict([(True, -0.35), (False, -0.075)])[aggregated], xanchor='center', x=0.5,
-#                                   #font=dict(size=LABEL_AXIS_FONT_SIZE),
-#                                   itemwidth=100),
-#                       paper_bgcolor='white', plot_bgcolor='white')
-#     fig.write_image(f'../figures/svix{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
-#                     format='pdf')
 def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool) -> None:
     fig = make_subplots(
         rows=1 if aggregated else len(SYMBOLS),
@@ -162,103 +105,23 @@ def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool) -> None:
     fig.write_image(f'../figures/svix{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf', format='pdf')
 
 
-def plot_feature_importance(feature_importance_ranking: pd.DataFrame, target) -> None:
-    tmp_target = target.lower() if target == 'Returns' else target
-    title = f'<b>Ranking of Predictive Features - {target}</b>'
-    fig = px.bar(data_frame=feature_importance_ranking.query(f'target == "{tmp_target}"'), x='MASE', y='rank',
-                 facet_col='volatility_regime', facet_row='D', orientation='h', color='MASE',
-                 category_orders={'volatility_regime': volatility_order.categories, 'D': d_order.categories,
-                                  'rank': list(range(5, 1, -1))}, text='feature',
-                 range_color=[feature_importance_ranking.query(f'target == "{tmp_target}"').MASE.min(),
-                              feature_importance_ranking.query(f'target == "{tmp_target}"').MASE.max()],
-                 color_continuous_scale=px.colors.sequential.Viridis, facet_col_spacing=0.15,
-                 title=title)
-    fig.update_traces(textposition='inside', insidetextanchor='start',
-                      textfont=dict(size=LABEL_AXIS_FONT_SIZE, color='white'))
-    fig.update_yaxes(matches=None, showticklabels=True, title='', categoryorder='array',
-                     categoryarray=list(range(5, 1, -1)))
-    fig.update_xaxes(matches=None)
-    fig.for_each_annotation(lambda x: x.update({'text': f'<i>{x["text"].split("=")[-1].lower()}</i>'}),
-                            selector=lambda x: 'D=' in x['text'])
-    fig.for_each_annotation(lambda x: x.update({'text': f'<i>{x["text"].split("=")[-1].lower()}</i>'}),
-                            selector=lambda x: 'volatility_regime' in x['text'])
-    fig.update_layout(title=dict(font=dict(size=1.75 * TITLE_FONT_SIZE), x=0.5, xanchor='center', y=0.98,
-                                 yanchor='top'), margin=dict(t=120, l=80, r=80, b=80),
-                      font=dict(size=LABEL_AXIS_FONT_SIZE), width=1.33 * WIDTH, height=1.5 * HEIGHT,
-                      coloraxis_colorbar=dict(title=dict(text='MASE')),
-                      yaxis=dict(categoryorder='array', categoryarray=[5, 4, 3, 2, 1]),
-                      paper_bgcolor='white', plot_bgcolor='white')
-    fig.update_traces(texttemplate='%{text}: %{x:.4f}', textposition='inside', cliponaxis=False)
-    fig.update_layout(title=dict(text=title, x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=150)))
-    fig.update_xaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False)
-    fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False)
-    fig.write_image(f'../figures/feature_importance_{target.lower()}.pdf', format='pdf')
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all the plots.')
     parser.add_argument('--type', type=str, help='Type of plot to display', default='svix_rv_vrp')
     args = parser.parse_args()
     print(args)
     mase = pd.read_csv(f'../data_centre/crypto_option_spot/metric.csv')
-    # mase['timestamp'] = pd.to_datetime(mase['timestamp'], utc=True)
-    mase = mase.set_index('D')# mase.set_index(['D', 'timestamp'])
+    mase = mase.set_index('D')
     model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
                                      pd.Grouper(key='regression'),
                                      pd.Grouper(key='freq')])[['MASE']].mean()
-    for target in ['returns', 'RV']:
-        model_ranking_tmp = model_ranking.xs(target, axis=0, level=0, drop_level=True)
-        with open(f'../data_centre/crypto_option_spot/mase_per_regression_freq_pair_{target}.txt', 'w') as \
-                mase_per_regression_freq_pair_file_tmp:
-            mase_per_regression_freq_pair_file_tmp.writelines(
-                model_ranking_tmp.unstack(0).droplevel(axis=1, level=0).loc[
-                    ['15min', '30min', '1h'], ['lasso', 'lightgbm', 'softs']].to_latex())
     mase_comparison = \
         model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
     best_model_tags = model_ranking.groupby('target').idxmin().to_dict()['MASE']
     ####################################################################################################################
-    ## Feature importance
-    ####################################################################################################################
-    if args.type == 'feature_importance':
-        feature_importance = pd.read_csv('../data_centre/crypto_option_spot/features_importance.csv')
-        feature_importance = feature_importance.rename(columns={'importance': 'MASE'})
-        for target, values in best_model_tags.items():
-            regression, freq = values[1:]
-            target_feature_importance = feature_importance.query('(regression == @regression) and (freq == @freq)')
-            target_feature_importance['D'] = target_feature_importance['D'].str.lower()
-            target_feature_importance = target_feature_importance.drop(['freq', 'market'], axis=1)
-            # target_feature_importance['timestamp'] = \
-            #     pd.to_datetime(target_feature_importance['timestamp'], utc=pytz.UTC)
-            target_feature_importance = target_feature_importance.set_index('D')
-            # target_feature_importance.set_index(['D', 'timestamp'])
-            feature_importance_ranking = target_feature_importance.groupby(by=[pd.Grouper(key='target'),
-                                                                               pd.Grouper(key='volatility_regime'),
-                                                                               pd.Grouper(key='feature'),
-                                                                               pd.Grouper(level='D')])[['MASE']].mean()
-            feature_importance_mean = feature_importance_ranking.groupby(
-                    by=[pd.Grouper(level=0), pd.Grouper(level=1), pd.Grouper(level=-1)]).mean().rename(
-                columns={'MASE': 'benchmark'})
-            feature_importance_ranking = (
-                feature_importance_ranking.join(feature_importance_mean, on=['target', 'volatility_regime', 'D']))
-            feature_importance_ranking = \
-                feature_importance_ranking.groupby(by=[pd.Grouper(level='target'), pd.Grouper(level='volatility_regime'),
-                                                       pd.Grouper(level='D')],
-                                                   group_keys=False).apply(
-                    lambda g: g.nlargest(5, 'MASE')).reset_index()
-            feature_importance_ranking['MASE'] = feature_importance_ranking['MASE'].round(4)
-            feature_importance_ranking = \
-                feature_importance_ranking.sort_values('MASE', ascending=False).groupby(['target', 'D',
-                                                                                         'volatility_regime'],
-                                                                                        group_keys=False).apply(
-                    lambda g: g.assign(rank=g['MASE'].rank(method='first', ascending=False).astype(int).astype(str)))
-            feature_importance_ranking['feature'] = \
-                feature_importance_ranking.feature.str.replace(r'_1([DWM])', lambda m: f"_1{m.group(1).lower()}",
-                                                                regex=True)
-            plot_feature_importance(feature_importance_ranking, target)
-    ####################################################################################################################
     ## Crypto SVIX, RV, and VRP
     ####################################################################################################################
-    elif args.type == 'svix_rv_vrp':
+    if args.type == 'svix_rv_vrp':
         svix_parquet = Path('../data_centre/crypto_option_spot/svix.parquet')
         svix_csv = Path('../data_centre/crypto_option_spot/svix.csv')
         if svix_parquet.exists():
@@ -278,8 +141,8 @@ if __name__ == '__main__':
         ################################################################################################################
         ## Crypto SVIX
         ################################################################################################################
-        # plot_svix(crypto_svix, True)
-        # plot_svix(crypto_svix, False)
+        plot_svix(crypto_svix, True)
+        plot_svix(crypto_svix, False)
         ################################################################################################################
         ## Crypto SVIX, RV, and VRP
         ################################################################################################################
@@ -327,7 +190,7 @@ if __name__ == '__main__':
                 rv_pair = pd.pivot(rv_pair.reset_index(0), columns='market', values=['forecast', 'rv'])
                 rv_pair = rv_pair['forecast']
                 rv_pair.columns = ['rv_0', 'rv_1']
-                rv_pair = rv_pair.dropna().mul(100)
+                rv_pair = rv_pair.dropna()#.mul(100)
                 try:
                     svix = tmp_pair.drop('underlying_name', axis=1).droplevel(axis=0, level=0)
                 except KeyError:
