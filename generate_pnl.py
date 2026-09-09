@@ -22,18 +22,9 @@ import plotly.express as px
 import polars as pl
 from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, SYMBOLS, DAYS_CONVERTER, VOL_REGIMES, \
                        TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, WIDTH, HEIGHT
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT']
-# Transaction-cost model constants (formerly config.DERIBIT_FEE_PREMIUM_PCT / config.BINANCE_TF)
-DERIBIT_FEE_PREMIUM_PCT = 0.125   # Deribit option fee, linear-bound simplification: TF = 0.125*(C+P)
-BINANCE_TF = 0.001                # Binance spot taker fee (flat rate)
-# NEW: fee CAP for straddle trading, expressed as basis points of the UNDERLYING's own
-# spot price -- the fee is the LESSER of a percentage-of-premium charge and a small
-# percentage-of-notional cap, so percentage-of-premium alone doesn't become excessive
-# for expensive, deep-ITM or long-dated options.
-MIN_FEE_BPS_UNDERLYING = 0.0006   # 6bps of underlying price
-
-
-import os
+DERIBIT_FEE_PREMIUM_PCT = 0.125
+BINANCE_TF = 0.001
+MIN_FEE_BPS_UNDERLYING = 0.0006
 
 
 def _reindex_cols(df, cols):
@@ -44,9 +35,7 @@ def _reindex_cols(df, cols):
 
 non_expired = {'15m': pd.to_timedelta('15min') / pd.to_timedelta('360D'),
                '30m': pd.to_timedelta('30min') / pd.to_timedelta('360D'),
-               '1h': pd.to_timedelta('1h') / pd.to_timedelta('360D'),
-               '3h': pd.to_timedelta('3h') / pd.to_timedelta('360D'),
-               '6h': pd.to_timedelta('6h') / pd.to_timedelta('360D'),}
+               '1h': pd.to_timedelta('1h') / pd.to_timedelta('360D')}
 
 
 def callback(study, trial) -> None:
@@ -395,7 +384,7 @@ if __name__ == '__main__':
     mean_bar = mean_bar.reindex(data_per_target['RV'].index).ffill()
     mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(date_range), :]
     target_underlying_names = list(itertools.product(['RV', 'returns'], SYMBOLS))
-    file_cutoff = pd.Timestamp(args.start_date) + relativedelta(days=DAYS_CONVERTER['3M']+1)
+    file_cutoff = pd.Timestamp(args.start_date) # + relativedelta(days=DAYS_CONVERTER['3M']+1)
     pnl = \
         dict([(target, dict([(underlying_name, list()) for underlying_name in SYMBOLS]))
               for target in ['RV', 'returns']])
@@ -407,8 +396,10 @@ if __name__ == '__main__':
             files = glob.glob(f'{args.target_path}/crypto_option_spot/option_helper_files/*/{underlying_name}/*')
             files.sort()
             underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
-            underlying_name_dates = [f for f in underlying_name_dates if
-                                     pd.to_datetime(f.split('/')[-1])+relativedelta(days=1) >= file_cutoff]
+            underlying_name_dates = \
+                [date for date in underlying_name_dates if
+                 (pd.to_datetime(date) + relativedelta(days=1) >= file_cutoff) &
+                 (pd.to_datetime(date) < pd.Timestamp(args.end_date))]
             for idx_file in range(1, len(underlying_name_dates)):
                 yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
                 yesterday_file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
@@ -428,7 +419,7 @@ if __name__ == '__main__':
                 yesterday_mean_bar = mean_bar[mean_bar.index.date == yesterday_date.date()][underlying_name]
                 yesterday_data = data_per_target['RV'][data_per_target['RV'].index.date == yesterday_date.date()]
                 tradable_assets = yesterday_data.columns.get_level_values('underlying_name').unique().shape[0]
-                if yesterday_data.isnull().any().sum() > 0:
+                if yesterday_data.isnull().all().sum() > 0:
                     continue
                 yesterday_data = \
                     yesterday_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
@@ -455,7 +446,7 @@ if __name__ == '__main__':
                     lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
                         study.user_attrs['lower_bound_atm'], \
                         study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
-                except (ValueError, KeyError) as exc:
+                except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError) as exc:
                     print(f"WARNING: RV {underlying_name} day {idx_file} "
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
@@ -584,7 +575,8 @@ if __name__ == '__main__':
                 returns = returns_table(returns, fees=None, underlying_name=underlying_name)
                 returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
                 returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
-                pnl[target][underlying_name].append(pd.concat([returns, returns_tc, returns_basc]))
+                returns_tmp = pd.concat([returns, returns_tc, returns_basc])
+                pnl[target][underlying_name].append(returns_tmp)
                 del returns, returns_tc, returns_basc, straddle_data, study
                 if idx_file % 20 == 0:
                     gc.collect()
@@ -594,7 +586,7 @@ if __name__ == '__main__':
             underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
             underlying_name_dates = [f for f in underlying_name_dates if
                                      pd.to_datetime(f.split('/')[-1]) + relativedelta(days=1) >= file_cutoff][:-1]
-            for idx_file in range(1, len(underlying_name_dates)):
+            for idx_file in range(1, len(underlying_name_dates)-1):
                 yesterday_date = pd.to_datetime(underlying_name_dates[idx_file - 1])
                 yesterday_file = pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/'
                                                  f'{underlying_name_dates[idx_file - 1]}')
@@ -635,8 +627,11 @@ if __name__ == '__main__':
                     forecast_underlying_name[:, :, target, :]]
                 today_data = today_data.dropna(axis=1, how='all')
                 tradable_assets = today_data.columns.get_level_values('underlying_name').unique().shape[0]
-                today_forecast = \
-                    today_data.loc[:, forecast_underlying_name['forecast', underlying_name, target, :]]
+                try:
+                    today_forecast = \
+                        today_data.loc[:, forecast_underlying_name['forecast', underlying_name, target, :]]
+                except KeyError:
+                    continue
                 today_forecast = today_forecast.droplevel(level=[0, 1, 2], axis=1)
                 markets = today_forecast.columns.get_level_values('market').unique().tolist()
                 signals = np.sign(today_forecast)
@@ -715,8 +710,11 @@ if __name__ == '__main__':
                            pd.Grouper(level='transaction_fees'), pd.Grouper(level='spread'),
                            pd.Grouper(level='timestamp', freq='D')]
     for underlying_name, target in list(itertools.product(SYMBOLS, ['RV', 'returns'])):
-        pnl[target][underlying_name] = pd.concat(pnl[target][underlying_name])
-        pnl[target][underlying_name] = pnl[target][underlying_name].groupby(daily_grouper_level).sum()
+        index_names = pnl[target][underlying_name][0].index.names
+        combined = \
+            pd.concat(
+                [df.reset_index() for df in pnl[target][underlying_name]], ignore_index=True).set_index(index_names)
+        pnl[target][underlying_name] = combined.groupby(daily_grouper_level).sum()
         gc.collect()
     pnl = pd.concat(pd.concat([reduce(lambda l, r: l.join(r, how='outer'), pnl[target].values())])
                     for target in pnl.keys())
