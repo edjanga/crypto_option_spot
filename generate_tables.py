@@ -60,7 +60,6 @@ if __name__ == '__main__':
             with open(f'{args.target_path}/crypto_option_spot/mase_per_regression_freq_pair_{target}.txt', 'w') as \
                     mase_per_regression_pair:
                 mase_per_regression_pair.writelines(tmp.to_latex())
-        pdb.set_trace()
         metric_per_target = dict()
         tmp = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
         for target, values in mase_comparison.items():
