@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 import polars as pl
-from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, SYMBOLS, DAYS_CONVERTER, VOL_REGIMES, \
+from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, DAYS_CONVERTER, VOL_REGIMES, \
                        TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, WIDTH, HEIGHT
 DERIBIT_FEE_PREMIUM_PCT = 0.125
 BINANCE_TF = 0.001
@@ -182,13 +182,14 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
                                    suffix='_delta_weights')
         exprs = []
         for D in data.columns.get_level_values('D').unique().tolist():
-            exprs += [((pl.col('returns') * pl.col(D) - (pl.col('transaction_fees') *
-                                                         pl.col(f'{D}_delta_weights')).abs()).fill_null(0)).alias(
-                f'returns_tc_{D}'),
-                      ((pl.col('returns') * pl.col(D) - (pl.col('basc_fees') *
-                                                         pl.col(f'{D}_delta_weights')).abs()).fill_null(0)).alias(
-                          f'returns_basc_{D}'),
-                      (pl.col('returns') * pl.col(D)).alias(f'returns_{D}')]
+            exprs += pnl_expressions(
+                return_col='returns',
+                weight_col=D,
+                delta_weight_col=f'{D}_delta_weights',
+                transaction_fee_col='transaction_fees',
+                basc_fee_col='basc_fees',
+                D=D,
+            )
         spot_data = spot_data.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
         spot_data = spot_data.with_columns(exprs)
         spot_data = spot_data.drop(['returns', 'transaction_fees']+data.columns.get_level_values('D').tolist() +
@@ -227,6 +228,18 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
     return trial.user_attrs['sharpe']
 
 
+def pnl_expressions(return_col: str, weight_col: str, delta_weight_col: str,
+                    transaction_fee_col: str, basc_fee_col: str, D: str):
+    gross = pl.col(return_col) * pl.col(weight_col)
+    tf_cost = (pl.col(transaction_fee_col) * pl.col(delta_weight_col)).abs()
+    basc_cost = (pl.col(basc_fee_col) * pl.col(delta_weight_col)).abs()
+    return [
+        (gross - tf_cost).fill_null(0).alias(f'returns_tc_{D}'),
+        (gross - basc_cost).fill_null(0).alias(f'returns_basc_{D}'),
+        gross.alias(f'returns_{D}'),
+    ]
+
+
 def return_straddle_table(data: pl.DataFrame, freq: str, underlying_price: pl.DataFrame, **kwargs) -> pl.DataFrame:
     non_expired_filter = pl.col('tau').ge(non_expired[freq])
     straddle_data = data.with_columns(pl.col('symbol').str.replace(r"-(C|P)$", "").alias('symbol'))
@@ -257,7 +270,7 @@ def return_spot_table(data: pl.DataFrame) -> pl.DataFrame:
     spot_data = spot_data.with_columns(pl.col('spreads[0]').alias('spread'),
                                        pl.col('mid_price[0]').alias('mid_price'),
                                        pl.col('mid_price[0]').log().diff().alias('returns'))
-    spot_data.sort('timestamp')
+    spot_data = spot_data.sort('timestamp')
     spot_data = \
         spot_data.group_by_dynamic(index_column='timestamp', every=best_model_tags['returns'][-1].replace('in', ''),
                                    group_by='underlying_name').agg(pl.col('spread').last(),
@@ -278,7 +291,7 @@ def return_underlying_price_table(data: pl.DataFrame) -> pl.DataFrame:
 
 def make_filter(data, **kwargs) -> pd.DataFrame:
     if target == 'RV':
-        mean_bar = kwargs['mean_bar']
+        mean_bar = kwargs['mean_bar'].droplevel(level=0, axis=1)
         filter = data[['forecast']].subtract(data[['values']].rename(columns={'values': 'forecast'}, level=0).shift())
         filter = filter.droplevel(level=0, axis=1)
         filter = filter.div(mean_bar)
@@ -371,7 +384,7 @@ if __name__ == '__main__':
     svix_agg = \
         pd.concat([svix.xs(1, axis=0, level=0,
                            drop_level=False).droplevel(axis=0, level=1).assign(underlying_name=underlying_name)
-                   for underlying_name in SYMBOLS]).set_index('underlying_name', append=True)
+                   for underlying_name in list(pairs_order.categories)]).set_index('underlying_name', append=True)
     svix_agg = svix_agg.swaplevel(-1, 1).swaplevel(-1, 2)
     svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
     svix = pd.concat([svix_agg, svix_non_agg])
@@ -383,22 +396,23 @@ if __name__ == '__main__':
         lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean().shift()).ffill()
     mean_bar = mean_bar.reindex(data_per_target['RV'].index).ffill()
     mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(date_range), :]
-    target_underlying_names = list(itertools.product(['RV', 'returns'], SYMBOLS))
-    file_cutoff = pd.Timestamp(args.start_date) # + relativedelta(days=DAYS_CONVERTER['3M']+1)
+    target_underlying_names = list(itertools.product(['RV', 'returns'], list(pairs_order.categories)))
+    file_cutoff = pd.Timestamp(args.start_date)
     pnl = \
-        dict([(target, dict([(underlying_name, list()) for underlying_name in SYMBOLS]))
+        dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
               for target in ['RV', 'returns']])
     forecast_underlying_name = pd.IndexSlice
     number_freq_period_in_day = pd.to_timedelta('1D')//pd.to_timedelta(best_model_tags['RV'][-1])
     for target_underlying_name in tqdm(target_underlying_names):
         target, underlying_name = tuple(target_underlying_name)
+        underlying_name_mean_bar = mean_bar.loc[:, mean_bar.columns.get_level_values(0) == underlying_name]
         if target == 'RV':
             files = glob.glob(f'{args.target_path}/crypto_option_spot/option_helper_files/*/{underlying_name}/*')
             files.sort()
             underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
             underlying_name_dates = \
                 [date for date in underlying_name_dates if
-                 (pd.to_datetime(date) + relativedelta(days=1) >= file_cutoff) &
+                 (pd.to_datetime(date) + relativedelta(days=1) > file_cutoff) &
                  (pd.to_datetime(date) < pd.Timestamp(args.end_date))]
             for idx_file in range(1, len(underlying_name_dates)):
                 yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
@@ -416,18 +430,22 @@ if __name__ == '__main__':
                     return_straddle_table(data=yesterday_file,
                                           freq=best_model_tags['RV'][-1].replace('in', ''),
                                           underlying_price=yesterday_underlying_price)
-                yesterday_mean_bar = mean_bar[mean_bar.index.date == yesterday_date.date()][underlying_name]
+                yesterday_mean_bar = \
+                    underlying_name_mean_bar[underlying_name_mean_bar.index.date == yesterday_date.date()]
+                if yesterday_mean_bar.dropna().empty:
+                    continue
                 yesterday_data = data_per_target['RV'][data_per_target['RV'].index.date == yesterday_date.date()]
-                tradable_assets = yesterday_data.columns.get_level_values('underlying_name').unique().shape[0]
-                if yesterday_data.isnull().all().sum() > 0:
+                tradable_assets = yesterday_data.isnull().all().groupby('underlying_name').sum()
+                tradable_assets = tradable_assets[tradable_assets == 0].index
+                if underlying_name not in tradable_assets:
                     continue
                 yesterday_data = \
                     yesterday_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
                 yesterday_data = yesterday_data.droplevel(level=[1, 2], axis=1)
                 yesterday_filter = make_filter(data=yesterday_data, mean_bar=yesterday_mean_bar)
                 yesterday_svix_underlying_name = \
-                    svix.loc[(svix.index.get_level_values(3).date == yesterday_date.date())&
-                            (svix.index.get_level_values(1) == underlying_name), ['svix']]
+                    svix.loc[(svix.index.get_level_values(3).date == yesterday_date.date()) &
+                              (svix.index.get_level_values(1) == underlying_name), ['svix']]
                 yesterday_svix_underlying_name = yesterday_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
                 yesterday_svix_underlying_name = yesterday_svix_underlying_name.droplevel(axis=1, level=0)
                 yesterday_svix_underlying_name.columns = yesterday_svix_underlying_name.columns.str.upper()
@@ -467,7 +485,7 @@ if __name__ == '__main__':
                         ['symbol', 'type', pl.col('timestamp').dt.date()]) == number_freq_period_in_day)
                 straddle_data = straddle_data.filter(pl.len().over(['symbol', pl.col('timestamp')]) == 2)
                 today_date = pd.to_datetime(underlying_name_dates[idx_file])
-                today_mean_bar = mean_bar[mean_bar.index.date == today_date.date()][underlying_name]
+                today_mean_bar = underlying_name_mean_bar[mean_bar.index.date == today_date.date()]
                 today_data = \
                     data_per_target['RV'].loc[data_per_target['RV'].index.date == today_date.date()]
                 today_data = today_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
@@ -501,7 +519,13 @@ if __name__ == '__main__':
                 today_vrp_underlying_name = today_vrp_underlying_name.groupby('aggregated', group_keys=False)
                 today_signals_underlying_name = today_vrp_underlying_name.apply(lambda x: x.shift())
                 today_number_of_unique_straddles = straddle_data.select(pl.col('symbol').n_unique()).collect().item()
-                today_signals_underlying_name = today_signals_underlying_name.div(today_number_of_unique_straddles)
+                today_active_count = today_signals_underlying_name.ne(0).sum(axis=1)
+                today_signals_underlying_name = (
+                    today_signals_underlying_name
+                    .div(today_number_of_unique_straddles)
+                    .div(today_active_count.replace(0, np.nan), axis=0)
+                    .fillna(0)
+                )
                 today_delta_weights = \
                     today_signals_underlying_name.groupby('aggregated', group_keys=False).apply(lambda x: x.diff())
                 today_delta_weights = \
@@ -661,13 +685,14 @@ if __name__ == '__main__':
                                              how='left', suffix='_delta_weights')
                 exprs = []
                 for D in today_forecast.columns.get_level_values('D').unique().tolist():
-                    exprs += [((pl.col('returns') * pl.col(D) - (pl.col('transaction_fees') *
-                                                                 pl.col(f'{D}_delta_weights')).abs()).fill_null(
-                        0)).alias(f'returns_tc_{D}'),
-                              ((pl.col('returns') * pl.col(D) - (pl.col('basc_fees') *
-                                                                 pl.col(f'{D}_delta_weights')).abs()).fill_null(
-                                  0)).alias(f'returns_basc_{D}'),
-                              (pl.col('returns') * pl.col(D)).alias(f'returns_{D}')]
+                    exprs += pnl_expressions(
+                        return_col='returns',
+                        weight_col=D,
+                        delta_weight_col=f'{D}_delta_weights',
+                        transaction_fee_col='transaction_fees',
+                        basc_fee_col='basc_fees',
+                        D=D,
+                    )
                 today_spot = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
                 today_spot = today_spot.with_columns(exprs)
                 today_spot = today_spot.drop(
@@ -709,14 +734,18 @@ if __name__ == '__main__':
     daily_grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'),
                            pd.Grouper(level='transaction_fees'), pd.Grouper(level='spread'),
                            pd.Grouper(level='timestamp', freq='D')]
-    for underlying_name, target in list(itertools.product(SYMBOLS, ['RV', 'returns'])):
-        index_names = pnl[target][underlying_name][0].index.names
-        combined = \
-            pd.concat(
-                [df.reset_index() for df in pnl[target][underlying_name]], ignore_index=True).set_index(index_names)
-        pnl[target][underlying_name] = combined.groupby(daily_grouper_level).sum()
-        gc.collect()
-    pnl = pd.concat(pd.concat([reduce(lambda l, r: l.join(r, how='outer'), pnl[target].values())])
+    for underlying_name, target in list(itertools.product(list(pairs_order.categories), ['RV', 'returns'])):
+        try:
+            index_names = pnl[target][underlying_name][0].index.names
+            combined = \
+                pd.concat(
+                    [df.reset_index() for df in pnl[target][underlying_name]], ignore_index=True).set_index(index_names)
+            pnl[target][underlying_name] = combined.groupby(daily_grouper_level).sum()
+            gc.collect()
+        except IndexError:
+            continue
+    pnl = pd.concat(pd.concat([reduce(lambda l, r: l.join(r, how='outer'), dfs)
+                               for dfs in [[df for df in pnl[target].values() if isinstance(df, pd.DataFrame)]] if dfs])
                     for target in pnl.keys())
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
                      pd.Grouper(level='spread')]
@@ -744,7 +773,7 @@ if __name__ == '__main__':
                                              'P&L<sup><span>&#8212;</span>TF</sup>',
                                              'P&L<sup><span>&#8212;</span>BASC</sup>'],
                                  column_titles=[f'<i>{D}</i>' for D in d_order.categories])
-        for idx, pair in enumerate(SYMBOLS):
+        for idx, pair in enumerate(list(pairs_order.categories)):
             tmp_diff_cum_pnl_pair = tmp_diff_cum_pnl.xs(pair, axis=1)
             if target == 'RV':
                 tmp_diff_cum_pnl_pair = \
@@ -801,9 +830,9 @@ if __name__ == '__main__':
                                      x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                      font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                      yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
-                          height=5 * len(d_order.categories) * HEIGHT,
-                          paper_bgcolor='white', plot_bgcolor='white')
+                          height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white')
         fig.update_traces(line=dict(width=30))
+        fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
         fig.update_xaxes(tickangle=45, showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
                          title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
         fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
@@ -833,9 +862,9 @@ if __name__ == '__main__':
     sharpe.columns = sharpe.columns.set_levels(['$X^S$', '$X^{(S,O)}$'], level='market')
     sharpe.columns = sharpe.columns.set_levels([r'\textit{1d}', r'\textit{1m}', r'\textit{1w}'], level='D')
     sharpe.index = sharpe.index.set_levels(['0.0', '1.0', ''], level='aggregated')
-    sharpe_columns_order = pd.MultiIndex.from_product([pairs_order.categories.tolist(),
-                                                       market_order.categories.tolist()],
-                                                      names=['underlying_name', 'market'])
+    sharpe_columns_order = \
+        pd.MultiIndex.from_product([pairs_order.categories.tolist(), market_order.categories.tolist()],
+                                   names=['underlying_name', 'market'])
     sharpe_index_order_aggregated = pd.MultiIndex.from_tuples(
         [(agg, target, rf'\textit{{{d}}}') for agg in ['', str(float(1))]
          for target in ['returns', 'RV']
@@ -934,7 +963,7 @@ if __name__ == '__main__':
     sharpe_pnl_per_vol_regime.index = \
         sharpe_pnl_per_vol_regime.index.set_levels([r'\textit{1d}', r'\textit{1w}', r'\textit{1m}'], level='D')
     sharpe_pnl_per_vol_regime_aggregated = pd.MultiIndex.from_tuples(
-        [(agg, target, f'\textit{{{vol_regime}}}', f'\textit{{{d}}}') for agg in ['', str(float(1))]
+        [(agg, target, rf'\textit{{{vol_regime}}}', rf'\textit{{{d}}}') for agg in ['', str(float(1))]
          for target in ['returns', 'RV']
          for vol_regime in volatility_order.categories.tolist()
          for d in d_order.categories.tolist()

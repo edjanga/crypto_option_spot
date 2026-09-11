@@ -1,6 +1,5 @@
 import argparse
 import os
-import pdb
 import re
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import polars as pl
@@ -20,7 +19,6 @@ from tqdm_joblib import tqdm_joblib
 import random
 from constants import EARLY_STOPPING_PATIENCE
 from typing import Dict
-
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
 regression_dd = {'ml': ['LGBMRegressor'], 'dl': ['SOFTS']}
 rng = random.Random(123)
@@ -123,15 +121,11 @@ def train_one_window(date, features, regression: str, market: int, D: str, targe
             lgb_model.fit(train_X[feature_cols], train_X['y'])
             model = {'lightgbm': lgb_model, 'feature_cols': feature_cols,
                      'last_date': train_X.groupby('unique_id')['ds'].max()}
-        return (date, regression, market, D), (model, avg_1s)
+        return (date, regression, market, D, freq), (model, avg_1s)
     except Exception as e:
-        print(f"WARNING: training window ({date}, {regression}, market={market}, D={D}) failed "
+        print(f"WARNING: training window ({date}, {regression}, market={market}, D={D}, freq={freq}) failed "
               f"({type(e).__name__}: {e}) -- no model produced for this window.")
-        return (date, regression, market, D), None
-
-
-def get_n_heads(regression: str) -> int:
-    return 1
+        return (date, regression, market, D, freq), None
 
 
 def evaluate_one_window(model, regression: str, target: str, freq: str, n_steps_ahead_scaler, main_features):
@@ -156,7 +150,6 @@ def evaluate_one_window(model, regression: str, target: str, freq: str, n_steps_
         test_X[fill_cols] = test_X.groupby(level=0)[fill_cols].ffill()
         test_X[fill_cols] = test_X.groupby(level=0)[fill_cols].bfill()
         test_X = test_X.reset_index()
-
         missing_cols = [c for c in feature_cols if c not in test_X.columns]
         if missing_cols:
             raise ValueError(f'evaluate_one_window: test_X is missing required feature columns {missing_cols}')
@@ -217,9 +210,9 @@ def process_one_test_window(trained_entry, main_features, target, freq, tmp_sum,
     return forecast.assign(freq=freq), avg_1s_tagged
 
 
-def resolve_trained_entry(trained_models, date_grid, date, regression, market, D):
+def resolve_trained_entry(trained_models, date_grid, date, regression, market, D, freq):
     for candidate_date in sorted((d for d in date_grid if d <= date), reverse=True):
-        entry = trained_models.get((candidate_date, regression, market, D))
+        entry = trained_models.get((candidate_date, regression, market, D, freq))
         if entry is None:
             continue
         model, avg_1s = entry
@@ -259,8 +252,8 @@ def run_for_target(target: str, args):
     )
     main_features_base = main_features_base.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
     main_features_by_D = dict()
-    for D in D_LIST:
-        n_heads_agg = int(pd.to_timedelta(DAYS_CONVERTER[D], unit='d') // pd.to_timedelta(args.freq))
+    for D, freq in itertools.product(D_LIST, REPORT_FREQS):
+        n_heads_agg = int(pd.to_timedelta(DAYS_CONVERTER[D], unit='d') // pd.to_timedelta(freq))
         rolled = main_features_base.sort(['underlying_name', 'timestamp']).with_columns(
             pl.col(target).rolling_sum(window_size=n_heads_agg, min_samples=n_heads_agg)
               .shift(-(n_heads_agg - 1)).over('underlying_name').alias(target)
@@ -269,71 +262,73 @@ def run_for_target(target: str, args):
             col for col in contemporanous_features[target] + [f'{c}_{D}' for c in contemporanous_features[target]]
             if col in rolled.columns
         ]
-        main_features_by_D[D] = rolled.drop(cols_to_drop)
+        main_features_by_D[(D, freq)] = rolled.drop(cols_to_drop)
     L_days = DAYS_CONVERTER[args.L]
     start_idx = np.searchsorted(dates, dates[0] + relativedelta(days=L_days))
     date_grid = dates[start_idx::L_days]
-    date_masks = {d: ((main_features_base['timestamp'] >= pl.lit(d - relativedelta(days=L_days))) &
-                      (main_features_base['timestamp'] < pl.lit(d))) for d in date_grid}
-    date_grid_regressions_markets_Ds = \
-        list(itertools.product(date_grid, list(regression_dd.keys()), [0, 1], D_LIST))
-    print(f'[Training] {len(date_grid_regressions_markets_Ds)} (date, regression, market, D) windows '
+    date_masks = \
+        {(d, D, freq): ((main_features_by_D[(D, freq)]['timestamp'] >= pl.lit(d - relativedelta(days=L_days))) &
+                        (main_features_by_D[(D, freq)]['timestamp'] < pl.lit(d)))
+         for d, D, freq in itertools.product(date_grid, D_LIST, REPORT_FREQS)}
+    date_grid_regressions_markets_Ds_freqs = \
+        list(itertools.product(date_grid, list(regression_dd.keys()), [0, 1], D_LIST, REPORT_FREQS))
+    print(f'[Training] {len(date_grid_regressions_markets_Ds_freqs)} (date, regression, market, D, freq) windows '
           f'to train across {args.cpu_count} worker(s) for target={target}.')
     with tqdm_joblib(tqdm(desc=f'Model training windows (target={target})',
-                          total=len(date_grid_regressions_markets_Ds))):
+                          total=len(date_grid_regressions_markets_Ds_freqs))):
         trained_models = dict(Parallel(n_jobs=args.cpu_count, backend='loky')(
             delayed(train_one_window)(
-                date, main_features_by_D[D].filter(date_masks[date]), regression, market, D,
-                target, args.freq, L_days)
-            for date, regression, market, D in date_grid_regressions_markets_Ds
+                date, main_features_by_D[(D, freq)].filter(date_masks[(date, D, freq)]), regression, market, D,
+                target, freq, L_days)
+            for date, regression, market, D, freq in date_grid_regressions_markets_Ds_freqs
         ))
     date_grid_np = np.array(date_grid)
     end = np.datetime64(args.end_date)
-    freq_delta = pd.to_timedelta(args.freq)
-    freq_ns = np.timedelta64(freq_delta.value, 'ns')
     date_grid_test_by_D = dict()
     date_masks_tests_by_D = dict()
     in_sample_dates_by_D = dict()
     horizon_dates_by_D = dict()
-    n_steps_ahead_scaler_by_D = dict()
-    for D in D_LIST:
+    n_steps_ahead_scaler_by_D_freq = dict()
+    for D, freq in itertools.product(D_LIST, REPORT_FREQS):
         D_days = DAYS_CONVERTER[D]
         grid_test = dates[dates.index(date_grid[0])::D_days]
-        date_masks_tests_by_D[D] = {
-            d: ((main_features_base['timestamp'] < pl.lit(d + relativedelta(days=D_days))) &
-                (main_features_base['timestamp'] >= pl.lit(d - relativedelta(days=D_days + D_days))))
+        date_masks_tests_by_D[(D, freq)] = {
+            d: ((main_features_by_D[(D, freq)]['timestamp'] < pl.lit(d + relativedelta(days=D_days))) &
+                (main_features_by_D[(D, freq)]['timestamp'] >= pl.lit(d - relativedelta(days=D_days + D_days))))
             for d in grid_test
         }
         grid_test = np.array(grid_test)
-        date_grid_test_by_D[D] = grid_test
+        date_grid_test_by_D[(D, freq)] = grid_test
         retrain_idx = np.clip(np.searchsorted(date_grid_np, grid_test, side='right') - 1, 0, len(date_grid_np) - 1)
-        in_sample_dates_by_D[D] = date_grid_np[retrain_idx]
+        in_sample_dates_by_D[(D, freq)] = date_grid_np[retrain_idx]
         _dates = pd.to_datetime(grid_test).to_numpy(dtype='datetime64[ns]')
-        horizon_dates_by_D[D] = np.minimum(_dates + np.timedelta64(D_days, 'D'), end)
-        _retrain_ts = pd.to_datetime(in_sample_dates_by_D[D]).to_numpy(dtype='datetime64[ns]')
-        _horizon_ts = pd.to_datetime(horizon_dates_by_D[D]).to_numpy(dtype='datetime64[ns]')
+        horizon_dates_by_D[(D, freq)] = np.minimum(_dates + np.timedelta64(D_days, 'D'), end)
+        _retrain_ts = pd.to_datetime(in_sample_dates_by_D[(D, freq)]).to_numpy(dtype='datetime64[ns]')
+        _horizon_ts = pd.to_datetime(horizon_dates_by_D[(D, freq)]).to_numpy(dtype='datetime64[ns]')
+        freq_delta = pd.to_timedelta(freq)
+        freq_ns = np.timedelta64(freq_delta.value, 'ns')
         raw_steps = (_horizon_ts - _retrain_ts).astype('timedelta64[ns]') / freq_ns
-        n_steps_ahead_scaler_by_D[D] = np.clip(np.ceil(raw_steps), 1, None).astype(int)
+        n_steps_ahead_scaler_by_D_freq[(D, freq)] = np.clip(np.ceil(raw_steps), 1, None).astype(int)
     for market in [1, 0]:
         all_forecasts = []
         all_avg_1s = []
-        for D in D_LIST:
+        for D, freq in itertools.product(D_LIST, REPORT_FREQS):
             main_features_test_cache = {
-                d: filter_market_features(main_features_by_D[D].filter(mask), target, market)
-                for d, mask in date_masks_tests_by_D[D].items()
+                d: filter_market_features(main_features_by_D[(D, freq)].filter(mask), target, market)
+                for d, mask in date_masks_tests_by_D[(D, freq)].items()
             }
-            date_grid_test = date_grid_test_by_D[D]
-            date_regression_grid_test = list(itertools.product(range(len(date_grid_test)), regression_dd.keys()))
-            with tqdm_joblib(tqdm(desc=f'Test windows (target={target}, market={market}, D={D})',
-                                  total=len(date_regression_grid_test))):
+            date_grid_test = date_grid_test_by_D[(D, freq)]
+            regression_grid_test = list(itertools.product(range(len(date_grid_test)), regression_dd.keys()))
+            with tqdm_joblib(tqdm(desc=f'Test windows (target={target}, market={market}, D={D}, freq={freq})',
+                                  total=len(regression_grid_test))):
                 results = Parallel(n_jobs=args.cpu_count, backend='loky')(
                     delayed(process_one_test_window)(
-                        resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[D][i], regression,
-                                              market, D),
+                        resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[(D, freq)][i],
+                                              regression, market, D, freq),
                         main_features_test_cache[date_grid_test[i]],
-                        target, args.freq, n_steps_ahead_scaler_by_D[D][i], date_grid_test[i],
-                        horizon_dates_by_D[D][i], regression, market, D)
-                    for i, regression in date_regression_grid_test)
+                        target, freq, n_steps_ahead_scaler_by_D_freq[(D, freq)][i], date_grid_test[i],
+                        horizon_dates_by_D[(D, freq)][i], regression, market, D)
+                    for i, regression in regression_grid_test)
             n_total_windows = len(results)
             pairs = [(f, a) for f, a in results if f is not None]
             n_skipped = n_total_windows - len(pairs)
@@ -356,18 +351,6 @@ def run_for_target(target: str, args):
                   f"skipping export.")
             continue
         market_forecasts = pd.concat(all_forecasts, ignore_index=True)
-        market_forecasts = market_forecasts.set_index(['underlying_name', 'timestamp'])
-        market_forecasts_by_freq = []
-        for D in D_LIST:
-            D_slice = market_forecasts[market_forecasts['D'] == D]
-            if D_slice.empty:
-                continue
-            for freq in REPORT_FREQS:
-                grouped = \
-                    D_slice.groupby(['underlying_name', 'regression',
-                                     pd.Grouper(level='timestamp', freq=freq)])[['y', 'y_hat']].sum().reset_index()
-                market_forecasts_by_freq.append(grouped.assign(D=D, freq=freq))
-        market_forecasts = pl.concat([pl.from_pandas(df) for df in market_forecasts_by_freq]).to_pandas()
         market_forecasts = market_forecasts.assign(target=target, market=market)
         avg_flat = pd.concat(all_avg_1s, ignore_index=True)
         avg_flat = avg_flat.rename(columns={'unique_id': 'underlying_name', 'retrain_date': 'timestamp'})
@@ -454,10 +437,10 @@ def run_feature_importance(target_path: str, target: str, args):
     champion_freq = re.sub(r'^\$?(\d+)\\mathrm\{([^}]+)\}\$?$', r'\1\2', champion_freq)
     print(
         f'[FeatureImportance] target={target}: '
-        f'champion freq={champion_freq!r}, '
-        f'regression={champion_regression!r} '
+        f'champion regression={champion_regression!r} '
         f'({champion_model_key}, type={champion_regression_type}), '
-        f'champion_mase={champion_mase:.6f}'
+        f'champion_mase={champion_mase:.6f}. '
+        f'Forecasting every (D, freq) pair with D in {D_LIST} and freq in {REPORT_FREQS}.'
     )
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
     volatility_regime = pl.scan_parquet(f'{args.target_path}/spot_features.parquet')
@@ -491,99 +474,103 @@ def run_feature_importance(target_path: str, target: str, args):
     main_features_base = main_features_base.with_columns(pl.all().forward_fill().over('underlying_name'))
     main_features_base = main_features_base.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
     main_features_by_D = dict()
-    for D in D_LIST:
-        n_heads_agg = int(pd.to_timedelta(DAYS_CONVERTER[D], unit='d') // pd.to_timedelta(args.freq))
+    for D, freq in itertools.product(D_LIST, REPORT_FREQS):
+        n_heads_agg = int(pd.to_timedelta(DAYS_CONVERTER[D], unit='d') // pd.to_timedelta(freq))
         rolled = (main_features_base.sort(['underlying_name', 'timestamp']).with_columns(pl.col(target).rolling_sum(
                     window_size=n_heads_agg, min_samples=n_heads_agg).shift(-(n_heads_agg - 1)).over('underlying_name')
                                                                                          .alias(target)))
         cols_to_drop = [col for col in (contemporanous_features[target] +
                                         [f'{c}_{D}' for c in contemporanous_features[target]]) if col in rolled.columns]
-        main_features_by_D[D] = rolled.drop(cols_to_drop)
+        main_features_by_D[(D, freq)] = rolled.drop(cols_to_drop)
     L_days = DAYS_CONVERTER[args.L]
     start_idx = np.searchsorted(dates, dates[0] + relativedelta(days=L_days))
     date_grid = dates[start_idx::L_days]
     date_masks = {
-        d: (
-            (main_features_base['timestamp'] >=
+        (d, D, freq): (
+            (main_features_by_D[(D, freq)]['timestamp'] >=
              pl.lit(d - relativedelta(days=L_days))) &
-            (main_features_base['timestamp'] <
+            (main_features_by_D[(D, freq)]['timestamp'] <
              pl.lit(d))
         )
-        for d in date_grid
+        for d, D, freq in itertools.product(date_grid, D_LIST, REPORT_FREQS)
     }
-    date_grid_regressions_markets_Ds = list(itertools.product(date_grid, [champion_regression_type], [0, 1], D_LIST))
+    date_grid_regressions_markets_Ds_freqs = \
+        list(itertools.product(date_grid, [champion_regression_type], [0, 1], D_LIST, REPORT_FREQS))
     print(
         f'[FeatureImportance] '
-        f'{len(date_grid_regressions_markets_Ds)} '
-        f'(date, market, D) windows to train '
+        f'{len(date_grid_regressions_markets_Ds_freqs)} '
+        f'(date, market, D, freq) windows to train '
         f'across {args.cpu_count} worker(s) '
         f'for target={target}, '
         f'regression_type={champion_regression_type}.'
     )
 
     with tqdm_joblib(tqdm(desc=f'Feature importance training windows (target={target})',
-                          total=len(date_grid_regressions_markets_Ds))
+                          total=len(date_grid_regressions_markets_Ds_freqs))
     ):
         trained_models = dict(Parallel(n_jobs=args.cpu_count, backend='loky')(delayed(train_one_window)(
-            date, main_features_by_D[D].filter(date_masks[date]), champion_regression_type, market, D, target,
-            args.freq, L_days) for date, _, market, D in date_grid_regressions_markets_Ds))
+            date, main_features_by_D[(D, freq)].filter(date_masks[(date, D, freq)]), champion_regression_type,
+            market, D, target, freq, L_days)
+            for date, _, market, D, freq in date_grid_regressions_markets_Ds_freqs))
     date_grid_np = np.array(date_grid)
     end = np.datetime64(args.end_date)
-    freq_delta = pd.to_timedelta(args.freq)
-    freq_ns = np.timedelta64(freq_delta.value, 'ns')
     date_grid_test_by_D = dict()
     date_masks_tests_by_D = dict()
     in_sample_dates_by_D = dict()
     horizon_dates_by_D = dict()
-    n_steps_ahead_scaler_by_D = dict()
-    for D in D_LIST:
+    n_steps_ahead_scaler_by_D_freq = dict()
+    for D, freq in itertools.product(D_LIST, REPORT_FREQS):
         D_days = DAYS_CONVERTER[D]
         grid_test = dates[dates.index(date_grid[0])::D_days]
-        date_masks_tests_by_D[D] = {
+        date_masks_tests_by_D[(D, freq)] = {
             d: (
-                (main_features_base['timestamp'] <
+                (main_features_by_D[(D, freq)]['timestamp'] <
                  pl.lit(d + relativedelta(days=D_days))) &
-                (main_features_base['timestamp'] >=
+                (main_features_by_D[(D, freq)]['timestamp'] >=
                  pl.lit(d - relativedelta(days=D_days + D_days)))
             )
             for d in grid_test
         }
         grid_test = np.array(grid_test)
-        date_grid_test_by_D[D] = grid_test
+        date_grid_test_by_D[(D, freq)] = grid_test
         retrain_idx = np.clip(np.searchsorted(date_grid_np, grid_test, side='right') - 1, 0, len(date_grid_np) - 1)
-        in_sample_dates_by_D[D] = date_grid_np[retrain_idx]
+        in_sample_dates_by_D[(D, freq)] = date_grid_np[retrain_idx]
         _dates = pd.to_datetime(grid_test).to_numpy(dtype='datetime64[ns]')
-        horizon_dates_by_D[D] = np.minimum(_dates + np.timedelta64(D_days, 'D'), end)
-        _retrain_ts = pd.to_datetime(in_sample_dates_by_D[D]).to_numpy(dtype='datetime64[ns]')
-        _horizon_ts = pd.to_datetime(horizon_dates_by_D[D]).to_numpy(dtype='datetime64[ns]')
+        horizon_dates_by_D[(D, freq)] = np.minimum(_dates + np.timedelta64(D_days, 'D'), end)
+        _retrain_ts = pd.to_datetime(in_sample_dates_by_D[(D, freq)]).to_numpy(dtype='datetime64[ns]')
+        _horizon_ts = pd.to_datetime(horizon_dates_by_D[(D, freq)]).to_numpy(dtype='datetime64[ns]')
+        freq_delta = pd.to_timedelta(freq)
+        freq_ns = np.timedelta64(freq_delta.value, 'ns')
         raw_steps = ((_horizon_ts - _retrain_ts).astype('timedelta64[ns]') / freq_ns)
-        n_steps_ahead_scaler_by_D[D] = (np.clip(np.ceil(raw_steps), 1, None).astype(int))
+        n_steps_ahead_scaler_by_D_freq[(D, freq)] = (np.clip(np.ceil(raw_steps), 1, None).astype(int))
 
     def window_mase(forecast_df: pd.DataFrame, avg_1s: pd.DataFrame, D: str, freq: str) -> Dict[str, float]:
         merged = forecast_df.merge(avg_1s.reset_index().rename(columns={'unique_id': 'underlying_name'}),
                                    on='underlying_name', how='left')
         mase = merged.groupby('underlying_name').apply(lambda x: (x.y-x.y_hat).abs().mean()/x.avg_1s.iloc[0])
+        n_periods = pd.to_timedelta(DAYS_CONVERTER[D], unit='d') / pd.to_timedelta(freq)
+        mase = mase / n_periods
         return mase.to_dict()
 
-    def _run_one_window(market, D, i):
-        date_grid_test = date_grid_test_by_D[D]
+    def _run_one_window(market, D, freq, i):
+        date_grid_test = date_grid_test_by_D[(D, freq)]
         date_test = date_grid_test[i]
-        trained_entry = resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[D][i],
-                                              champion_regression_type, market, D)
+        trained_entry = resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[(D, freq)][i],
+                                              champion_regression_type, market, D, freq)
         if trained_entry is None:
             return []
         model, avg_1s = trained_entry
         if avg_1s is None:
             return []
-        main_features_i = filter_market_features(main_features_by_D[D].filter(date_masks_tests_by_D[D][date_test]),
-                                                 target, market)
-        tmp_sum = n_steps_ahead_scaler_by_D[D][i]
+        main_features_i = filter_market_features(
+            main_features_by_D[(D, freq)].filter(date_masks_tests_by_D[(D, freq)][date_test]), target, market)
+        tmp_sum = n_steps_ahead_scaler_by_D_freq[(D, freq)][i]
         start = pd.Timestamp(date_test)
-        horizon_end = horizon_dates_by_D[D][i]
+        horizon_end = horizon_dates_by_D[(D, freq)][i]
 
         def champion_forecast(mf: pl.DataFrame):
             fc = \
-                evaluate_one_window(model=model, regression=champion_regression_type, target=target, freq=champion_freq,
+                evaluate_one_window(model=model, regression=champion_regression_type, target=target, freq=freq,
                                     n_steps_ahead_scaler=tmp_sum, main_features=mf)
             fc = fc.loc[(fc.timestamp >= start) & (fc.timestamp < horizon_end) &
                         (fc.regression == champion_regression.lower())]
@@ -594,7 +581,7 @@ def run_feature_importance(target_path: str, target: str, args):
             print(
                 f'WARNING: baseline evaluate_one_window failed '
                 f'for feature importance window '
-                f'{date_test}/{champion_regression}/market={market}/D={D} '
+                f'{date_test}/{champion_regression}/market={market}/D={D}/freq={freq} '
                 f'({type(e).__name__}: {e}) -- skipping window.'
             )
             return []
@@ -618,11 +605,11 @@ def run_feature_importance(target_path: str, target: str, args):
                     continue
                 if jittered_forecast.empty:
                     continue
-                window_mases.append(window_mase(jittered_forecast, avg_1s, D, champion_freq))
+                window_mases.append(window_mase(jittered_forecast, avg_1s, D, freq))
             main_features_pd[col] = original_col
             if not window_mases:
                 continue
-            records.append({'target': target, 'market': market, 'D': D, 'freq': champion_freq,
+            records.append({'target': target, 'market': market, 'D': D, 'freq': freq,
                             'regression': champion_regression, 'timestamp': date_test, 'feature': col,
                             'MASE': float(pd.DataFrame(window_mases).mean().mean())})
         return records
@@ -630,28 +617,29 @@ def run_feature_importance(target_path: str, target: str, args):
     tasks = []
     for market in [1, 0]:
         for D in D_LIST:
-            date_grid_test = date_grid_test_by_D[D]
-            windows_to_run = [i for i in range(len(date_grid_test)) if i % window_stride == 0]
-            tasks += [(market, D, i) for i in windows_to_run]
-    print(f'[FeatureImportance] {len(tasks)} (market, D, window) tasks to evaluate across {args.cpu_count} worker(s) '
-          f'for target={target}.')
+            for freq in REPORT_FREQS:
+                date_grid_test = date_grid_test_by_D[(D, freq)]
+                windows_to_run = [i for i in range(len(date_grid_test)) if i % window_stride == 0]
+                tasks += [(market, D, freq, i) for i in windows_to_run]
+    print(f'[FeatureImportance] {len(tasks)} (market, D, freq, window) tasks to evaluate across '
+          f'{args.cpu_count} worker(s) for target={target}.')
     with tqdm_joblib(tqdm(desc=f'Feature importance windows (target={target})', total=len(tasks))):
-        results = Parallel(n_jobs=args.cpu_count, backend='loky')(delayed(_run_one_window)(market, D, i)
-                                                                  for market, D, i in tasks)
+        results = Parallel(n_jobs=args.cpu_count, backend='loky')(delayed(_run_one_window)(market, D, freq, i)
+                                                                  for market, D, freq, i in tasks)
     importance_records = [record for window_records in results for record in window_records]
     importance_df = pd.DataFrame(importance_records)
     importance_df['timestamp'] = pd.to_datetime(importance_df['timestamp'], utc=True)
-    volatility_regime_champion = volatility_regime[volatility_regime['freq'] == champion_freq].drop(columns='freq')
-    importance_df = pd.merge(importance_df, volatility_regime_champion, on='timestamp', how='left')
+    # Join on (timestamp, freq) now that freq varies, instead of pre-filtering to champion_freq.
+    importance_df = pd.merge(importance_df, volatility_regime, on=['timestamp', 'freq'], how='left')
     averaged = importance_df.groupby(['target', 'market', 'D', 'volatility_regime', 'freq', 'regression', 'feature'])
     averaged = averaged[['MASE']].mean().reset_index()
     averaged['regression'] = averaged['regression'].str.lower()
     detail_path = f'{args.target_path}/crypto_option_spot/features_importance_{target}.csv'
     averaged.to_csv(detail_path, mode='a', header=not os.path.exists(detail_path), index=False)
-    print(f'[Done] target={target}: feature MASE computed for champion (freq={champion_freq!r}, '
-          f'regression={champion_regression!r}, champion_mase={champion_mase:.6f}), '
-          f'averaged over every {window_stride}th test window across {averaged["feature"].nunique()} features, '
-          f'and stored with relative_MASE.')
+    print(f'[Done] target={target}: feature MASE computed for champion regression={champion_regression!r} '
+          f'({champion_regression_type}, champion_mase={champion_mase:.6f}), '
+          f'averaged over every {window_stride}th test window across D={D_LIST} x freq={REPORT_FREQS}, '
+          f'{averaged["feature"].nunique()} features, and stored with relative_MASE.')
 
 
 if __name__ == "__main__":
@@ -661,14 +649,13 @@ if __name__ == "__main__":
                     'frequencies, and all forecasting horizons in one execution.',
         allow_abbrev=False)
     parser.add_argument('--L', type=str, help='Parameter controlling the size of the training set size.')
-    parser.add_argument('--start_date', type=str, help='Start date.', default='2021-01-01')
+    parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-01')
     parser.add_argument('--end_date', type=str, help='End date.', default='2023-07-01')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
     parser.add_argument('--cpu_count', type=int, default=1, help='Number of processes to use for the pipeline.')
     parser.add_argument('--feature_importance', type=int, default=0, help='Feature importance part of the pipeline.')
     args = parser.parse_args()
-    args.freq = '15min'
     print(args)
     print(f'targets={TARGET_LIST}, markets=[1, 0], D={D_LIST}, report_freqs={REPORT_FREQS}')
     for target in TARGET_LIST:
