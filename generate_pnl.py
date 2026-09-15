@@ -78,7 +78,10 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
             pl.col('moneyness').is_between(lower_bound=param['lower_bound_atm'], upper_bound=param['upper_bound_atm'])
         option_chain_data = option_chain_data.filter(atm_filter)
         option_chain_data = option_chain_data.filter(pl.len().over(['symbol', 'timestamp']) == 2)
-        number_of_unique_straddles = option_chain_data.select(pl.col('symbol').n_unique()).collect().item()
+        try:
+            number_of_unique_straddles = option_chain_data.select(pl.col('symbol').n_unique()).collect().item()
+        except pl.exceptions.ComputeError:
+            return
         if number_of_unique_straddles > 0:
             active_count = signals.ne(0).sum(axis=1)
             signals = signals.div(number_of_unique_straddles).div(active_count.replace(0, np.nan), axis=0).fillna(0)
@@ -464,7 +467,7 @@ if __name__ == '__main__':
                     lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
                         study.user_attrs['lower_bound_atm'], \
                         study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
-                except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError) as exc:
+                except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError) as exc:
                     print(f"WARNING: RV {underlying_name} day {idx_file} "
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
