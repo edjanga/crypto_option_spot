@@ -36,12 +36,6 @@ non_expired = {'15m': pd.to_timedelta('15min') / pd.to_timedelta('360D'),
 
 
 def callback(study, trial) -> None:
-    # study.best_trial raises ValueError (not None) when no trial has completed yet.
-    # Since this callback runs after EVERY trial including failed ones, an early NaN
-    # trial (e.g. trial 0, which is deterministic per-day since each day reseeds
-    # RandomSampler(123)) used to crash this callback, and that exception propagated
-    # straight out of study.optimize() -- aborting the ENTIRE day after just one failed
-    # trial, before trials 1..n_trials-1 (with different params) ever got a chance to run.
     if trial.state != optuna.trial.TrialState.COMPLETE:
         return
     if study.best_trial.number == trial.number:
@@ -444,13 +438,6 @@ if __name__ == '__main__':
                     return_straddle_table(data=yesterday_file,
                                           freq=best_model_tags['RV'][-1].replace('in', ''),
                                           underlying_price=yesterday_underlying_price)
-                # Materialize ONCE here, then re-wrap as lazy. Without this, every one of the
-                # N_TRIALS // 20 optuna trials below re-triggers this entire pipeline from the
-                # CSV scan onward (re-read, re-sort, re-group_by_dynamic, re-join) each time
-                # objective_daily calls .collect() on it -- this was previously the dominant
-                # cost of the whole walk-forward loop. .lazy() after .collect() keeps the
-                # LazyFrame API objective_daily expects, but replays a cheap in-memory query
-                # plan instead of hitting disk again.
                 try:
                     yesterday_straddle_data = yesterday_straddle_data.collect().lazy()
                 except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
@@ -646,8 +633,6 @@ if __name__ == '__main__':
                 yesterday_file = pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/'
                                                  f'{underlying_name_dates[idx_file - 1]}')
                 yesterday_spot = return_spot_table(yesterday_file)
-                # Same fix as the RV branch above -- materialize once so objective_daily's
-                # per-trial .collect() calls don't re-scan this file from disk every trial.
                 try:
                     yesterday_spot = yesterday_spot.collect().lazy()
                 except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
@@ -871,10 +856,6 @@ if __name__ == '__main__':
                                      font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                      yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
                           height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
-                          # legend=dict(orientation='h', yanchor='top', y=-0.03, xanchor='center', x=0.5,
-                          #             font=dict(size=7.5 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
-                          #             tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
-                          #             bordercolor='rgba(0,0,0,0.3)', borderwidth=1))
                           legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
                                       font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
                                       tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
