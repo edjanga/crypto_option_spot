@@ -1,3 +1,5 @@
+import pdb
+
 import plotly.express as px
 import pandas as pd
 import argparse
@@ -17,7 +19,8 @@ d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
 volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
 market_order = CategoricalDtype(categories=[0, 1], ordered=True)
 
-def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool) -> None:
+
+def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool, args) -> None:
     fig = make_subplots(
         rows=1 if aggregated else len(SYMBOLS),
         cols=1,
@@ -102,15 +105,20 @@ def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool) -> None:
     fig.update_layout(title=dict(x=0.5, y=1, xanchor='center', yanchor='top', pad=dict(b=150, t=10)),
                       legend=dict(orientation='h', yanchor='top', y=dict([(True, -0.35), (False, -0.075)])[aggregated],
                                   xanchor='center', x=0.5, itemwidth=100), paper_bgcolor='white', plot_bgcolor='white')
-    fig.write_image(f'../figures/svix{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf', format='pdf')
+    fig.write_image(f'{args.target_figures}/svix{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
+                    format='pdf')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all the plots.')
     parser.add_argument('--type', type=str, help='Type of plot to display', default='svix_rv_vrp')
+    parser.add_argument('--target_path', type=str, help='Directory where database is located',
+                        default='../data_centre')
+    parser.add_argument('--target_figures', type=str, help='Directory where database is located',
+                        default='../data_centre')
     args = parser.parse_args()
     print(args)
-    mase = pd.read_csv(f'../data_centre/crypto_option_spot/metric.csv')
+    mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
     mase = mase.set_index('D')
     model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
                                      pd.Grouper(key='regression'),
@@ -122,8 +130,8 @@ if __name__ == '__main__':
     ## Crypto SVIX, RV, and VRP
     ####################################################################################################################
     if args.type == 'svix_rv_vrp':
-        svix_parquet = Path('../data_centre/crypto_option_spot/svix.parquet')
-        svix_csv = Path('../data_centre/crypto_option_spot/svix.csv')
+        svix_parquet = Path(f'{args.target_path}/crypto_option_spot/svix.parquet')
+        svix_csv = Path(f'{args.target_path}/crypto_option_spot/svix.csv')
         if svix_parquet.exists():
             crypto_svix = pl.scan_parquet(str(svix_parquet)).select(
                 ['underlying_name', 'timestamp', 'svix', 'aggregated', 'D'])
@@ -141,13 +149,13 @@ if __name__ == '__main__':
         ################################################################################################################
         ## Crypto SVIX
         ################################################################################################################
-        plot_svix(crypto_svix, True)
-        plot_svix(crypto_svix, False)
+        # plot_svix(crypto_svix, True, args)
+        # plot_svix(crypto_svix, False, args)
         ################################################################################################################
         ## Crypto SVIX, RV, and VRP
         ################################################################################################################
-        forecasts_parquet = Path('../data_centre/crypto_option_spot/forecasts.parquet')
-        forecasts_csv = Path('../data_centre/crypto_option_spot/forecasts.csv')
+        forecasts_parquet = Path(f'{args.target_path}/crypto_option_spot/forecasts.parquet')
+        forecasts_csv = Path(f'{args.target_path}/crypto_option_spot/forecasts.csv')
         rv_cols = ['timestamp', 'underlying_name', 'y_hat', 'y', 'regression', 'target', 'D', 'market', 'freq']
         regression, freq = best_model_tags['RV'][1:]
         if forecasts_parquet.exists():
@@ -190,7 +198,7 @@ if __name__ == '__main__':
                 rv_pair = pd.pivot(rv_pair.reset_index(0), columns='market', values=['forecast', 'rv'])
                 rv_pair = rv_pair['forecast']
                 rv_pair.columns = ['rv_0', 'rv_1']
-                rv_pair = rv_pair.dropna()#.mul(100)
+                rv_pair = rv_pair.dropna().mul(100)
                 try:
                     svix = tmp_pair.drop('underlying_name', axis=1).droplevel(axis=0, level=0)
                 except KeyError:
@@ -272,8 +280,9 @@ if __name__ == '__main__':
                                           font=dict(size=LABEL_AXIS_FONT_SIZE), itemwidth=40,
                                           tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
                                           bordercolor='rgba(0,0,0,0.3)', borderwidth=1))
-            fig.write_image(f'../figures/rv_svix_vrp{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
-                            format='pdf')
+            fig.write_image(
+                f'{args.target_figures}/rv_svix_vrp{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
+                format='pdf')
 
 
 
