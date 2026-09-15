@@ -1,11 +1,8 @@
-import pdb
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import glob
 import gc
-import resource
-import platform
 import optuna
 from dateutil.relativedelta import relativedelta
 from pandas.api.types import CategoricalDtype
@@ -39,6 +36,14 @@ non_expired = {'15m': pd.to_timedelta('15min') / pd.to_timedelta('360D'),
 
 
 def callback(study, trial) -> None:
+    # study.best_trial raises ValueError (not None) when no trial has completed yet.
+    # Since this callback runs after EVERY trial including failed ones, an early NaN
+    # trial (e.g. trial 0, which is deterministic per-day since each day reseeds
+    # RandomSampler(123)) used to crash this callback, and that exception propagated
+    # straight out of study.optimize() -- aborting the ENTIRE day after just one failed
+    # trial, before trials 1..n_trials-1 (with different params) ever got a chance to run.
+    if trial.state != optuna.trial.TrialState.COMPLETE:
+        return
     if study.best_trial.number == trial.number:
         if trial.user_attrs['target'] == 'RV':
             study.set_user_attr(key='lower_bound_atm', value=trial.user_attrs['lower_bound_atm'])
@@ -102,7 +107,7 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
             option_chain_data = \
                 option_chain_data.group_by(['symbol', 'aggregated', 'market', 'timestamp'], maintain_order=True)
             option_chain_data = option_chain_data.agg([pl.col('mid_price').sum(), pl.col('spread').sum(),
-                                                       pl.col('transaction_fees').last()]+
+                                                       pl.col('transaction_fees').sum()]+
                                                       [pl.col(d).last() for d in available_ds])
             option_chain_data = \
                 option_chain_data.with_columns(
@@ -251,7 +256,8 @@ def return_straddle_table(data: pl.DataFrame, freq: str, underlying_price: pl.Da
         straddle_data.group_by_dynamic(index_column='timestamp', group_by=['symbol', 'type'], every=freq).last()
     straddle_data = straddle_data.sort(['symbol', 'type', 'timestamp'])
     straddle_data = (
-        straddle_data.with_columns((((pl.col('spread').shift().add(pl.col('spread'))).mul(.5)).over('symbol'))))
+        straddle_data.with_columns((((pl.col('spread').shift().add(pl.col('spread'))).mul(.5))
+                                    .over(['symbol', 'type']))))
     straddle_data = straddle_data.filter(non_expired_filter)
     straddle_data = straddle_data.drop(['tau'])
     straddle_data = straddle_data.join(underlying_price.lazy(), on='timestamp', how='left')
@@ -260,7 +266,7 @@ def return_straddle_table(data: pl.DataFrame, freq: str, underlying_price: pl.Da
             pl.lit(DERIBIT_FEE_PREMIUM_PCT),
             (pl.lit(MIN_FEE_BPS_UNDERLYING) * pl.col('underlying_price') / pl.col('mid_price'))
         ).alias('transaction_fees'),
-        (.5*(pl.col('spread')+pl.col('spread').shift()) /
+        (.5*(pl.col('spread')+pl.col('spread').shift().over(['symbol', 'type'])) /
          pl.col('mid_price')).alias('basc_fees')])
     return straddle_data
 
@@ -392,6 +398,9 @@ if __name__ == '__main__':
     svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
     svix = pd.concat([svix_agg, svix_non_agg])
     svix = svix.loc[svix.index.get_level_values('timestamp').normalize().isin(date_range), :]
+    svix = svix.groupby(
+        ['aggregated', 'underlying_name', 'D',
+         pd.Grouper(level='timestamp', freq=best_model_tags['RV'][-1])]).last()
     rv = data_per_target['RV'].xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
     rv = rv.resample(best_model_tags['RV'][-1]).sum().replace(0, np.nan)
     rv.columns = rv.columns.set_levels(rv.columns.levels[-2].str.lower(), level=-2).dropna()
@@ -422,7 +431,9 @@ if __name__ == '__main__':
                 yesterday_file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
                                              f'{underlying_name_dates[idx_file-1].split("-")[0]}/{underlying_name}/'
                                              f'{underlying_name_dates[idx_file-1]}',
-                                             schema_overrides={'timestamp': pl.Datetime(time_unit='ms')})
+                                             schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
+                                                     'spread': pl.Float64, 'moneyness': pl.Float64,
+                                                     'tau': pl.Float64})
                 yesterday_file = (
                     yesterday_file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type']))
                 yesterday_spot_underlying_file = \
@@ -433,6 +444,20 @@ if __name__ == '__main__':
                     return_straddle_table(data=yesterday_file,
                                           freq=best_model_tags['RV'][-1].replace('in', ''),
                                           underlying_price=yesterday_underlying_price)
+                # Materialize ONCE here, then re-wrap as lazy. Without this, every one of the
+                # N_TRIALS // 20 optuna trials below re-triggers this entire pipeline from the
+                # CSV scan onward (re-read, re-sort, re-group_by_dynamic, re-join) each time
+                # objective_daily calls .collect() on it -- this was previously the dominant
+                # cost of the whole walk-forward loop. .lazy() after .collect() keeps the
+                # LazyFrame API objective_daily expects, but replays a cheap in-memory query
+                # plan instead of hitting disk again.
+                try:
+                    yesterday_straddle_data = yesterday_straddle_data.collect().lazy()
+                except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
+                    print(f"WARNING: RV {underlying_name} day {idx_file} "
+                          f"({underlying_name_dates[idx_file]}) failed reading/parsing yesterday's option file "
+                          f"({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
+                    continue
                 yesterday_mean_bar = \
                     underlying_name_mean_bar[underlying_name_mean_bar.index.date == yesterday_date.date()]
                 if yesterday_mean_bar.dropna().empty:
@@ -467,7 +492,8 @@ if __name__ == '__main__':
                     lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
                         study.user_attrs['lower_bound_atm'], \
                         study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
-                except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError) as exc:
+                except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError,
+                       pl.exceptions.InvalidOperationError) as exc:
                     print(f"WARNING: RV {underlying_name} day {idx_file} "
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
@@ -475,7 +501,9 @@ if __name__ == '__main__':
                 file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
                                    f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
                                    f'{underlying_name_dates[idx_file]}',
-                                   schema_overrides={'timestamp': pl.Datetime(time_unit='ms')})
+                                   schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
+                                                     'spread': pl.Float64, 'moneyness': pl.Float64,
+                                                     'tau': pl.Float64})
                 file = file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type'])
                 today_spot_underlying_file = \
                     pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
@@ -546,7 +574,7 @@ if __name__ == '__main__':
                 straddle_data = \
                     straddle_data.group_by(['symbol', 'aggregated', 'market', 'timestamp'], maintain_order=True)
                 straddle_data = straddle_data.agg([pl.col('mid_price').sum(), pl.col('spread').sum(),
-                                                   pl.col('transaction_fees').last()] +
+                                                   pl.col('transaction_fees').sum()] +
                                                   [pl.col(d).last() for d in
                                                    today_filter.columns.get_level_values('D').unique().tolist()])
                 straddle_data = \
@@ -618,6 +646,15 @@ if __name__ == '__main__':
                 yesterday_file = pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/'
                                                  f'{underlying_name_dates[idx_file - 1]}')
                 yesterday_spot = return_spot_table(yesterday_file)
+                # Same fix as the RV branch above -- materialize once so objective_daily's
+                # per-trial .collect() calls don't re-scan this file from disk every trial.
+                try:
+                    yesterday_spot = yesterday_spot.collect().lazy()
+                except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
+                    print(f"WARNING: returns {underlying_name} day {idx_file} "
+                          f"({underlying_name_dates[idx_file]}) failed reading/parsing yesterday's spot file "
+                          f"({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
+                    continue
                 yesterday_data = \
                     data_per_target['returns'][data_per_target['returns'].index.date == yesterday_date.date()]
                 yesterday_data = yesterday_data.loc[:, forecast_underlying_name['forecast']].dropna(how='all', axis=1)
@@ -639,7 +676,7 @@ if __name__ == '__main__':
                     study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
                                    n_jobs=N_JOBS, gc_after_trial=True)
                     threshold_filter = study.user_attrs['threshold_filter']
-                except (ValueError, KeyError) as exc:
+                except (ValueError, KeyError, pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
                     print(f"WARNING: returns {underlying_name} day {idx_file} "
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
@@ -793,7 +830,7 @@ if __name__ == '__main__':
                 fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index,
                                                y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
                                                marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
+                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=(col == 0)),
                               col=col + 1, row=1)
                 fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index,
                                                y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
@@ -817,7 +854,7 @@ if __name__ == '__main__':
                     fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index,
                                                     y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
                                                     marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
+                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=(col == 0)),
                                    col=col + 1, row=1)
                     fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index,
                                                     y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
@@ -833,8 +870,17 @@ if __name__ == '__main__':
                                      x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                      font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                      yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
-                          height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white')
+                          height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
+                          # legend=dict(orientation='h', yanchor='top', y=-0.03, xanchor='center', x=0.5,
+                          #             font=dict(size=7.5 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
+                          #             tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
+                          #             bordercolor='rgba(0,0,0,0.3)', borderwidth=1))
+                          legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                                      font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
+                                      tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
+                                      bordercolor='rgba(0,0,0,0.3)', borderwidth=1))
         fig.update_traces(line=dict(width=30))
+        fig.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
         fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
         fig.update_xaxes(tickangle=45, showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
                          title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
@@ -848,7 +894,10 @@ if __name__ == '__main__':
                                           font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                           yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE),
                                width=WIDTH * 15, height=5 * len(d_order.categories) * HEIGHT,
-                               legend=dict(font=dict(size=10 * LABEL_AXIS_FONT_SIZE), itemwidth=100),
+                               legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                                           font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
+                                           tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
+                                           bordercolor='rgba(0,0,0,0.3)', borderwidth=1),
                                paper_bgcolor='white', plot_bgcolor='white')
             fig2.update_traces(line=dict(width=30))
             fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
