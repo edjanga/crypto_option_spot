@@ -34,9 +34,18 @@ def _implied_vol(price: float, forward: float, strike: float, tau: float, r: flo
         return np.nan
 
 
+def _call_put_by_strike(group: pd.DataFrame) -> tuple:
+    """Returns (calls, puts) as strike-indexed Series, with duplicate strikes collapsed via
+    mean() first -- a plain .set_index('strike') allows a non-unique index, which turns a
+    later .loc[k] lookup into a Series instead of a scalar the moment two rows share a
+    strike (e.g. resampling landing two observations on the same contract)."""
+    calls = group.loc[group['type'] == 'call'].groupby('strike')['mid_price'].mean()
+    puts = group.loc[group['type'] == 'put'].groupby('strike')['mid_price'].mean()
+    return calls, puts
+
+
 def _forward_price(group: pd.DataFrame, spot: float, tau: float, r: float) -> float:
-    calls = group.loc[group['type'] == 'call'].set_index('strike')['mid_price']
-    puts = group.loc[group['type'] == 'put'].set_index('strike')['mid_price']
+    calls, puts = _call_put_by_strike(group)
     common_strikes = calls.index.intersection(puts.index)
     if len(common_strikes) == 0:
         return spot * np.exp(r * tau)
@@ -50,26 +59,40 @@ def _fit_dumas_surface(snapshot: pd.DataFrame, forwards_by_tau: Dict[float, floa
     rows = []
     for _, row in snapshot.iterrows():
         forward = forwards_by_tau[row['tau']]
-        is_otm = (row['type'] == 'put' and row['strike'] < forward) or \
-                 (row['type'] == 'call' and row['strike'] >= forward)
+        strike = row['strike']
+        if not (np.isfinite(forward) and forward > 0 and np.isfinite(strike) and strike > 0):
+            continue  # degenerate forward/strike would otherwise poison log(strike/forward)
+        is_otm = (row['type'] == 'put' and strike < forward) or \
+                 (row['type'] == 'call' and strike >= forward)
         if not is_otm:
             continue
         if iv_column is not None and pd.notna(row.get(iv_column)):
             iv = float(row[iv_column])
         else:
-            iv = _implied_vol(row['mid_price'], forward, row['strike'], row['tau'], r, row['type'])
+            iv = _implied_vol(row['mid_price'], forward, strike, row['tau'], r, row['type'])
         if pd.isna(iv) or not (MIN_SIGMA <= iv <= MAX_SIGMA):
             continue
-        m = np.log(row['strike'] / forward)
+        m = np.log(strike / forward)
+        if not np.isfinite(m):
+            continue
         rows.append((m, row['tau'], iv))
     if len(rows) < 8:
         return None
     m_arr, tau_arr, iv_arr = (np.array(x) for x in zip(*rows))
     X = np.column_stack([np.ones_like(m_arr), m_arr, m_arr ** 2, tau_arr, tau_arr ** 2, m_arr * tau_arr])
+    finite_rows = np.isfinite(X).all(axis=1) & np.isfinite(iv_arr)
+    if finite_rows.sum() < 8:
+        return None
+    X, iv_arr = X[finite_rows], iv_arr[finite_rows]
     try:
         coeffs, *_ = np.linalg.lstsq(X, iv_arr, rcond=None)
     except np.linalg.LinAlgError:
-        return np.full(6, np.nan)
+        # None (not a NaN-filled array) -- the caller checks `if coeffs is not None` to
+        # decide whether to fall back to raw integration; a NaN array looks like success
+        # and silently produces all-NaN output instead of degrading gracefully.
+        return None
+    if not np.all(np.isfinite(coeffs)):
+        return None
     return coeffs
 
 
@@ -78,32 +101,42 @@ def _fitted_iv(coeffs: np.ndarray, m, tau) -> np.ndarray:
     return np.clip(X @ coeffs, MIN_SIGMA, MAX_SIGMA)
 
 
-def _svix_squared_smoothed(tau: float, forward: float, spot: float, r: float, coeffs: np.ndarray,
-                           observed_m: np.ndarray, n_grid_points: int, grid_multiplier: float) -> float:
+def _variance_swap_squared_smoothed(tau: float, forward: float, spot: float, r: float, coeffs: np.ndarray,
+                                    observed_m: np.ndarray, n_grid_points: int, grid_multiplier: float) -> tuple:
+    """Returns (svix_sq, vix_sq) from the same fitted-smile grid. The two measures only
+    differ in how the OTM prices are weighted before integrating:
+      SVIX (Martin 2017): weight = 1 / S_t^2   (CONSTANT across strikes)
+      VIX  (CBOE-style):  weight = 1 / K^2     (varies per strike)
+    Computing them together avoids re-fitting the smile or re-pricing the grid twice."""
     if tau <= 0 or len(observed_m) == 0:
-        return np.nan
+        return np.nan, np.nan
     half_width = grid_multiplier * max(np.abs(observed_m).max(), 1e-3)
-    half_width = min(half_width, 3.0)
+    half_width = min(half_width, 3.0)  # cap the extrapolation -- see module docstring
     m_grid = np.linspace(-half_width, half_width, n_grid_points)
     sigma_grid = _fitted_iv(coeffs, m_grid, tau)
     strikes = forward * np.exp(m_grid)
-    otm = \
-        np.array([_bs76_price(forward, k, tau, s, r, 'put' if k < forward else 'call') for k, s
-                  in zip(strikes, sigma_grid)])
+    otm = np.array([
+        _bs76_price(forward, k, tau, s, r, 'put' if k < forward else 'call')
+        for k, s in zip(strikes, sigma_grid)
+    ])
     d_k = np.empty(len(strikes))
     d_k[1:-1] = (strikes[2:] - strikes[:-2]) / 2
     d_k[0] = strikes[1] - strikes[0]
     d_k[-1] = strikes[-1] - strikes[-2]
-    integral = float(np.sum(d_k * otm))
-    return (2 * np.exp(r * tau) / (spot ** 2 * tau)) * integral
+    svix_integral = float(np.sum(d_k * otm))
+    vix_integral = float(np.sum(d_k * otm / strikes ** 2))
+    svix_sq = (2 * np.exp(r * tau) / (spot ** 2 * tau)) * svix_integral
+    vix_sq = (2 * np.exp(r * tau) / tau) * vix_integral
+    return svix_sq, vix_sq
 
 
-def _svix_squared_raw(group: pd.DataFrame, spot: float, tau: float, forward: float, r: float) -> float:
-    calls = group.loc[group['type'] == 'call'].set_index('strike')['mid_price']
-    puts = group.loc[group['type'] == 'put'].set_index('strike')['mid_price']
+def _variance_swap_squared_raw(group: pd.DataFrame, spot: float, tau: float, forward: float, r: float) -> tuple:
+    """Fallback (no smile smoothing): integrate raw listed-strike prices directly. Returns
+    (svix_sq, vix_sq), same as the smoothed version."""
+    calls, puts = _call_put_by_strike(group)
     strikes = np.sort(pd.Index(calls.index).union(puts.index).unique())
     if len(strikes) < 2:
-        return np.nan
+        return np.nan, np.nan
     otm = np.full(len(strikes), np.nan)
     for i, k in enumerate(strikes):
         if k < forward:
@@ -116,28 +149,31 @@ def _svix_squared_raw(group: pd.DataFrame, spot: float, tau: float, forward: flo
     valid = ~np.isnan(otm)
     strikes, otm = strikes[valid], otm[valid]
     if len(strikes) < 2:
-        return np.nan
+        return np.nan, np.nan
     d_k = np.empty(len(strikes))
     d_k[1:-1] = (strikes[2:] - strikes[:-2]) / 2
     d_k[0] = strikes[1] - strikes[0]
     d_k[-1] = strikes[-1] - strikes[-2]
-    integral = float(np.sum(d_k * otm))
-    return (2 * np.exp(r * tau) / (spot ** 2 * tau)) * integral
+    svix_integral = float(np.sum(d_k * otm))
+    vix_integral = float(np.sum(d_k * otm / strikes ** 2))
+    svix_sq = (2 * np.exp(r * tau) / (spot ** 2 * tau)) * svix_integral
+    vix_sq = (2 * np.exp(r * tau) / tau) * vix_integral
+    return svix_sq, vix_sq
 
 
-def _interpolate_to_target(tau_svix: pd.DataFrame, target_tau: float) -> float:
-    tau_svix = tau_svix.dropna(subset=['svix_sq']).sort_values('tau')
-    if tau_svix.empty:
+def _interpolate_to_target(tau_data: pd.DataFrame, target_tau: float, value_col: str) -> float:
+    tau_data = tau_data.dropna(subset=[value_col]).sort_values('tau')
+    if tau_data.empty:
         return np.nan
-    taus = tau_svix['tau'].to_numpy()
-    svix_sq = tau_svix['svix_sq'].to_numpy()
+    taus = tau_data['tau'].to_numpy()
+    sq_vals = tau_data[value_col].to_numpy()
     if target_tau <= taus[0]:
-        return float(np.sqrt(svix_sq[0]))
+        return float(np.sqrt(sq_vals[0]))
     if target_tau >= taus[-1]:
-        return float(np.sqrt(svix_sq[-1]))
+        return float(np.sqrt(sq_vals[-1]))
     i = int(np.searchsorted(taus, target_tau))
     tau1, tau2 = taus[i - 1], taus[i]
-    var1, var2 = svix_sq[i - 1] * tau1, svix_sq[i] * tau2
+    var1, var2 = sq_vals[i - 1] * tau1, sq_vals[i] * tau2
     w = (target_tau - tau1) / (tau2 - tau1)
     total_var = (1 - w) * var1 + w * var2
     return float(np.sqrt(total_var / target_tau))
@@ -172,24 +208,26 @@ def compute_svix(option_chain_data: Union[pl.LazyFrame, pl.DataFrame, pd.DataFra
             forward = forwards_by_tau[tau]
             if coeffs is not None:
                 observed_m = np.log(group['strike'].to_numpy() / forward)
-                svix_sq = _svix_squared_smoothed(tau, forward, spot, risk_free_rate, coeffs,
-                                                 observed_m, n_grid_points, grid_multiplier)
+                svix_sq, vix_sq = _variance_swap_squared_smoothed(tau, forward, spot, risk_free_rate, coeffs,
+                                                                  observed_m, n_grid_points, grid_multiplier)
             else:
-                svix_sq = _svix_squared_raw(group, spot, tau, forward, risk_free_rate)
-            per_expiry.append((underlying_name, timestamp, tau, svix_sq))
-    per_expiry = pd.DataFrame(per_expiry, columns=['underlying_name', 'timestamp', 'tau', 'svix_sq'])
+                svix_sq, vix_sq = _variance_swap_squared_raw(group, spot, tau, forward, risk_free_rate)
+            per_expiry.append((underlying_name, timestamp, tau, svix_sq, vix_sq))
+    per_expiry = pd.DataFrame(per_expiry, columns=['underlying_name', 'timestamp', 'tau', 'svix_sq', 'vix_sq'])
     rows = []
     for (underlying_name, timestamp), group in per_expiry.groupby(['underlying_name', 'timestamp']):
         for label, days in target_maturities.items():
             target_tau = days / day_count
-            svix = _interpolate_to_target(group, target_tau)
-            rows.append((label, timestamp, underlying_name, svix))
-    result = pd.DataFrame(rows, columns=['D', 'timestamp', 'underlying_name', 'svix'])
+            svix = _interpolate_to_target(group, target_tau, 'svix_sq')
+            vix = _interpolate_to_target(group, target_tau, 'vix_sq')
+            rows.append((label, timestamp, underlying_name, svix, vix))
+    result = pd.DataFrame(rows, columns=['D', 'timestamp', 'underlying_name', 'svix', 'vix'])
     result['aggregated'] = 0
     agg = result.copy()
     agg['svix'] = agg.groupby(['D', 'timestamp'])['svix'].transform('mean')
+    agg['vix'] = agg.groupby(['D', 'timestamp'])['vix'].transform('mean')
     agg['aggregated'] = 1
-    out = pd.concat([result, agg], ignore_index=True)[['D', 'timestamp', 'svix', 'underlying_name', 'aggregated']]
+    out = pd.concat([result, agg], ignore_index=True)[['D', 'timestamp', 'svix', 'vix', 'underlying_name', 'aggregated']]
     return pl.from_pandas(out)
 
 
@@ -247,8 +285,11 @@ if __name__ == '__main__':
     svix = compute_svix(option_chain_data, target_maturities={'1D': 1, '1W': 7, '1M': 30}, iv_column=IV_COLUMN)
     svix = svix.with_columns([pl.when(pl.col('aggregated') == 1).then(pl.col('svix').mean().over(['D', 'timestamp']))
                              .otherwise(pl.col('svix')).alias('svix'),
+                              pl.when(pl.col('aggregated') == 1).then(pl.col('vix').mean().over(['D', 'timestamp']))
+                             .otherwise(pl.col('vix')).alias('vix'),
                               pl.col('D').str.to_lowercase()])
     svix = svix.to_pandas()
     out_path = f'{args.target_path}/crypto_option_spot/svix.parquet'
-    svix.write_parquet(out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    svix.to_parquet(out_path)
     print(f'\nSaved to {out_path}')
