@@ -479,149 +479,146 @@ if __name__ == '__main__':
                     lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
                         study.user_attrs['lower_bound_atm'], \
                         study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
+                    file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
+                                       f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
+                                       f'{underlying_name_dates[idx_file]}',
+                                       schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
+                                                         'spread': pl.Float64, 'moneyness': pl.Float64,
+                                                         'tau': pl.Float64})
+                    file = file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type'])
+                    today_spot_underlying_file = \
+                        pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
+                    today_underlying_price = return_underlying_price_table(today_spot_underlying_file).collect()
+                    straddle_data = return_straddle_table(data=file, freq=best_model_tags['RV'][1:][-1].replace('in', ''),
+                                                          underlying_price=today_underlying_price)
+                    straddle_data = straddle_data.sort(['symbol', 'type', 'timestamp'])
+                    straddle_data = \
+                        straddle_data.filter(pl.len().over(
+                            ['symbol', 'type', pl.col('timestamp').dt.date()]) == number_freq_period_in_day)
+                    straddle_data = straddle_data.filter(pl.len().over(['symbol', pl.col('timestamp')]) == 2)
+                    today_date = pd.to_datetime(underlying_name_dates[idx_file])
+                    today_mean_bar = underlying_name_mean_bar[mean_bar.index.date == today_date.date()]
+                    today_data = \
+                        data_per_target['RV'].loc[data_per_target['RV'].index.date == today_date.date()]
+                    today_data = today_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
+                    today_data = today_data.droplevel(level=[1, 2], axis=1)
+                    today_filter = make_filter(data=today_data, mean_bar=today_mean_bar)
+                    today_filter = today_filter.gt(threshold_filter).astype(int)
+                    markets = today_data.columns.get_level_values('market').unique().tolist()
+                    today_svix_underlying_name = \
+                        svix.loc[(svix.index.get_level_values(3).date == today_date.date()) &
+                                (svix.index.get_level_values(1) == underlying_name), ['svix']]
+                    today_svix_underlying_name = today_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
+                    today_svix_underlying_name = today_svix_underlying_name.droplevel(axis=1, level=0)
+                    today_svix_underlying_name.columns = today_svix_underlying_name.columns.str.upper()
+                    today_forecast_flat = today_data[['forecast']].droplevel(axis=1, level=0)
+                    if not today_forecast_flat.index.is_unique:
+                        print(f"WARNING: duplicate timestamp(s) in today's forecast data "
+                              f"for {underlying_name} -- dropping duplicates (keep last).")
+                        today_forecast_flat = today_forecast_flat[~today_forecast_flat.index.duplicated(keep='last')]
+                    today_svix_dedup = today_svix_underlying_name
+                    if not today_svix_underlying_name.index.get_level_values('timestamp').is_unique:
+                        print(f"WARNING: duplicate timestamp(s) in today's svix data "
+                              f"for {underlying_name} -- dropping duplicates (keep last).")
+                        today_svix_dedup = \
+                            today_svix_underlying_name[~today_svix_underlying_name.index.duplicated(keep='last')]
+                    today_forecast_broadcast = \
+                        today_forecast_flat.reindex(today_svix_dedup.index.get_level_values('timestamp'))
+                    today_forecast_broadcast.index = today_svix_dedup.index
+                    today_vrp_underlying_name = today_svix_dedup.sub(today_forecast_broadcast)
+                    today_vrp_underlying_name = -1*np.sign(today_vrp_underlying_name)
+                    today_vrp_underlying_name = today_vrp_underlying_name.mul(today_filter, level='timestamp')
+                    today_vrp_underlying_name = today_vrp_underlying_name.groupby('aggregated', group_keys=False)
+                    today_signals_underlying_name = today_vrp_underlying_name.apply(lambda x: x.shift())
+                    today_number_of_unique_straddles = straddle_data.select(pl.col('symbol').n_unique()).collect().item()
+                    today_active_count = today_signals_underlying_name.ne(0).sum(axis=1)
+                    today_signals_underlying_name = (
+                        today_signals_underlying_name
+                        .div(today_number_of_unique_straddles)
+                        .div(today_active_count.replace(0, np.nan), axis=0)
+                        .fillna(0)
+                    )
+                    today_delta_weights = \
+                        today_signals_underlying_name.groupby('aggregated', group_keys=False).apply(lambda x: x.diff())
+                    today_delta_weights = \
+                        pl.from_pandas(today_delta_weights.stack('market').reset_index()).with_columns(
+                            pl.col('timestamp').cast(pl.Datetime('ms')),
+                            pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
+                        ).lazy()
+                    today_signals_underlying_name = \
+                        pl.from_pandas(today_signals_underlying_name.stack('market').reset_index()).with_columns(
+                            pl.col('timestamp').cast(pl.Datetime('ms')),
+                            pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
+                        ).lazy()
+                    straddle_data = straddle_data.join(today_signals_underlying_name, on='timestamp', how='left')
+                    straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
+                    straddle_data = \
+                        straddle_data.group_by(['symbol', 'aggregated', 'market', 'timestamp'], maintain_order=True)
+                    straddle_data = straddle_data.agg([pl.col('mid_price').sum(), pl.col('spread').sum(),
+                                                       pl.col('transaction_fees').sum()] +
+                                                      [pl.col(d).last() for d in
+                                                       today_filter.columns.get_level_values('D').unique().tolist()])
+                    straddle_data = \
+                        straddle_data.with_columns([(pl.col('mid_price').log().diff().over(['symbol', 'aggregated',
+                                                                                            'market'])).alias('returns'),
+                                                    (pl.col('spread')/pl.col('mid_price')).alias('basc_fees')])
+                    straddle_data = straddle_data.join(today_delta_weights, how='left', suffix='_delta_weights',
+                                                       on=['aggregated', 'market', 'timestamp'])
+                    exprs = []
+                    for D in today_filter.columns.get_level_values('D').unique().tolist():
+                        exprs += [((pl.col('returns') * pl.col(D) - (pl.col('transaction_fees') *
+                                                                     pl.col(f'{D}_delta_weights')).abs()).fill_null(
+                            0)).alias(f'returns_tc_{D}'),
+                                  ((pl.col('returns') * pl.col(D) - (pl.col('basc_fees') *
+                                                                     pl.col(f'{D}_delta_weights')).abs()).fill_null(
+                                      0)).alias(f'returns_basc_{D}'),
+                                  (pl.col('returns') * pl.col(D)).alias(f'returns_{D}')]
+                    straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
+                    straddle_data = straddle_data.with_columns(exprs)
+                    straddle_data = \
+                        straddle_data.drop(['returns', 'spread', 'transaction_fees', 'mid_price'] +
+                                           today_filter.columns.get_level_values('D').unique().tolist() +
+                                           ['basc_fees'] +
+                                           [f'{d}_delta_weights' for d in
+                                            today_filter.columns.get_level_values('D').unique().tolist()])
+                    straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
+                    returns_cols = \
+                        [f'{prefix}_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()
+                         for prefix in ['returns', 'returns_tc', 'returns_basc']]
+                    straddle_data = straddle_data.group_by(['aggregated', 'market', 'timestamp'])
+                    straddle_data = \
+                        (straddle_data.agg([pl.col(c).mean().alias(c) for c in returns_cols])
+                         .with_columns(pl.lit(target).alias('target')))
+                    straddle_data = \
+                        straddle_data.collect().to_pandas().set_index(['aggregated', 'market', 'target', 'timestamp'])
+                    straddle_data = straddle_data.unstack('market')
+                    straddle_data = straddle_data.dropna(how='all', axis=1)
+                    returns_cols = pd.MultiIndex.from_product(
+                        [[f'returns_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()], markets])
+                    returns = _reindex_cols(straddle_data, returns_cols)
+                    returns_tc_cols = pd.MultiIndex.from_product(
+                        [[f'returns_tc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
+                         markets])
+                    returns_tc = _reindex_cols(straddle_data, returns_tc_cols)
+                    returns_basc_cols = \
+                        pd.MultiIndex.from_product(
+                            [[f'returns_basc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
+                             markets])
+                    returns_basc = _reindex_cols(straddle_data, returns_basc_cols)
+                    returns = returns_table(returns, fees=None, underlying_name=underlying_name)
+                    returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
+                    returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
+                    returns_tmp = pd.concat([returns, returns_tc, returns_basc])
+                    pnl[target][underlying_name].append(returns_tmp)
+                    del returns, returns_tc, returns_basc, straddle_data, study
+                    if idx_file % 20 == 0:
+                        gc.collect()
                 except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError,
                        pl.exceptions.InvalidOperationError) as exc:
                     print(f"WARNING: RV {underlying_name} day {idx_file} "
                           f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
                           f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
                     continue
-                file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
-                                   f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
-                                   f'{underlying_name_dates[idx_file]}',
-                                   schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
-                                                     'spread': pl.Float64, 'moneyness': pl.Float64,
-                                                     'tau': pl.Float64})
-                file = file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type'])
-                today_spot_underlying_file = \
-                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
-                today_underlying_price = return_underlying_price_table(today_spot_underlying_file).collect()
-                straddle_data = return_straddle_table(data=file, freq=best_model_tags['RV'][1:][-1].replace('in', ''),
-                                                      underlying_price=today_underlying_price)
-                straddle_data = straddle_data.sort(['symbol', 'type', 'timestamp'])
-                straddle_data = \
-                    straddle_data.filter(pl.len().over(
-                        ['symbol', 'type', pl.col('timestamp').dt.date()]) == number_freq_period_in_day)
-                straddle_data = straddle_data.filter(pl.len().over(['symbol', pl.col('timestamp')]) == 2)
-                today_date = pd.to_datetime(underlying_name_dates[idx_file])
-                today_mean_bar = underlying_name_mean_bar[mean_bar.index.date == today_date.date()]
-                today_data = \
-                    data_per_target['RV'].loc[data_per_target['RV'].index.date == today_date.date()]
-                today_data = today_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
-                today_data = today_data.droplevel(level=[1, 2], axis=1)
-                today_filter = make_filter(data=today_data, mean_bar=today_mean_bar)
-                today_filter = today_filter.gt(threshold_filter).astype(int)
-                markets = today_data.columns.get_level_values('market').unique().tolist()
-                today_svix_underlying_name = \
-                    svix.loc[(svix.index.get_level_values(3).date == today_date.date()) &
-                            (svix.index.get_level_values(1) == underlying_name), ['svix']]
-                today_svix_underlying_name = today_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
-                today_svix_underlying_name = today_svix_underlying_name.droplevel(axis=1, level=0)
-                today_svix_underlying_name.columns = today_svix_underlying_name.columns.str.upper()
-                today_forecast_flat = today_data[['forecast']].droplevel(axis=1, level=0)
-                if not today_forecast_flat.index.is_unique:
-                    print(f"WARNING: duplicate timestamp(s) in today's forecast data "
-                          f"for {underlying_name} -- dropping duplicates (keep last).")
-                    today_forecast_flat = today_forecast_flat[~today_forecast_flat.index.duplicated(keep='last')]
-                today_svix_dedup = today_svix_underlying_name
-                if not today_svix_underlying_name.index.get_level_values('timestamp').is_unique:
-                    print(f"WARNING: duplicate timestamp(s) in today's svix data "
-                          f"for {underlying_name} -- dropping duplicates (keep last).")
-                    today_svix_dedup = \
-                        today_svix_underlying_name[~today_svix_underlying_name.index.duplicated(keep='last')]
-                today_forecast_broadcast = \
-                    today_forecast_flat.reindex(today_svix_dedup.index.get_level_values('timestamp'))
-                today_forecast_broadcast.index = today_svix_dedup.index
-                today_vrp_underlying_name = today_svix_dedup.sub(today_forecast_broadcast)
-                today_vrp_underlying_name = -1*np.sign(today_vrp_underlying_name)
-                today_vrp_underlying_name = today_vrp_underlying_name.mul(today_filter, level='timestamp')
-                today_vrp_underlying_name = today_vrp_underlying_name.groupby('aggregated', group_keys=False)
-                today_signals_underlying_name = today_vrp_underlying_name.apply(lambda x: x.shift())
-                today_number_of_unique_straddles = straddle_data.select(pl.col('symbol').n_unique()).collect().item()
-                today_active_count = today_signals_underlying_name.ne(0).sum(axis=1)
-                today_signals_underlying_name = (
-                    today_signals_underlying_name
-                    .div(today_number_of_unique_straddles)
-                    .div(today_active_count.replace(0, np.nan), axis=0)
-                    .fillna(0)
-                )
-                today_delta_weights = \
-                    today_signals_underlying_name.groupby('aggregated', group_keys=False).apply(lambda x: x.diff())
-                today_delta_weights = \
-                    pl.from_pandas(today_delta_weights.stack('market').reset_index()).with_columns(
-                        pl.col('timestamp').cast(pl.Datetime('ms')),
-                        pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
-                    ).lazy()
-                today_signals_underlying_name = \
-                    pl.from_pandas(today_signals_underlying_name.stack('market').reset_index()).with_columns(
-                        pl.col('timestamp').cast(pl.Datetime('ms')),
-                        pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
-                    ).lazy()
-                straddle_data = straddle_data.join(today_signals_underlying_name, on='timestamp', how='left')
-                straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
-                straddle_data = \
-                    straddle_data.group_by(['symbol', 'aggregated', 'market', 'timestamp'], maintain_order=True)
-                straddle_data = straddle_data.agg([pl.col('mid_price').sum(), pl.col('spread').sum(),
-                                                   pl.col('transaction_fees').sum()] +
-                                                  [pl.col(d).last() for d in
-                                                   today_filter.columns.get_level_values('D').unique().tolist()])
-                straddle_data = \
-                    straddle_data.with_columns([(pl.col('mid_price').log().diff().over(['symbol', 'aggregated',
-                                                                                        'market'])).alias('returns'),
-                                                (pl.col('spread')/pl.col('mid_price')).alias('basc_fees')])
-                straddle_data = straddle_data.join(today_delta_weights, how='left', suffix='_delta_weights',
-                                                   on=['aggregated', 'market', 'timestamp'])
-                exprs = []
-                for D in today_filter.columns.get_level_values('D').unique().tolist():
-                    exprs += [((pl.col('returns') * pl.col(D) - (pl.col('transaction_fees') *
-                                                                 pl.col(f'{D}_delta_weights')).abs()).fill_null(
-                        0)).alias(f'returns_tc_{D}'),
-                              ((pl.col('returns') * pl.col(D) - (pl.col('basc_fees') *
-                                                                 pl.col(f'{D}_delta_weights')).abs()).fill_null(
-                                  0)).alias(f'returns_basc_{D}'),
-                              (pl.col('returns') * pl.col(D)).alias(f'returns_{D}')]
-                straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
-                straddle_data = straddle_data.with_columns(exprs)
-                straddle_data = \
-                    straddle_data.drop(['returns', 'spread', 'transaction_fees', 'mid_price'] +
-                                       today_filter.columns.get_level_values('D').unique().tolist() +
-                                       ['basc_fees'] +
-                                       [f'{d}_delta_weights' for d in
-                                        today_filter.columns.get_level_values('D').unique().tolist()])
-                straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
-                returns_cols = \
-                    [f'{prefix}_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()
-                     for prefix in ['returns', 'returns_tc', 'returns_basc']]
-                straddle_data = straddle_data.group_by(['aggregated', 'market', 'timestamp'])
-                straddle_data = \
-                    (straddle_data.agg([pl.col(c).mean().alias(c) for c in returns_cols])
-                     .with_columns(pl.lit(target).alias('target')))
-                straddle_data = \
-                    straddle_data.collect().to_pandas().set_index(['aggregated', 'market', 'target', 'timestamp'])
-                straddle_data = straddle_data.unstack('market')
-                straddle_data = straddle_data.dropna(how='all', axis=1)
-                returns_cols = pd.MultiIndex.from_product(
-                    [[f'returns_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()], markets])
-                try:
-                    returns = _reindex_cols(straddle_data, returns_cols)
-                except KeyError:
-                    continue
-                returns_tc_cols = pd.MultiIndex.from_product(
-                    [[f'returns_tc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
-                     markets])
-                returns_tc = _reindex_cols(straddle_data, returns_tc_cols)
-                returns_basc_cols = \
-                    pd.MultiIndex.from_product(
-                        [[f'returns_basc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
-                         markets])
-                returns_basc = _reindex_cols(straddle_data, returns_basc_cols)
-                returns = returns_table(returns, fees=None, underlying_name=underlying_name)
-                returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
-                returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
-                returns_tmp = pd.concat([returns, returns_tc, returns_basc])
-                pnl[target][underlying_name].append(returns_tmp)
-                del returns, returns_tc, returns_basc, straddle_data, study
-                if idx_file % 20 == 0:
-                    gc.collect()
         elif target == 'returns':
             files = glob.glob(f'{args.target_path}/{underlying_name}/*/spot/*')
             files.sort()
