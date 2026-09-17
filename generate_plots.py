@@ -1,3 +1,5 @@
+import pdb
+
 import plotly.express as px
 import pandas as pd
 import argparse
@@ -70,7 +72,7 @@ def plot_svix(crypto_svix: pd.DataFrame, aggregated: bool, args) -> None:
             tmp_svix = aggregated_svix[D]
             fig.add_trace(go.Scatter(x=tmp_svix.index.tz_convert(None), y=tmp_svix.values,
                                      line=dict(color=px.colors.qualitative.Plotly[idx], width=3),
-                                     name=f'Crypto SVIX<sub>0<span>&#10230;</span>{D}</sub>'), showlegend=True,
+                                     name=f'Crypto SVIX<sub>0<span>&#10230;</span>{D}</sub>', showlegend=True),
                           row=1, col=1)
         fig.update_xaxes(tickangle=45)
         fig.update_layout(title=dict(text='<b>Term Structure of Crypto SVIX</b>', font=dict(size=TITLE_FONT_SIZE)),
