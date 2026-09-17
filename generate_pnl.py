@@ -18,7 +18,7 @@ from plotly.subplots import make_subplots
 import plotly.express as px
 import polars as pl
 from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, DAYS_CONVERTER, VOL_REGIMES, \
-                       TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, WIDTH, HEIGHT
+                       TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, WIDTH, HEIGHT, D_HORIZONS
 DERIBIT_FEE_PREMIUM_PCT = 0.125
 BINANCE_TF = 0.001
 MIN_FEE_BPS_UNDERLYING = 0.0006
@@ -349,40 +349,25 @@ if __name__ == '__main__':
     for target, values in mase_comparison.items():
         regression = best_model_tags[target][1]
         freq = best_model_tags[target][-1]
-        if Path(forecasts_parquet).exists():
-            lazy = pl.scan_parquet(forecasts_parquet)
-            lazy = \
-                lazy.filter((pl.col('regression') == regression.lower()) & (pl.col('freq') == freq) &
-                            (pl.col('target') == target))
-            lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
-            tmp = lazy.collect().to_pandas()
-        else:
-            chunks = pd.read_csv(f'{args.target_path}/crypto_option_spot/forecasts.csv', chunksize=1_000_000)
-            tmp = pd.concat(chunk.query('target == @values[0] and regression == @values[1] and freq == @values[-1]')
-                            for chunk in chunks)
+        lazy = pl.scan_parquet(forecasts_parquet)
+        lazy = \
+            lazy.filter((pl.col('regression') == regression.lower()) & (pl.col('freq') == freq) &
+                        (pl.col('target') == target))
+        lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
+        tmp = lazy.collect().to_pandas()
         tmp = tmp.rename(columns={'y_hat': 'forecast', 'y': 'values'})
         tmp = tmp.set_index('timestamp')
         tmp.index = pd.to_datetime(tmp.index, utc=True)
         tmp = pd.pivot_table(data=tmp, columns=['underlying_name', 'target', 'D', 'market'],
                              values=['values', 'forecast'], index='timestamp')
         data_per_target[target] = tmp
-    scaling_factor = pd.to_timedelta('360D') // pd.to_timedelta(best_model_tags['RV'][-1])
-    rv_idx = pd.IndexSlice
-    data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :, :]] = \
-        data_per_target['RV'].loc[:, rv_idx[:, :, 'RV', :, :]].pow(.5).mul(scaling_factor ** .5)
+    annualisation = pd.Series(360 / data_per_target['RV'].columns.get_level_values('D').map(D_HORIZONS),
+                              index=data_per_target['RV'].columns)
+    data_per_target['RV'] = data_per_target['RV'].mul(annualisation, axis=1)
     svix_parquet = f'{args.target_path}/crypto_option_spot/svix.parquet'
-    svix_csv = f'{args.target_path}/crypto_option_spot/svix.csv'
-    if Path(svix_parquet).exists():
-        lazy = pl.scan_parquet(svix_parquet)
-        lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
-        svix = lazy.collect().to_pandas()
-        if 'index' in svix.columns:
-            svix = svix.drop(columns=['index'])
-    else:
-        svix = pd.read_csv(svix_csv, index_col='index')
-        svix['timestamp'] = pd.to_datetime(svix['timestamp'], utc=True)
-        svix = svix.loc[svix['timestamp'].dt.normalize().isin(date_range), :]
-    svix['svix'] = svix['svix']/100
+    lazy = pl.scan_parquet(svix_parquet)
+    lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
+    svix = lazy.collect().to_pandas()
     svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
     svix_agg = \
         pd.concat([svix.xs(1, axis=0, level=0,
@@ -472,7 +457,7 @@ if __name__ == '__main__':
                 objective = partial(objective_daily, option_chain_data=yesterday_straddle_data,
                                     data=yesterday_data.loc[:, forecast_underlying_name['forecast', :, :]],
                                     filter_signal=yesterday_filter, svix=yesterday_svix_underlying_name,
-                                    target=target, scaling_factor=scaling_factor, tradable_assets=tradable_assets)
+                                    target=target, tradable_assets=tradable_assets)
                 try:
                     study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
                                    n_jobs=N_JOBS, gc_after_trial=True)
@@ -653,7 +638,7 @@ if __name__ == '__main__':
                                                    f'{underlying_name}_{underlying_name_dates[idx_file]} has started.',
                                         sampler=RandomSampler(123))
                 objective = partial(objective_daily, spot_data=yesterday_spot, data=yesterday_data, target=target,
-                                    scaling_factor=scaling_factor, tradable_assets=tradable_assets)
+                                    tradable_assets=tradable_assets)
                 try:
                     study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
                                    n_jobs=N_JOBS, gc_after_trial=True)
