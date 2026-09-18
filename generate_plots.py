@@ -1,4 +1,3 @@
-import pdb
 import plotly.express as px
 import pandas as pd
 import argparse
@@ -9,7 +8,6 @@ from plotly.subplots import make_subplots
 import polars as pl
 from itertools import product
 from pathlib import Path
-import numpy as np
 
 ########################################################################################################################
 ## Order
@@ -171,16 +169,11 @@ if __name__ == '__main__':
                                 row_titles=list(pairs_order.categories), shared_yaxes=False, shared_xaxes=False,
                                 vertical_spacing=0.1, horizontal_spacing=0.06)
             tmp_crypto_svix = crypto_svix.xs(int(aggregated), axis=0, level=0, drop_level=True)
-            if aggregated:
-                tmp_crypto_svix = tmp_crypto_svix.drop('underlying_name', axis=1)
             for D, pair in product(list(d_order.categories), list(pairs_order.categories)):
-                if aggregated:
-                    tmp_pair = tmp_crypto_svix.xs(D, axis=0, level=0, drop_level=False)
-                else:
-                    tmp_pair = tmp_crypto_svix.xs(D, axis=0, level=0, drop_level=False)
-                    tmp_pair = tmp_pair.query(f'underlying_name == "{pair}"')
+                tmp_pair = tmp_crypto_svix.xs(D, axis=0, level=0, drop_level=False)
+                tmp_pair = tmp_pair.query(f'underlying_name == "{pair}"')
                 rv_pair = rv.filter((pl.col('underlying_name') == pair) & (pl.col('D') == D.upper()))
-                rv_pair = rv.collect().to_pandas().drop('regression', axis=1)
+                rv_pair = rv_pair.collect().to_pandas().drop('regression', axis=1)
                 rv_pair = rv_pair.groupby([pd.Grouper(key='market'), pd.Grouper(key='timestamp', freq=freq)])
                 rv_pair = rv_pair[['forecast', 'rv']].last()
                 D_days = D_HORIZONS[D.lower()]
@@ -192,25 +185,17 @@ if __name__ == '__main__':
                 rv_pair = rv_pair['forecast']
                 rv_pair.columns = ['rv_0', 'rv_1']
                 rv_pair = rv_pair.loc[valid].mul(100)
-                try:
-                    svix = tmp_pair.drop('underlying_name', axis=1).droplevel(axis=0, level=0)
-                except KeyError:
-                    svix = tmp_pair.droplevel(axis=0, level=0)
+                svix = tmp_pair.drop('underlying_name', axis=1).droplevel(axis=0, level=0)
                 svix.index = pd.to_datetime(svix.index, utc=True)
                 rv_pair.index = pd.to_datetime(rv_pair.index, utc=True)
                 if svix.index.has_duplicates:
-                    if aggregated:
-                        svix = svix.groupby(level=0).mean()
-                    else:
-                        duplicate_timestamps = svix.index[svix.index.duplicated(keep=False)].unique()
-                        raise ValueError(f'Duplicate SVIX timestamps for {pair}, {D}: {duplicate_timestamps}')
+                    duplicate_timestamps = svix.index[svix.index.duplicated(keep=False)].unique()
+                    raise ValueError(f'Duplicate SVIX timestamps for {pair}, {D}: {duplicate_timestamps}')
                 svix = svix.sort_index()
                 svix = svix.reindex(rv_pair.index, method='nearest')
                 vrp = -rv_pair.apply(lambda x, y: x.subtract(y.values.reshape(y.shape[0])), y=svix)
                 vrp.columns = ['vrp_0', 'vrp_1']
                 tmp_pair = pd.concat([vrp, rv_pair, svix], axis=1)
-                if pair not in ['BTCUSDT', 'ETHUSDT']:
-                    tmp_pair = tmp_pair.loc[tmp_pair.index >= svix.diff().replace(0, np.nan).first_valid_index(), :]
                 tmp_pair = tmp_pair.resample('7D').mean()
                 name_svix = 'Crypto SVIX<sub>0<span>&#10230;</span>D</sub>'
                 name_rv0 = 'RV<sub>0<span>&#10230;</span>D</sub><sup>X<sup>(S)</sup></sup>'
@@ -247,10 +232,6 @@ if __name__ == '__main__':
                               paper_bgcolor='white', plot_bgcolor='white', margin=dict(b=190, r=90, t=90))
             fig.update_xaxes(showline=True, linewidth=1, linecolor='black', mirror=False, showgrid=False, tickangle=45,
                              nticks=6)
-            # fig.update_yaxes(showline=True, linewidth=1, linecolor='black', mirror=False, showgrid=False, nticks=6,
-            #                  secondary_y=False)
-            # fig.update_yaxes(showline=True, linewidth=1, linecolor='rgba(150,50,50,0.6)', mirror=False, showgrid=False,
-            #                  nticks=4)
             fig.update_yaxes(showline=True, linewidth=1, linecolor='rgba(150,50,50,0.6)', mirror=False, showgrid=False,
                              nticks=4)
             fig.for_each_annotation(lambda x: x.update({'text': f'<i>{x["text"].split("=")[-1].lower()}</i>'}),
@@ -265,6 +246,3 @@ if __name__ == '__main__':
             fig.write_image(
                 f'{args.target_figures}/rv_svix_vrp {dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
                 format='pdf')
-
-
-
