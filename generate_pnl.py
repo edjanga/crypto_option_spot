@@ -329,7 +329,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Order
     ####################################################################################################################
-    pairs_order = CategoricalDtype(categories=['BTCUSDT'], ordered=True) #, 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'
+    pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'], ordered=True)
     d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
     volatility_order = CategoricalDtype(categories=['low', 'normal', 'high'], ordered=True)
     market_order = CategoricalDtype(categories=['$X^S$', '$X^{(S,O)}$'], ordered=True)
@@ -372,18 +372,6 @@ if __name__ == '__main__':
     lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
     svix = lazy.collect().to_pandas()
     svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
-    # Fix: the previous construction called .xs(1, level=0) to grab ALL FIVE
-    # symbols' aggregated==1 rows at once, then .droplevel(level=1) DROPPED
-    # the underlying_name level before the per-symbol loop below re-assigned
-    # it -- so every iteration relabeled the ENTIRE 5-symbol block under one
-    # symbol's name (confirmed: the resulting "BTCUSDT" block had 20 rows per
-    # (D, hour) group -- 5 symbols x 4 quotes/hour -- instead of the correct
-    # 4). The subsequent groupby(...).last() then silently picked whichever
-    # symbol's row happened to sort last for each timestamp, which is not
-    # guaranteed to be the symbol the row was labeled with. svix_non_agg
-    # (below) never had this problem because it does exactly what's needed
-    # here: .xs(..., drop_level=False) keeps every level, including
-    # underlying_name, intact and correctly attributed per row.
     svix_agg = svix.xs(1, axis=0, level=0, drop_level=False)
     svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
     svix = pd.concat([svix_agg, svix_non_agg])
@@ -398,7 +386,7 @@ if __name__ == '__main__':
         lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean().shift()).ffill()
     mean_bar = mean_bar.reindex(data_per_target['RV'].index).ffill()
     mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(date_range), :]
-    target_underlying_names = list(itertools.product(['RV', 'returns'], ['BTCUSDT'])) #list(pairs_order.categories)
+    target_underlying_names = list(itertools.product(['RV', 'returns'], list(pairs_order.categories)))
     file_cutoff = pd.Timestamp(args.start_date)
     pnl = \
         dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
@@ -704,14 +692,8 @@ if __name__ == '__main__':
                                              how='left', suffix='_delta_weights')
                 exprs = []
                 for D in today_forecast.columns.get_level_values('D').unique().tolist():
-                    exprs += pnl_expressions(
-                        return_col='returns',
-                        weight_col=D,
-                        delta_weight_col=f'{D}_delta_weights',
-                        transaction_fee_col='transaction_fees',
-                        basc_fee_col='basc_fees',
-                        D=D,
-                    )
+                    exprs += pnl_expressions(return_col='returns', weight_col=D, delta_weight_col=f'{D}_delta_weights',
+                                             transaction_fee_col='transaction_fees', basc_fee_col='basc_fees', D=D)
                 today_spot = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
                 today_spot = today_spot.with_columns(exprs)
                 today_spot = today_spot.drop(
@@ -846,10 +828,6 @@ if __name__ == '__main__':
                                      font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                      yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
                           height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
-                          # legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
-                          #             font=dict(size=10 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
-                          #             tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
-                          #             bordercolor='rgba(0,0,0,0.3)', borderwidth=1)
                           )
         fig.update_traces(line=dict(width=30))
         fig.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
@@ -866,10 +844,6 @@ if __name__ == '__main__':
                                           font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                           yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE),
                                width=WIDTH * 15, height=5 * len(d_order.categories) * HEIGHT,
-                               # legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
-                               #             font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
-                               #             tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
-                               #             bordercolor='rgba(0,0,0,0.3)', borderwidth=1),
                                paper_bgcolor='white', plot_bgcolor='white')
             fig2.update_traces(line=dict(width=30))
             fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
@@ -906,10 +880,8 @@ if __name__ == '__main__':
     for aggregated in [False, True]:
         tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
         if not aggregated:
-            # tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
             tmp_sharpe = tmp_sharpe.reindex(sharpe_index_order_non_aggregated).reindex(sharpe_columns_order, axis=1)
         else:
-            # tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
             tmp_sharpe = tmp_sharpe.reindex(sharpe_index_order_aggregated).reindex(sharpe_columns_order, axis=1)
         tmp_sharpe = tmp_sharpe.astype(object)
         sharpe_xs = tmp_sharpe.xs('$X^S$', level=1, axis=1, drop_level=False)

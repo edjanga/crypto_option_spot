@@ -1,3 +1,4 @@
+import pdb
 import plotly.express as px
 import pandas as pd
 import argparse
@@ -8,6 +9,7 @@ from plotly.subplots import make_subplots
 import polars as pl
 from itertools import product
 from pathlib import Path
+import numpy as np
 
 ########################################################################################################################
 ## Order
@@ -207,6 +209,8 @@ if __name__ == '__main__':
                 vrp = -rv_pair.apply(lambda x, y: x.subtract(y.values.reshape(y.shape[0])), y=svix)
                 vrp.columns = ['vrp_0', 'vrp_1']
                 tmp_pair = pd.concat([vrp, rv_pair, svix], axis=1)
+                if pair not in ['BTCUSDT', 'ETHUSDT']:
+                    tmp_pair = tmp_pair.loc[tmp_pair.index >= svix.diff().replace(0, np.nan).first_valid_index(), :]
                 tmp_pair = tmp_pair.resample('7D').mean()
                 name_svix = 'Crypto SVIX<sub>0<span>&#10230;</span>D</sub>'
                 name_rv0 = 'RV<sub>0<span>&#10230;</span>D</sub><sup>X<sup>(S)</sup></sup>'
