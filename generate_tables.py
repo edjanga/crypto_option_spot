@@ -1,20 +1,11 @@
-import datetime
-import itertools
 import os
-import pdb
 import numpy as np
 import pandas as pd
 import pytz
-from dateutil.relativedelta import relativedelta
-from constants import DATE_FORMAT, DAYS_CONVERTER, SYMBOLS, VOL_REGIMES, ATM_MONEYNESSES
-from typing import Dict, List, Tuple
-from scipy.optimize import minimize
-from scipy.stats.distributions import norm
+from constants import SYMBOLS
 from pandas.api.types import CategoricalDtype
-import polars as pl
 from itertools import product
 import argparse
-import concurrent
 
 
 if __name__ == '__main__':
@@ -27,7 +18,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Order
     ####################################################################################################################
-    pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True)
+    pairs_order = CategoricalDtype(categories=SYMBOLS, ordered=True)
     d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
     volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
     market_order = CategoricalDtype(categories=[0, 1], ordered=True)
@@ -149,6 +140,7 @@ if __name__ == '__main__':
                     group_keys=False).apply(
                     lambda g: g.nlargest(5, 'MASE')).reset_index()
             feature_importance_ranking['MASE'] = feature_importance_ranking['MASE'].round(4)
+            feature_importance_ranking = feature_importance_ranking.dropna()
             feature_importance_ranking = \
                 feature_importance_ranking.sort_values('MASE', ascending=False).groupby(['target', 'D',
                                                                                          'volatility_regime'],

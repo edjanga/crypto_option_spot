@@ -1,3 +1,4 @@
+import pdb
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -328,7 +329,7 @@ if __name__ == '__main__':
     ####################################################################################################################
     ## Order
     ####################################################################################################################
-    pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True)
+    pairs_order = CategoricalDtype(categories=['BTCUSDT'], ordered=True) #, 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'
     d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
     volatility_order = CategoricalDtype(categories=['low', 'normal', 'high'], ordered=True)
     market_order = CategoricalDtype(categories=['$X^S$', '$X^{(S,O)}$'], ordered=True)
@@ -363,17 +364,27 @@ if __name__ == '__main__':
         data_per_target[target] = tmp
     annualisation = pd.Series(360 / data_per_target['RV'].columns.get_level_values('D').map(D_HORIZONS),
                               index=data_per_target['RV'].columns)
+    d_values = data_per_target['RV'].columns.get_level_values('D').str.lower()
+    annualisation = pd.Series(360 / d_values.map(D_HORIZONS), index=data_per_target['RV'].columns)
     data_per_target['RV'] = data_per_target['RV'].mul(annualisation, axis=1)
     svix_parquet = f'{args.target_path}/crypto_option_spot/svix.parquet'
     lazy = pl.scan_parquet(svix_parquet)
     lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
     svix = lazy.collect().to_pandas()
     svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
-    svix_agg = \
-        pd.concat([svix.xs(1, axis=0, level=0,
-                           drop_level=False).droplevel(axis=0, level=1).assign(underlying_name=underlying_name)
-                   for underlying_name in list(pairs_order.categories)]).set_index('underlying_name', append=True)
-    svix_agg = svix_agg.swaplevel(-1, 1).swaplevel(-1, 2)
+    # Fix: the previous construction called .xs(1, level=0) to grab ALL FIVE
+    # symbols' aggregated==1 rows at once, then .droplevel(level=1) DROPPED
+    # the underlying_name level before the per-symbol loop below re-assigned
+    # it -- so every iteration relabeled the ENTIRE 5-symbol block under one
+    # symbol's name (confirmed: the resulting "BTCUSDT" block had 20 rows per
+    # (D, hour) group -- 5 symbols x 4 quotes/hour -- instead of the correct
+    # 4). The subsequent groupby(...).last() then silently picked whichever
+    # symbol's row happened to sort last for each timestamp, which is not
+    # guaranteed to be the symbol the row was labeled with. svix_non_agg
+    # (below) never had this problem because it does exactly what's needed
+    # here: .xs(..., drop_level=False) keeps every level, including
+    # underlying_name, intact and correctly attributed per row.
+    svix_agg = svix.xs(1, axis=0, level=0, drop_level=False)
     svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
     svix = pd.concat([svix_agg, svix_non_agg])
     svix = svix.loc[svix.index.get_level_values('timestamp').normalize().isin(date_range), :]
@@ -387,7 +398,7 @@ if __name__ == '__main__':
         lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean().shift()).ffill()
     mean_bar = mean_bar.reindex(data_per_target['RV'].index).ffill()
     mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(date_range), :]
-    target_underlying_names = list(itertools.product(['RV', 'returns'], list(pairs_order.categories)))
+    target_underlying_names = list(itertools.product(['RV', 'returns'], ['BTCUSDT'])) #list(pairs_order.categories)
     file_cutoff = pd.Timestamp(args.start_date)
     pnl = \
         dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
@@ -410,9 +421,10 @@ if __name__ == '__main__':
                 yesterday_file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
                                              f'{underlying_name_dates[idx_file-1].split("-")[0]}/{underlying_name}/'
                                              f'{underlying_name_dates[idx_file-1]}',
-                                             schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
-                                                     'spread': pl.Float64, 'moneyness': pl.Float64,
-                                                     'tau': pl.Float64})
+                                             schema_overrides={'timestamp': pl.Datetime(time_unit='ms'),
+                                                               'mid_price': pl.Float64,
+                                                               'spread': pl.Float64, 'moneyness': pl.Float64,
+                                                               'tau': pl.Float64})
                 yesterday_file = (
                     yesterday_file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type']))
                 yesterday_spot_underlying_file = \
@@ -751,24 +763,19 @@ if __name__ == '__main__':
             gc.collect()
         except IndexError:
             continue
-    pnl = pd.concat(pd.concat([reduce(lambda l, r: l.join(r, how='outer'), dfs)
-                               for dfs in [[df for df in pnl[target].values() if isinstance(df, pd.DataFrame)]] if dfs])
-                    for target in pnl.keys())
+    for target in ['RV', 'returns']:
+        pnl[target] = pd.concat(pnl[target], axis=1)
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
                      pd.Grouper(level='spread')]
-    pnl = pnl.groupby(grouper_level + [pd.Grouper(level='timestamp', freq='D')]).sum()
     ####################################################################################################################
     ## Plot difference in cumulative P&L
     ####################################################################################################################
     title_dd = dict([(False, 'First Moment-based Strategy'), (True, 'Second Moment-based Strategy')])
-    diff_cum_pnl = pnl.groupby(grouper_level, group_keys=False).apply(lambda x: x.cumsum())
-    diff_cum_pnl = diff_cum_pnl.xs(1, level='market', axis=1).sub(diff_cum_pnl.xs(0, level='market', axis=1))
-    all_diff_tmp_cum_pnl = \
-        {'returns': diff_cum_pnl.xs('returns', level='target', drop_level=True).xs('', level='aggregated',
-                                                                                   drop_level=True),
-         'RV': diff_cum_pnl.loc[pd.IndexSlice[:, 'RV', :], :].xs('RV', level='target', drop_level=True)}
     for target in ['RV', 'returns']:
-        tmp_diff_cum_pnl = all_diff_tmp_cum_pnl[target]
+        tmp_pnl = pnl[target]
+        tmp_cum_pnl = tmp_pnl.groupby(grouper_level, group_keys=False).apply(lambda x: x.cumsum())
+        tmp_diff_cum_pnl = tmp_cum_pnl.xs(1, level='market', axis=1).sub(tmp_cum_pnl.xs(0, level='market', axis=1))
+        tmp_diff_cum_pnl = tmp_diff_cum_pnl.droplevel('target')
         fig = make_subplots(rows=3, cols=len(d_order.categories), shared_xaxes=False,
                             row_titles=['P&L<sup><span>&#8212;</span>0</sup>',
                                         'P&L<sup><span>&#8212;</span>TF</sup>',
@@ -781,55 +788,56 @@ if __name__ == '__main__':
                                              'P&L<sup><span>&#8212;</span>BASC</sup>'],
                                  column_titles=[f'<i>{D}</i>' for D in d_order.categories])
         for idx, pair in enumerate(list(pairs_order.categories)):
-            tmp_diff_cum_pnl_pair = tmp_diff_cum_pnl.xs(pair, axis=1)
+            pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
             if target == 'RV':
-                tmp_diff_cum_pnl_pair = \
-                    tmp_diff_cum_pnl.xs(pair, axis=1).xs(1, axis=0, level='aggregated', drop_level=True)
-                tmp_diff_cum_pnl_pair_non_agg = \
-                    tmp_diff_cum_pnl.xs(pair, axis=1).xs(0, axis=0, level='aggregated', drop_level=True)
+                tmp_diff_cum_pnl_pair = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True)
+                tmp_diff_cum_pnl_pair_non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True)
+                tmp_diff_cum_pnl_pair_non_agg = tmp_diff_cum_pnl_pair_non_agg.droplevel(0, 1)
+            else:
+                tmp_diff_cum_pnl_pair = pair_slice.xs('', axis=0, level='aggregated', drop_level=True)
+            tmp_diff_cum_pnl_pair = tmp_diff_cum_pnl_pair.droplevel(0, 1)
             tmp_diff_cum_pnl_pair_no_fees = \
                 tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
             tmp_diff_cum_pnl_pair_tf = \
                 tmp_diff_cum_pnl_pair.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
             tmp_diff_cum_pnl_pair_basc = \
                 tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
+            if target == 'RV':
+                tmp_diff_cum_pnl_pair_non_agg_no_fees = \
+                    tmp_diff_cum_pnl_pair_non_agg.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
+                tmp_diff_cum_pnl_pair_non_agg_tf = \
+                    tmp_diff_cum_pnl_pair_non_agg.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
+                tmp_diff_cum_pnl_pair_non_agg_basc = \
+                    tmp_diff_cum_pnl_pair_non_agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
             for col, D in enumerate(d_order.categories):
-                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index,
+                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index.astype(str),
                                                y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
                                                marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=(col == 0)),
+                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=False), #col == 0
                               col=col + 1, row=1)
-                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index,
+                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index.astype(str),
                                                y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
                                                marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                               col=col + 1, row=2)
-                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_basc.index,
+                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_basc.index.astype(str),
                                                y=tmp_diff_cum_pnl_pair_basc[D.upper()].values,
                                                marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                               col=col + 1, row=3)
                 if target == 'RV':
-                    tmp_diff_cum_pnl_pair = \
-                        tmp_diff_cum_pnl.xs(pair, axis=1).xs(0, axis=0, level='aggregated', drop_level=True)
-                    tmp_diff_cum_pnl_pair_no_fees = \
-                        tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
-                    tmp_diff_cum_pnl_pair_tf = \
-                        tmp_diff_cum_pnl_pair.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
-                    tmp_diff_cum_pnl_pair_basc = \
-                        tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
-                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index,
-                                                    y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
+                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_non_agg_no_fees.index.astype(str),
+                                                    y=tmp_diff_cum_pnl_pair_non_agg_no_fees[D.upper()].values,
                                                     marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=(col == 0)),
+                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False), #col == 0
                                    col=col + 1, row=1)
-                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index,
-                                                    y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
+                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_non_agg_tf.index.astype(str),
+                                                    y=tmp_diff_cum_pnl_pair_non_agg_tf[D.upper()].values,
                                                     marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                     name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                                    col=col + 1, row=2)
-                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_basc.index,
-                                                    y=tmp_diff_cum_pnl_pair_basc[D.upper()].values,
+                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_non_agg_basc.index.astype(str),
+                                                    y=tmp_diff_cum_pnl_pair_non_agg_basc[D.upper()].values,
                                                     marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                     name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                                    col=col + 1, row=3)
@@ -838,10 +846,11 @@ if __name__ == '__main__':
                                      font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                      yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
                           height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
-                          legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
-                                      font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
-                                      tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
-                                      bordercolor='rgba(0,0,0,0.3)', borderwidth=1))
+                          # legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                          #             font=dict(size=10 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
+                          #             tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
+                          #             bordercolor='rgba(0,0,0,0.3)', borderwidth=1)
+                          )
         fig.update_traces(line=dict(width=30))
         fig.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
         fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
@@ -857,10 +866,10 @@ if __name__ == '__main__':
                                           font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                           yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE),
                                width=WIDTH * 15, height=5 * len(d_order.categories) * HEIGHT,
-                               legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
-                                           font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
-                                           tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
-                                           bordercolor='rgba(0,0,0,0.3)', borderwidth=1),
+                               # legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                               #             font=dict(size=20 * LABEL_AXIS_FONT_SIZE), itemwidth=40,
+                               #             tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
+                               #             bordercolor='rgba(0,0,0,0.3)', borderwidth=1),
                                paper_bgcolor='white', plot_bgcolor='white')
             fig2.update_traces(line=dict(width=30))
             fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
@@ -869,9 +878,14 @@ if __name__ == '__main__':
                               showgrid=False, title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
             fig2.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
                               tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
+            fig2.for_each_trace(lambda t: setattr(t, 'x',
+                                                  [x.isoformat() if isinstance(x, pd.Timestamp) else x for x in
+                                                   t.x]) if t.x is not None else None)
             fig2.write_image(f'./figures/pnl_second_moment_non_aggregated.pdf', format='pdf')
-    sharpe_mean = pnl.groupby(grouper_level).mean()
-    sharpe_std = pnl.groupby(grouper_level).std()
+    sharpe_mean = pd.concat([pnl['RV'].droplevel(0, 1).groupby(grouper_level).mean(),
+                             pnl['returns'].droplevel(0, 1).groupby(grouper_level).mean()])
+    sharpe_std = pd.concat([pnl['RV'].droplevel(0, 1).groupby(grouper_level).std(),
+                            pnl['returns'].droplevel(0, 1).groupby(grouper_level).std()])
     no_fees = pd.IndexSlice
     sharpe = sharpe_mean.div(sharpe_std).mul(360 ** .5).loc[no_fees[:, :, 0, 0], :].round(2)
     sharpe.columns = sharpe.columns.set_levels(['$X^S$', '$X^{(S,O)}$'], level='market')
@@ -881,35 +895,28 @@ if __name__ == '__main__':
         pd.MultiIndex.from_product([pairs_order.categories.tolist(), market_order.categories.tolist()],
                                    names=['underlying_name', 'market'])
     sharpe_index_order_aggregated = pd.MultiIndex.from_tuples(
-        [(agg, target, rf'\textit{{{d}}}') for agg in ['', str(float(1))]
-         for target in ['returns', 'RV']
+        [(agg, target, rf'\textit{{{d}}}') for agg in ['', str(float(1))] for target in ['returns', 'RV']
          for d in d_order.categories.tolist()
          if not ((target == 'returns' and agg in [str(float(1))]) or (target == 'RV' and agg == ''))],
         names=['aggregated', 'target', 'D']
     )
-    sharpe_index_order_non_aggregated = pd.MultiIndex.from_tuples(
-        [(agg, target, rf'\textit{{{d}}}') for agg in [str(float(0))]
-         for target in ['RV']
-         for d in d_order.categories.tolist()],
-        names=['aggregated', 'target', 'D']
-    )
+    sharpe_index_order_non_aggregated = \
+        pd.MultiIndex.from_tuples([(agg, target, rf'\textit{{{d}}}') for agg in [str(float(0))] for target in ['RV']
+                                   for d in d_order.categories.tolist()], names=['aggregated', 'target', 'D'])
     for aggregated in [False, True]:
+        tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
         if not aggregated:
-            tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
+            # tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
             tmp_sharpe = tmp_sharpe.reindex(sharpe_index_order_non_aggregated).reindex(sharpe_columns_order, axis=1)
         else:
-            tmp_sharpe = \
-                sharpe.droplevel(axis=0, level=[-2, -1]).stack('D').reindex(sharpe_index_order_aggregated).reindex(
-                sharpe_columns_order, axis=1)
+            # tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
+            tmp_sharpe = tmp_sharpe.reindex(sharpe_index_order_aggregated).reindex(sharpe_columns_order, axis=1)
         tmp_sharpe = tmp_sharpe.astype(object)
         sharpe_xs = tmp_sharpe.xs('$X^S$', level=1, axis=1, drop_level=False)
         sharpe_x_so = tmp_sharpe.xs('$X^{(S,O)}$', level=1, axis=1, drop_level=False)
-        xs_wins = pd.DataFrame(
-            sharpe_xs.droplevel('market', axis=1).to_numpy(dtype=float)
-            >= sharpe_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
-            index=tmp_sharpe.index, columns=sharpe_xs.columns,
-        )
-
+        xs_wins = pd.DataFrame(sharpe_xs.droplevel('market', axis=1).to_numpy(dtype=float)
+                               >= sharpe_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
+                               index=tmp_sharpe.index, columns=sharpe_xs.columns)
         def _bold_if(value, is_winner):
             if pd.isna(value):
                 return value
@@ -950,28 +957,35 @@ if __name__ == '__main__':
                          .then(pl.lit(rf'\textit{{{VOL_REGIMES[1].lower()}}}'))
                          .otherwise(pl.lit(rf'\textit{{{VOL_REGIMES[2].lower()}}}')).alias('vol_regime')))
     rv = rv.drop(['q33', 'q66', 'RV'])
-    pnl = pl.from_pandas(pnl.stack('D', future_stack=True).stack('market', future_stack=True).stack(
-        'underlying_name', future_stack=True).reset_index().replace('', np.nan))
-    pnl = pnl.join(rv.collect(), on=['D', 'timestamp'], how='inner').rename({'0': 'returns'})
-    pnl = \
-        pnl.sort(['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name', 'market'])
-    pnl = \
-        pnl.group_by(['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name',
-                      'market'])
-    sharpe_pnl_per_vol_regime = pnl.agg([pl.col('returns').mean().alias('mean'),
-                                         pl.col('returns').std().alias('std')])
-    sharpe_pnl_per_vol_regime = \
-        sharpe_pnl_per_vol_regime.with_columns((pl.col('mean')/pl.col('std')).mul(360 ** .5).alias('sharpe'))
-    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.select(['aggregated', 'target', 'transaction_fees', 'spread',
-                                                                  'vol_regime', 'D', 'underlying_name', 'market',
-                                                                  'sharpe'])
-    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.sort(['aggregated', 'target', 'transaction_fees', 'spread',
-                                                                'vol_regime', 'D', 'underlying_name', 'market'])
-    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.with_columns(pl.col('aggregated').fill_null('')).to_pandas()
+    pnl_returns = \
+        pnl['returns'].droplevel(0, 1).stack('D', future_stack=True).stack('market', future_stack=True).stack()
+    pnl_returns = pd.DataFrame(pnl_returns).rename(columns={0: 'returns'}).reset_index()
+    pnl_returns = pnl_returns.merge(rv.collect().to_pandas(), on=['D', 'timestamp'], how='inner')
+    pnl_rv = \
+        pnl['RV'].droplevel(0, 1).stack('D', future_stack=True).stack('market', future_stack=True).stack()
+    pnl_rv = pd.DataFrame(pnl_rv).rename(columns={0: 'returns'}).reset_index()
+    pnl_rv = pnl_rv.merge(rv.collect().to_pandas(), on=['D', 'timestamp'], how='inner')
+    pnl_returns = pnl_returns.groupby(
+        ['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name', 'market'],
+        dropna=False)[['returns']]
+    pnl_returns_mean = pnl_returns.mean()
+    pnl_returns_std = pnl_returns.std()
+    sharpe_pnl_per_vol_regime_returns = pnl_returns_mean/pnl_returns_std
+    pnl_rv = \
+        pnl_rv.groupby(['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name',
+                        'market'])[['returns']]
+    pnl_rv_mean = pnl_rv.mean()
+    pnl_rv_std = pnl_rv.std()
+    sharpe_pnl_per_vol_regime_rv = pnl_rv_mean / pnl_rv_std
+    sharpe_pnl_per_vol_regime = pd.concat([sharpe_pnl_per_vol_regime_returns, sharpe_pnl_per_vol_regime_rv])
+    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.mul(360 ** .5).rename(columns={'returns': 'sharpe'})
+    sharpe_pnl_per_vol_regime.index = \
+        sharpe_pnl_per_vol_regime.index.set_levels(sharpe_pnl_per_vol_regime.index.levels[0].fillna(''),
+                                                   level='aggregated')
     sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.query('transaction_fees == 0 and spread == 0')
-    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.drop(['transaction_fees', 'spread'], axis=1)
+    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.droplevel(['transaction_fees', 'spread'])
     sharpe_pnl_per_vol_regime = \
-        pd.pivot(sharpe_pnl_per_vol_regime, index=['aggregated', 'target', 'vol_regime', 'D'],
+        pd.pivot(sharpe_pnl_per_vol_regime.reset_index(), index=['aggregated', 'target', 'vol_regime', 'D'],
                  columns=['underlying_name', 'market'], values='sharpe').round(2)
     sharpe_pnl_per_vol_regime.columns = \
         sharpe_pnl_per_vol_regime.columns.set_levels(['$X^S$', '$X^{(S,O)}$'], level='market')
@@ -1008,7 +1022,6 @@ if __name__ == '__main__':
             >= sharpe_per_volatility_regime_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
             index=tmp_sharpe.index, columns=sharpe_per_volatility_regime_xs.columns,
         )
-
         def _bold_if(value, is_winner):
             if pd.isna(value):
                 return value

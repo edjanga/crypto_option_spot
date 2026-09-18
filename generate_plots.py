@@ -1,5 +1,3 @@
-import pdb
-
 import plotly.express as px
 import pandas as pd
 import argparse
@@ -14,7 +12,7 @@ from pathlib import Path
 ########################################################################################################################
 ## Order
 ########################################################################################################################
-pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT'], ordered=True)
+pairs_order = CategoricalDtype(categories=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'], ordered=True)
 d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
 volatility_order = CategoricalDtype(categories=['Low', 'Normal', 'High'], ordered=True)
 market_order = CategoricalDtype(categories=[0, 1], ordered=True)

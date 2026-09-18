@@ -32,7 +32,7 @@ LABEL_AXIS_FONT_SIZE = 30
 LEGEND_FONT_SIZE = 20
 HEIGHT = 900
 WIDTH = 1_300
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'] #'XRPUSDT',
 LOW_ATM_MONEYNESS = .85
 HIGH_ATM_MONEYNESS = 1.15
 ATM_MONEYNESSES = \
@@ -43,5 +43,6 @@ if torch.cuda.is_available():
     ENGINE = 'cuda'
 elif torch.backends.mps.is_available():
     ENGINE = 'mps'
-model_names = {'Lasso': 'lasso', 'LGBMRegressor': 'lightgbm', 'SOFTS': 'softs'}
+model_names = {'LGBMRegressor': 'lightgbm', 'SOFTS': 'softs'}
 OPTION_PREFIXES = ('gex', 'vax', 'vex', 'vox', 'pcr', 'spread_', 'is_retail', 'is_informed', 'is_institutional')
+D_HORIZONS = {'1d': 1, '1w': 7, '1m': 30}
