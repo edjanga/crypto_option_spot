@@ -57,20 +57,15 @@ if __name__ == "__main__":
         convert_forecasts(forecasts_csv, base / "crypto_option_spot/forecasts.parquet")
     else:
         print(f"NOTE: {forecasts_csv} not found, skipping.")
-    svix_csv = base / "crypto_option_spot/svix.csv"
-    if svix_csv.exists():
-        convert_svix(svix_csv, base / "crypto_option_spot/svix.parquet")
-    else:
-        print(f"NOTE: {svix_csv} not found, skipping.")
-    spot_features_csv = base / "spot_features.csv"
-    option_features_csv = base / "option_features.csv"
-    if spot_features_csv.exists():
-        convert_spot_features(spot_features_csv, base / "spot_features.parquet")
-    else:
-        print(f"NOTE: {spot_features_csv} not found, skipping.")
-    if option_features_csv.exists():
-        convert_option_features(option_features_csv, base / "option_features.parquet")
-    else:
-        print(f"NOTE: {option_features_csv} not found, skipping.")
+    # spot_features_csv = base / "spot_features.csv"
+    # option_features_csv = base / "option_features.csv"
+    # if spot_features_csv.exists():
+    #     convert_spot_features(spot_features_csv, base / "spot_features.parquet")
+    # else:
+    #     print(f"NOTE: {spot_features_csv} not found, skipping.")
+    # if option_features_csv.exists():
+    #     convert_option_features(option_features_csv, base / "option_features.parquet")
+    # else:
+    #     print(f"NOTE: {option_features_csv} not found, skipping.")
     print("\nDone. Re-run generate_pnl3.py -- it will automatically prefer the .parquet "
           "files if present.")
