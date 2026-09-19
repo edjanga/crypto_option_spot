@@ -1,5 +1,3 @@
-import pdb
-from pathlib import Path
 import pandas as pd
 import numpy as np
 import glob
@@ -11,7 +9,6 @@ from functools import partial
 from optuna.samplers import RandomSampler
 import argparse
 import itertools
-from functools import reduce
 from tqdm.auto import tqdm
 from datetime import datetime
 import plotly.graph_objects as go
@@ -753,100 +750,132 @@ if __name__ == '__main__':
     ## Plot difference in cumulative P&L
     ####################################################################################################################
     title_dd = dict([(False, 'First Moment-based Strategy'), (True, 'Second Moment-based Strategy')])
+    fee_labels = ['No fees', 'TF', 'BASC']
     for target in ['RV', 'returns']:
         tmp_pnl = pnl[target]
         tmp_cum_pnl = tmp_pnl.groupby(grouper_level, group_keys=False).apply(lambda x: x.cumsum())
         tmp_diff_cum_pnl = tmp_cum_pnl.xs(1, level='market', axis=1).sub(tmp_cum_pnl.xs(0, level='market', axis=1))
         tmp_diff_cum_pnl = tmp_diff_cum_pnl.droplevel('target')
-        fig = make_subplots(rows=3, cols=len(d_order.categories), shared_xaxes=False,
-                            row_titles=['P&L<sup><span>&#8212;</span>0</sup>',
-                                        'P&L<sup><span>&#8212;</span>TF</sup>',
-                                        'P&L<sup><span>&#8212;</span>BASC</sup>'],
-                            column_titles=[f'<i>{D}</i>' for D in d_order.categories])
-        if target == 'RV':
-            fig2 = make_subplots(rows=3, cols=len(d_order.categories), shared_xaxes=False,
-                                 row_titles=['P&L<sup><span>&#8212;</span>0</sup>',
-                                             'P&L<sup><span>&#8212;</span>TF</sup>',
-                                             'P&L<sup><span>&#8212;</span>BASC</sup>'],
-                                 column_titles=[f'<i>{D}</i>' for D in d_order.categories])
-        for idx, pair in enumerate(list(pairs_order.categories)):
-            pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
-            if target == 'RV':
-                tmp_diff_cum_pnl_pair = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True)
-                tmp_diff_cum_pnl_pair_non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True)
-                tmp_diff_cum_pnl_pair_non_agg = tmp_diff_cum_pnl_pair_non_agg.droplevel(0, 1)
-            else:
+        if target == 'returns':
+            fig = make_subplots(rows=3, cols=len(d_order.categories), shared_xaxes=False,
+                                row_titles=['P&L<sup><span>&#8212;</span>0</sup>',
+                                            'P&L<sup><span>&#8212;</span>TF</sup>',
+                                            'P&L<sup><span>&#8212;</span>BASC</sup>'],
+                                column_titles=[f'<i>{D}</i>' for D in d_order.categories])
+            for idx, pair in enumerate(list(pairs_order.categories)):
+                pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
                 tmp_diff_cum_pnl_pair = pair_slice.xs('', axis=0, level='aggregated', drop_level=True)
-            tmp_diff_cum_pnl_pair = tmp_diff_cum_pnl_pair.droplevel(0, 1)
-            tmp_diff_cum_pnl_pair_no_fees = \
-                tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
-            tmp_diff_cum_pnl_pair_tf = \
-                tmp_diff_cum_pnl_pair.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
-            tmp_diff_cum_pnl_pair_basc = \
-                tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
-            if target == 'RV':
-                tmp_diff_cum_pnl_pair_non_agg_no_fees = \
-                    tmp_diff_cum_pnl_pair_non_agg.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
-                tmp_diff_cum_pnl_pair_non_agg_tf = \
-                    tmp_diff_cum_pnl_pair_non_agg.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
-                tmp_diff_cum_pnl_pair_non_agg_basc = \
-                    tmp_diff_cum_pnl_pair_non_agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
-            for col, D in enumerate(d_order.categories):
-                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index.astype(str),
-                                               y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
-                                               marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=False), #col == 0
-                              col=col + 1, row=1)
-                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index.astype(str),
-                                               y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
-                                               marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
-                              col=col + 1, row=2)
-                fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_basc.index.astype(str),
-                                               y=tmp_diff_cum_pnl_pair_basc[D.upper()].values,
-                                               marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                               name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
-                              col=col + 1, row=3)
-                if target == 'RV':
-                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_non_agg_no_fees.index.astype(str),
-                                                    y=tmp_diff_cum_pnl_pair_non_agg_no_fees[D.upper()].values,
-                                                    marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False), #col == 0
-                                   col=col + 1, row=1)
-                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_non_agg_tf.index.astype(str),
-                                                    y=tmp_diff_cum_pnl_pair_non_agg_tf[D.upper()].values,
-                                                    marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
-                                   col=col + 1, row=2)
-                    fig2.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_non_agg_basc.index.astype(str),
-                                                    y=tmp_diff_cum_pnl_pair_non_agg_basc[D.upper()].values,
-                                                    marker=dict(color=px.colors.qualitative.Plotly[idx]),
-                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
-                                   col=col + 1, row=3)
-        fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
-                                     x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
-                                     font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
-                                     yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
-                          height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
-                          )
-        fig.update_traces(line=dict(width=30))
-        fig.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
-        fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
-        fig.update_xaxes(tickangle=45, showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
-                         title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
-        fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
-                         tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
-        fig.write_image(f'./figures/pnl_{dict([("returns", "first"), ("RV", "second")])[target]}_moment.pdf',
-                        format='pdf')
-        if target == 'RV':
+                tmp_diff_cum_pnl_pair = tmp_diff_cum_pnl_pair.droplevel(0, 1)
+                tmp_diff_cum_pnl_pair_no_fees = \
+                    tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
+                tmp_diff_cum_pnl_pair_tf = \
+                    tmp_diff_cum_pnl_pair.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread')
+                tmp_diff_cum_pnl_pair_basc = \
+                    tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
+                for col, D in enumerate(d_order.categories):
+                    fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index.astype(str),
+                                                   y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
+                                                   marker=dict(color=px.colors.qualitative.Plotly[idx]),
+                                                   name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
+                                  col=col + 1, row=1)
+                    fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index.astype(str),
+                                                   y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
+                                                   marker=dict(color=px.colors.qualitative.Plotly[idx]),
+                                                   name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
+                                  col=col + 1, row=2)
+                    fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_basc.index.astype(str),
+                                                   y=tmp_diff_cum_pnl_pair_basc[D.upper()].values,
+                                                   marker=dict(color=px.colors.qualitative.Plotly[idx]),
+                                                   name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
+                                  col=col + 1, row=3)
+            fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
+                                         x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
+                                         font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
+                                         yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
+                              height=5 * len(d_order.categories) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
+                              )
+            fig.update_traces(line=dict(width=30))
+            fig.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
+            fig.update_xaxes(tickangle=45, showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
+                             title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
+            fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
+                             tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
+            fig.write_image(f'./figures/pnl_{dict([("returns", "first"), ("RV", "second")])[target]}_moment.pdf',
+                            format='pdf')
+        else:
+            fee_name = {'No fees': 'P&L<sup>-0</sup>', 'TF': 'P&L<sup>-TF</sup>', 'BASC': 'P&L<sup>-BASC</sup>'}
+            pairs = list(pairs_order.categories)
+            fig = make_subplots(rows=len(pairs), cols=len(d_order.categories), shared_xaxes=False,
+                                row_titles=[p.replace("USDT", "/USDT") for p in pairs],
+                                column_titles=[f'<i>{D}</i>' for D in d_order.categories])
+            fig2 = make_subplots(rows=len(pairs), cols=len(d_order.categories), shared_xaxes=False,
+                                 row_titles=[p.replace("USDT", "/USDT") for p in pairs],
+                                 column_titles=[f'<i>{D}</i>' for D in d_order.categories])
+            for row_idx, pair in enumerate(pairs):
+                pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
+                pair_slice = pair_slice.groupby(['aggregated', 'transaction_fees', 'spread']).transform('ffill')
+                agg = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True).droplevel(0, 1)
+                non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True).droplevel(0, 1)
+                by_fee = {'No fees': agg.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
+                          'TF': agg.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
+                          'BASC': agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')}
+                by_fee_non_agg = {
+                    'No fees': non_agg.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
+                    'TF': non_agg.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
+                    'BASC': non_agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')}
+                for col, D in enumerate(d_order.categories):
+                    for idx, fee_label in enumerate(fee_labels):
+                        s = by_fee[fee_label]
+                        fig.add_trace(trace=go.Scatter(x=s.index.astype(str), y=s[D.upper()].values,
+                                                       marker=dict(color=px.colors.qualitative.Plotly[idx]),
+                                                       name=fee_name[fee_label], legendgroup=fee_name[fee_label],
+                                                       showlegend=False),
+                                      row=row_idx + 1, col=col + 1)
+                        s2 = by_fee_non_agg[fee_label]
+                        fig2.add_trace(trace=go.Scatter(x=s2.index.astype(str), y=s2[D.upper()].values,
+                                                        marker=dict(color=px.colors.qualitative.Plotly[idx]),
+                                                        name=fee_name[fee_label], legendgroup=fee_name[fee_label],
+                                                        showlegend=False),
+                                       row=row_idx + 1, col=col + 1)
+                    fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
+                    fig2.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
+            fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
+                                         x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
+                                         font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
+                                         yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
+                              height=5 * len(pairs) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
+                              legend=dict(orientation='h', yanchor='top', y=-0.04, xanchor='center', x=0.5,
+                                          font=dict(size=7.5 * LABEL_AXIS_FONT_SIZE), itemwidth=150))
+            fig.update_traces(line=dict(width=30))
+            for idx, fee_label in enumerate(fee_labels):
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines',
+                                         line=dict(color=px.colors.qualitative.Plotly[idx]), #, width=20
+                                         name=f'\u00a0\u00a0\u00a0{fee_name[fee_label]}\u00a0\u00a0\u00a0',
+                                         legendgroup=fee_name[fee_label],
+                                         showlegend=True), row=1, col=1)
+            fig.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
+            fig.update_xaxes(tickangle=45, showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
+                             title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
+            fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=False, showgrid=False,
+                             tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
+            fig.write_image(f'./figures/pnl_{dict([("returns", "first"), ("RV", "second")])[target]}_moment.pdf',
+                            format='pdf')
             fig2.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}'
                                                f' (non-aggregated Crypto SVIX)</b>',
+                                          x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                           font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                           yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE),
-                               width=WIDTH * 15, height=5 * len(d_order.categories) * HEIGHT,
-                               paper_bgcolor='white', plot_bgcolor='white')
+                               width=WIDTH * 15, height=5 * len(pairs) * HEIGHT,
+                               paper_bgcolor='white', plot_bgcolor='white',
+                               legend=dict(orientation='h', yanchor='top', y=-0.1, xanchor='center', x=0.5,
+                                           font=dict(size=10 * LABEL_AXIS_FONT_SIZE), itemwidth=150))
             fig2.update_traces(line=dict(width=30))
-            fig2.update_layout(title=dict(x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250)))
+            for idx, fee_label in enumerate(fee_labels):
+                fig2.add_trace(go.Scatter(x=[None], y=[None], mode='lines',
+                                          line=dict(color=px.colors.qualitative.Plotly[idx], width=20),
+                                          name=f'\u00a0\u00a0\u00a0{fee_name[fee_label]}\u00a0\u00a0\u00a0',
+                                          legendgroup=fee_name[fee_label],
+                                          showlegend=True), row=1, col=1)
             fig2.update_annotations(font=dict(size=10 * LABEL_AXIS_FONT_SIZE))
             fig2.update_xaxes(tickangle=45, showline=True, linewidth=2, linecolor='black', mirror=False,
                               showgrid=False, title='', tickfont=dict(size=7.5 * LABEL_AXIS_FONT_SIZE))
