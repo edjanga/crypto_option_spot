@@ -1,3 +1,5 @@
+import pdb
+
 import pandas as pd
 import numpy as np
 import glob
@@ -993,16 +995,16 @@ if __name__ == '__main__':
     sharpe_pnl_per_vol_regime.index = \
         sharpe_pnl_per_vol_regime.index.set_levels([r'\textit{1d}', r'\textit{1w}', r'\textit{1m}'], level='D')
     sharpe_pnl_per_vol_regime_aggregated = pd.MultiIndex.from_tuples(
-        [(agg, target, rf'\textit{{{vol_regime}}}', rf'\textit{{{d}}}') for agg in ['', str(float(1))]
+        [(agg, target, rf'\textit{{{vol_regime}}}', rf'\textit{{{d}}}') for agg in ['', 1]
          for target in ['returns', 'RV']
          for vol_regime in volatility_order.categories.tolist()
          for d in d_order.categories.tolist()
-         if not ((target == 'returns' and agg in [str(float(1))]) or (target == 'RV' and agg == ''))],
+         if not ((target == 'returns' and agg in [1]) or (target == 'RV' and agg == ''))],
         names=['aggregated', 'target', 'vol_regime', 'D']
     )
     sharpe_pnl_per_vol_regime_non_aggregated = pd.MultiIndex.from_tuples(
         [(agg, target, rf'\textit{{{vol_regime}}}', rf'\textit{{{d}}}')
-         for agg in [(str(float(0)))]
+         for agg in [0]
          for target in ['RV']
          for vol_regime in volatility_order.categories.tolist()
          for d in d_order.categories.tolist()], names=['aggregated', 'target', 'vol_regime', 'D']
