@@ -966,7 +966,7 @@ if __name__ == '__main__':
         xs_wins = pd.DataFrame(sharpe_xs.droplevel('market', axis=1).to_numpy(dtype=float)
                                >= sharpe_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
                                index=tmp_sharpe.index, columns=sharpe_xs.columns)
-        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .95 else x)
         tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
@@ -1091,7 +1091,7 @@ if __name__ == '__main__':
             >= sharpe_per_volatility_regime_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
             index=tmp_sharpe.index, columns=sharpe_per_volatility_regime_xs.columns,
         )
-        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .95 else x)
         tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
