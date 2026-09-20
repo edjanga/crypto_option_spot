@@ -833,8 +833,8 @@ if __name__ == '__main__':
             for row_idx, pair in enumerate(pairs):
                 pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
                 pair_slice = pair_slice.groupby(['aggregated', 'transaction_fees', 'spread']).transform('ffill')
-                agg = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True).droplevel(0, 1)
-                non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True).droplevel(0, 1)
+                agg = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True).droplevel(0, 1).dropna()
+                non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True).droplevel(0, 1).dropna()
                 by_fee = {'No fees': agg.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
                           'TF': agg.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
                           'BASC': agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')}
@@ -856,8 +856,6 @@ if __name__ == '__main__':
                                                         name=fee_name[fee_label], legendgroup=fee_name[fee_label],
                                                         showlegend=False),
                                        row=row_idx + 1, col=col + 1)
-                    # fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
-                    # fig2.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
             fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
                                          x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                          font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
@@ -954,7 +952,7 @@ if __name__ == '__main__':
         xs_wins = pd.DataFrame(sharpe_xs.droplevel('market', axis=1).to_numpy(dtype=float)
                                >= sharpe_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
                                index=tmp_sharpe.index, columns=sharpe_xs.columns)
-        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x >= .95 else x)
         tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
@@ -1079,7 +1077,7 @@ if __name__ == '__main__':
             >= sharpe_per_volatility_regime_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
             index=tmp_sharpe.index, columns=sharpe_per_volatility_regime_xs.columns,
         )
-        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x >= .95 else x)
         tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
