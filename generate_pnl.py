@@ -1,5 +1,3 @@
-import pdb
-
 import pandas as pd
 import numpy as np
 import glob
@@ -17,6 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 import polars as pl
+from scipy.stats import norm
 from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, DAYS_CONVERTER, VOL_REGIMES, \
                        TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, WIDTH, HEIGHT, D_HORIZONS
 DERIBIT_FEE_PREMIUM_PCT = 0.125
@@ -235,11 +234,8 @@ def pnl_expressions(return_col: str, weight_col: str, delta_weight_col: str,
     gross = pl.col(return_col) * pl.col(weight_col)
     tf_cost = (pl.col(transaction_fee_col) * pl.col(delta_weight_col)).abs()
     basc_cost = (pl.col(basc_fee_col) * pl.col(delta_weight_col)).abs()
-    return [
-        (gross - tf_cost).fill_null(0).alias(f'returns_tc_{D}'),
-        (gross - basc_cost).fill_null(0).alias(f'returns_basc_{D}'),
-        gross.alias(f'returns_{D}'),
-    ]
+    return [(gross - tf_cost).fill_null(0).alias(f'returns_tc_{D}'),
+            (gross - basc_cost).fill_null(0).alias(f'returns_basc_{D}'), gross.alias(f'returns_{D}')]
 
 
 def return_straddle_table(data: pl.DataFrame, freq: str, underlying_price: pl.DataFrame, **kwargs) -> pl.DataFrame:
@@ -314,6 +310,26 @@ def returns_table(data, fees, underlying_name):
     else:
         data = data.assign(transaction_fees=0, spread=0).set_index(['transaction_fees', 'spread'], append=True)
     return data
+
+
+def probabilistic_sharpe_ratio(pnl, benchmark=1.0, periods_per_year=360, vol_regime= False):
+    if not vol_regime:
+        pnl = pnl.droplevel(0, 1).groupby(['aggregated', 'target', 'transaction_fees', 'spread'])
+    else:
+        pnl = pnl.set_index(
+            ['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'timestamp', 'D', 'underlying_name',
+             'market'])['returns'].unstack(['underlying_name', 'market']).droplevel(-2, 0)
+        pnl = pnl.groupby(['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D'])
+    sr = pnl.mean() / pnl.std(ddof=1)
+    n = pnl.count()
+    n = n.where(n >= 3, np.nan)
+    benchmark_periodic = benchmark / np.sqrt(periods_per_year)
+    skew = pnl.skew()
+    kurt = pnl.agg(lambda x: x.kurtosis())
+    denominator = np.sqrt(1 - skew * sr + ((kurt - 1) / 4) * sr ** 2)
+    denominator = denominator.where((denominator > 0) & np.isfinite(denominator), np.nan)
+    z = (sr - benchmark_periodic).mul(np.sqrt(n - 1)) / denominator
+    return z.apply(norm.cdf)
 
 
 if __name__ == '__main__':
@@ -766,6 +782,7 @@ if __name__ == '__main__':
                                 column_titles=[f'<i>{D}</i>' for D in d_order.categories])
             for idx, pair in enumerate(list(pairs_order.categories)):
                 pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
+                pair_slice = pair_slice.groupby(['aggregated', 'transaction_fees', 'spread']).transform('ffill')
                 tmp_diff_cum_pnl_pair = pair_slice.xs('', axis=0, level='aggregated', drop_level=True)
                 tmp_diff_cum_pnl_pair = tmp_diff_cum_pnl_pair.droplevel(0, 1)
                 tmp_diff_cum_pnl_pair_no_fees = \
@@ -839,8 +856,8 @@ if __name__ == '__main__':
                                                         name=fee_name[fee_label], legendgroup=fee_name[fee_label],
                                                         showlegend=False),
                                        row=row_idx + 1, col=col + 1)
-                    fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
-                    fig2.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
+                    # fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
+                    # fig2.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
             fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
                                          x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                          font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
@@ -887,15 +904,25 @@ if __name__ == '__main__':
                                                   [x.isoformat() if isinstance(x, pd.Timestamp) else x for x in
                                                    t.x]) if t.x is not None else None)
             fig2.write_image(f'./figures/pnl_second_moment_non_aggregated.pdf', format='pdf')
+    proba_sharpe_rv = probabilistic_sharpe_ratio(pnl=pnl['RV'])
+    proba_sharpe_returns = probabilistic_sharpe_ratio(pnl=pnl['returns'])
+    proba_sharpe = pd.concat([proba_sharpe_returns, proba_sharpe_rv])
+    proba_sharpe = proba_sharpe.rename(columns=str.lower, level='D')
     sharpe_mean = pd.concat([pnl['RV'].droplevel(0, 1).groupby(grouper_level).mean(),
                              pnl['returns'].droplevel(0, 1).groupby(grouper_level).mean()])
     sharpe_std = pd.concat([pnl['RV'].droplevel(0, 1).groupby(grouper_level).std(),
                             pnl['returns'].droplevel(0, 1).groupby(grouper_level).std()])
     no_fees = pd.IndexSlice
     sharpe = sharpe_mean.div(sharpe_std).mul(360 ** .5).loc[no_fees[:, :, 0, 0], :].round(2)
-    sharpe.columns = sharpe.columns.set_levels(['$X^S$', '$X^{(S,O)}$'], level='market')
-    sharpe.columns = sharpe.columns.set_levels([r'\textit{1d}', r'\textit{1m}', r'\textit{1w}'], level='D')
+    proba_sharpe = proba_sharpe.loc[no_fees[:, :, 0, 0], :].round(2)
+    d_label_map = {d: rf'\textit{{{d}}}' for d in d_order.categories}
+    market_label_map = {0: '$X^S$', 1: '$X^{(S,O)}$'}
+    sharpe = sharpe.rename(columns=market_label_map, level='market')
+    sharpe = sharpe.rename(columns=d_label_map, level='D')
+    proba_sharpe = proba_sharpe.rename(columns=market_label_map, level='market')
+    proba_sharpe = proba_sharpe.rename(columns=d_label_map, level='D')
     sharpe.index = sharpe.index.set_levels(['0.0', '1.0', ''], level='aggregated')
+    proba_sharpe.index = proba_sharpe.index.set_levels(['', '0.0', '1.0'], level='aggregated')
     sharpe_columns_order = \
         pd.MultiIndex.from_product([pairs_order.categories.tolist(), market_order.categories.tolist()],
                                    names=['underlying_name', 'market'])
@@ -910,16 +937,25 @@ if __name__ == '__main__':
                                    for d in d_order.categories.tolist()], names=['aggregated', 'target', 'D'])
     for aggregated in [False, True]:
         tmp_sharpe = sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
+        tmp_proba_sharpe = proba_sharpe.droplevel(axis=0, level=[-2, -1]).stack('D')
+        tmp_proba_sharpe.index = tmp_proba_sharpe.index.set_levels(tmp_proba_sharpe.index.levels[0].astype(str),
+                                                                   level='aggregated')
         if not aggregated:
             tmp_sharpe = tmp_sharpe.reindex(sharpe_index_order_non_aggregated).reindex(sharpe_columns_order, axis=1)
+            tmp_proba_sharpe = \
+                tmp_proba_sharpe.reindex(sharpe_index_order_non_aggregated).reindex(sharpe_columns_order, axis=1)
         else:
             tmp_sharpe = tmp_sharpe.reindex(sharpe_index_order_aggregated).reindex(sharpe_columns_order, axis=1)
+            tmp_proba_sharpe = \
+                tmp_proba_sharpe.reindex(sharpe_index_order_aggregated).reindex(sharpe_columns_order, axis=1)
         tmp_sharpe = tmp_sharpe.astype(object)
         sharpe_xs = tmp_sharpe.xs('$X^S$', level=1, axis=1, drop_level=False)
         sharpe_x_so = tmp_sharpe.xs('$X^{(S,O)}$', level=1, axis=1, drop_level=False)
         xs_wins = pd.DataFrame(sharpe_xs.droplevel('market', axis=1).to_numpy(dtype=float)
                                >= sharpe_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
                                index=tmp_sharpe.index, columns=sharpe_xs.columns)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
                 return value
@@ -931,7 +967,12 @@ if __name__ == '__main__':
         with open(f'{args.target_path}/crypto_option_spot/'
                   f'sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}.txt',
                   'w') as sharpe_file:
-            sharpe_file.writelines(tmp_sharpe.to_latex(escape=False, float_format='%.2f'))
+            sharpe_file.writelines(tmp_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
+        with open(f'{args.target_path}/crypto_option_spot/'
+                  f'proba_sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}.txt',
+                  'w') as proba_sharpe_file:
+            proba_sharpe_file.writelines(
+                tmp_proba_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
     start = datetime.fromisoformat(str(args.start_date))
     end = datetime.fromisoformat(str(args.end_date))
     rv = pl.scan_parquet(f'{args.target_path}/*/*/spot/*').select(['symbol', 'timestamp', 'mid_price[0]'])
@@ -964,10 +1005,18 @@ if __name__ == '__main__':
         pnl['returns'].droplevel(0, 1).stack('D', future_stack=True).stack('market', future_stack=True).stack()
     pnl_returns = pd.DataFrame(pnl_returns).rename(columns={0: 'returns'}).reset_index()
     pnl_returns = pnl_returns.merge(rv.collect().to_pandas(), on=['D', 'timestamp'], how='inner')
+    pnl_returns_proba_sharpe = probabilistic_sharpe_ratio(pnl_returns, vol_regime=True)
     pnl_rv = \
         pnl['RV'].droplevel(0, 1).stack('D', future_stack=True).stack('market', future_stack=True).stack()
     pnl_rv = pd.DataFrame(pnl_rv).rename(columns={0: 'returns'}).reset_index()
     pnl_rv = pnl_rv.merge(rv.collect().to_pandas(), on=['D', 'timestamp'], how='inner')
+    pnl_rv_proba_sharpe = probabilistic_sharpe_ratio(pnl_rv, vol_regime=True)
+    pnl_proba_sharpe_vol_regime = pd.concat([pnl_returns_proba_sharpe, pnl_rv_proba_sharpe])
+    pnl_proba_sharpe_vol_regime = \
+        pnl_proba_sharpe_vol_regime.rename(index=lambda x: rf'\textit{{{x.lower()}}}', level='D')
+    pnl_proba_sharpe_vol_regime = pnl_proba_sharpe_vol_regime.rename(columns=market_label_map, level='market')
+    # pnl_proba_sharpe_vol_regime.index = \
+    #     pnl_proba_sharpe_vol_regime.index.set_levels(['', '0.0', '1.0'], level='aggregated')
     pnl_returns = pnl_returns.groupby(
         ['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name', 'market'],
         dropna=False)[['returns']]
@@ -987,13 +1036,14 @@ if __name__ == '__main__':
                                                    level='aggregated')
     sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.query('transaction_fees == 0 and spread == 0')
     sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.droplevel(['transaction_fees', 'spread'])
+    pnl_proba_sharpe_vol_regime = pnl_proba_sharpe_vol_regime.query('transaction_fees == 0 and spread == 0')
+    pnl_proba_sharpe_vol_regime = pnl_proba_sharpe_vol_regime.droplevel(['transaction_fees', 'spread'])
     sharpe_pnl_per_vol_regime = \
         pd.pivot(sharpe_pnl_per_vol_regime.reset_index(), index=['aggregated', 'target', 'vol_regime', 'D'],
                  columns=['underlying_name', 'market'], values='sharpe').round(2)
-    sharpe_pnl_per_vol_regime.columns = \
-        sharpe_pnl_per_vol_regime.columns.set_levels(['$X^S$', '$X^{(S,O)}$'], level='market')
-    sharpe_pnl_per_vol_regime.index = \
-        sharpe_pnl_per_vol_regime.index.set_levels([r'\textit{1d}', r'\textit{1w}', r'\textit{1m}'], level='D')
+    sharpe_pnl_per_vol_regime = sharpe_pnl_per_vol_regime.rename(columns=market_label_map, level='market')
+    sharpe_pnl_per_vol_regime = \
+        sharpe_pnl_per_vol_regime.rename(index=lambda x: rf'\textit{{{x.lower()}}}', level='D')
     sharpe_pnl_per_vol_regime_aggregated = pd.MultiIndex.from_tuples(
         [(agg, target, rf'\textit{{{vol_regime}}}', rf'\textit{{{d}}}') for agg in ['', 1]
          for target in ['returns', 'RV']
@@ -1013,10 +1063,14 @@ if __name__ == '__main__':
         if not aggregated:
             tmp_sharpe = sharpe_pnl_per_vol_regime.reindex(sharpe_pnl_per_vol_regime_non_aggregated)
             tmp_sharpe = tmp_sharpe.reindex(sharpe_columns_order, axis=1)
+            tmp_proba_sharpe = pnl_proba_sharpe_vol_regime.reindex(sharpe_pnl_per_vol_regime_non_aggregated).round(2)
+            tmp_proba_sharpe = tmp_proba_sharpe.reindex(sharpe_columns_order, axis=1)
         else:
             tmp_sharpe = sharpe_pnl_per_vol_regime.reindex(sharpe_pnl_per_vol_regime_aggregated)
             tmp_sharpe = tmp_sharpe.reindex(sharpe_columns_order, axis=1)
-        tmp_sharpe = tmp_sharpe.droplevel(axis=0, level=0).round(2)
+            tmp_proba_sharpe = pnl_proba_sharpe_vol_regime.reindex(sharpe_pnl_per_vol_regime_aggregated).round(2)
+            tmp_proba_sharpe = tmp_proba_sharpe.reindex(sharpe_columns_order, axis=1)
+        tmp_sharpe = tmp_sharpe.round(2)
         tmp_sharpe = tmp_sharpe.astype(object)
         sharpe_per_volatility_regime_xs = tmp_sharpe.xs('$X^S$', level=1, axis=1, drop_level=False)
         sharpe_per_volatility_regime_x_so = tmp_sharpe.xs('$X^{(S,O)}$', level=1, axis=1, drop_level=False)
@@ -1025,6 +1079,8 @@ if __name__ == '__main__':
             >= sharpe_per_volatility_regime_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
             index=tmp_sharpe.index, columns=sharpe_per_volatility_regime_xs.columns,
         )
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
                 return value
@@ -1036,4 +1092,11 @@ if __name__ == '__main__':
         with open(f'{args.target_path}/crypto_option_spot/'
                   f'sharpe_per_volatility{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}.txt',
                   'w') as sharpe_file:
-            sharpe_file.writelines(tmp_sharpe.to_latex(escape=False, float_format='%.2f'))
+            sharpe_file.writelines(
+                tmp_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
+        with open(f'{args.target_path}/crypto_option_spot/'
+                  f'proba_sharpe_per_volatility'
+                  f'{dict([(False, "_non_aggregated"),(True, "_aggregated")])[aggregated]}.txt',
+                  'w') as proba_sharpe_file:
+            proba_sharpe_file.writelines(
+                tmp_proba_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
