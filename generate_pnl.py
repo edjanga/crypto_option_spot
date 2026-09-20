@@ -332,6 +332,15 @@ def probabilistic_sharpe_ratio(pnl, benchmark=1.0, periods_per_year=360, vol_reg
     return z.apply(norm.cdf)
 
 
+def _trim_leading_nan(series: pd.Series) -> pd.Series:
+    """Drop rows before the series' first non-NaN value, so a trace's x-axis
+    starts at that series' own first valid date instead of the shared index start."""
+    first_valid = series.first_valid_index()
+    if first_valid is None:
+        return series.iloc[0:0]
+    return series.loc[first_valid:]
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all P&L tables.')
     parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-01')
@@ -792,18 +801,21 @@ if __name__ == '__main__':
                 tmp_diff_cum_pnl_pair_basc = \
                     tmp_diff_cum_pnl_pair.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')
                 for col, D in enumerate(d_order.categories):
-                    fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_no_fees.index.astype(str),
-                                                   y=tmp_diff_cum_pnl_pair_no_fees[D.upper()].values,
+                    no_fees_s = _trim_leading_nan(tmp_diff_cum_pnl_pair_no_fees[D.upper()])
+                    fig.add_trace(trace=go.Scatter(x=no_fees_s.index.astype(str),
+                                                   y=no_fees_s.values,
                                                    marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                                   col=col + 1, row=1)
-                    fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_tf.index.astype(str),
-                                                   y=tmp_diff_cum_pnl_pair_tf[D.upper()].values,
+                    tf_s = _trim_leading_nan(tmp_diff_cum_pnl_pair_tf[D.upper()])
+                    fig.add_trace(trace=go.Scatter(x=tf_s.index.astype(str),
+                                                   y=tf_s.values,
                                                    marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                                   col=col + 1, row=2)
-                    fig.add_trace(trace=go.Scatter(x=tmp_diff_cum_pnl_pair_basc.index.astype(str),
-                                                   y=tmp_diff_cum_pnl_pair_basc[D.upper()].values,
+                    basc_s = _trim_leading_nan(tmp_diff_cum_pnl_pair_basc[D.upper()])
+                    fig.add_trace(trace=go.Scatter(x=basc_s.index.astype(str),
+                                                   y=basc_s.values,
                                                    marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                    name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                                   col=col + 1, row=3)
@@ -833,8 +845,8 @@ if __name__ == '__main__':
             for row_idx, pair in enumerate(pairs):
                 pair_slice = tmp_diff_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
                 pair_slice = pair_slice.groupby(['aggregated', 'transaction_fees', 'spread']).transform('ffill')
-                agg = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True).droplevel(0, 1).dropna()
-                non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True).droplevel(0, 1).dropna()
+                agg = pair_slice.xs(1, axis=0, level='aggregated', drop_level=True).droplevel(0, 1)
+                non_agg = pair_slice.xs(0, axis=0, level='aggregated', drop_level=True).droplevel(0, 1)
                 by_fee = {'No fees': agg.xs(0, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
                           'TF': agg.xs(1, axis=0, level='transaction_fees').xs(0, axis=0, level='spread'),
                           'BASC': agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')}
@@ -844,18 +856,20 @@ if __name__ == '__main__':
                     'BASC': non_agg.xs(0, axis=0, level='transaction_fees').xs(1, axis=0, level='spread')}
                 for col, D in enumerate(d_order.categories):
                     for idx, fee_label in enumerate(fee_labels):
-                        s = by_fee[fee_label]
-                        fig.add_trace(trace=go.Scatter(x=s.index.astype(str), y=s[D.upper()].values,
+                        s = _trim_leading_nan(by_fee[fee_label][D.upper()])
+                        fig.add_trace(trace=go.Scatter(x=s.index.astype(str), y=s.values,
                                                        marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                        name=fee_name[fee_label], legendgroup=fee_name[fee_label],
                                                        showlegend=False),
                                       row=row_idx + 1, col=col + 1)
-                        s2 = by_fee_non_agg[fee_label]
-                        fig2.add_trace(trace=go.Scatter(x=s2.index.astype(str), y=s2[D.upper()].values,
+                        s2 = _trim_leading_nan(by_fee_non_agg[fee_label][D.upper()])
+                        fig2.add_trace(trace=go.Scatter(x=s2.index.astype(str), y=s2.values,
                                                         marker=dict(color=px.colors.qualitative.Plotly[idx]),
                                                         name=fee_name[fee_label], legendgroup=fee_name[fee_label],
                                                         showlegend=False),
                                        row=row_idx + 1, col=col + 1)
+                    # fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
+                    # fig2.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
             fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
                                          x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                          font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
@@ -952,7 +966,7 @@ if __name__ == '__main__':
         xs_wins = pd.DataFrame(sharpe_xs.droplevel('market', axis=1).to_numpy(dtype=float)
                                >= sharpe_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
                                index=tmp_sharpe.index, columns=sharpe_xs.columns)
-        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x >= .95 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
         tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
@@ -1077,7 +1091,7 @@ if __name__ == '__main__':
             >= sharpe_per_volatility_regime_x_so.droplevel('market', axis=1).to_numpy(dtype=float),
             index=tmp_sharpe.index, columns=sharpe_per_volatility_regime_xs.columns,
         )
-        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x >= .95 else x)
+        tmp_proba_sharpe = tmp_proba_sharpe.map(lambda x: rf'$\mathbf{{{x:.2f}}}$' if x is x > .5 else x)
         tmp_proba_sharpe = tmp_proba_sharpe.astype(object)
         def _bold_if(value, is_winner):
             if pd.isna(value):
