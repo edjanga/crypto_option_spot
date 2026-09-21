@@ -878,7 +878,7 @@ if __name__ == '__main__':
             fig.update_traces(line=dict(width=30))
             for idx, fee_label in enumerate(fee_labels):
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines',
-                                         line=dict(color=px.colors.qualitative.Plotly[idx]), #, width=20
+                                         line=dict(color=px.colors.qualitative.Plotly[idx]),
                                          name=f'\u00a0\u00a0\u00a0{fee_name[fee_label]}\u00a0\u00a0\u00a0',
                                          legendgroup=fee_name[fee_label],
                                          showlegend=True), row=1, col=1)
