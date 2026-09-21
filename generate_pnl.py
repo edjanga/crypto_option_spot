@@ -868,14 +868,12 @@ if __name__ == '__main__':
                                                         name=fee_name[fee_label], legendgroup=fee_name[fee_label],
                                                         showlegend=False),
                                        row=row_idx + 1, col=col + 1)
-                    # fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
-                    # fig2.add_hline(y=0, line_dash='dot', line_color='gray', line_width=1, row=row_idx + 1, col=col + 1)
             fig.update_layout(title=dict(text=f'<b>&#916; P&L Curves - {title_dd[target == "RV"]}</b>',
                                          x=0.5, xanchor='center', y=0.98, yanchor='top', pad=dict(b=250),
                                          font=dict(size=10 * TITLE_FONT_SIZE), automargin=True,
                                          yref='container'), font=dict(size=5 * LABEL_AXIS_FONT_SIZE), width=WIDTH * 15,
                               height=5 * len(pairs) * HEIGHT, paper_bgcolor='white', plot_bgcolor='white',
-                              legend=dict(orientation='h', yanchor='top', y=-0.04, xanchor='center', x=0.5,
+                              legend=dict(orientation='h', yanchor='top', y=-0.1, xanchor='center', x=0.5,
                                           font=dict(size=7.5 * LABEL_AXIS_FONT_SIZE), itemwidth=150))
             fig.update_traces(line=dict(width=30))
             for idx, fee_label in enumerate(fee_labels):
@@ -1027,8 +1025,6 @@ if __name__ == '__main__':
     pnl_proba_sharpe_vol_regime = \
         pnl_proba_sharpe_vol_regime.rename(index=lambda x: rf'\textit{{{x.lower()}}}', level='D')
     pnl_proba_sharpe_vol_regime = pnl_proba_sharpe_vol_regime.rename(columns=market_label_map, level='market')
-    # pnl_proba_sharpe_vol_regime.index = \
-    #     pnl_proba_sharpe_vol_regime.index.set_levels(['', '0.0', '1.0'], level='aggregated')
     pnl_returns = pnl_returns.groupby(
         ['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name', 'market'],
         dropna=False)[['returns']]
