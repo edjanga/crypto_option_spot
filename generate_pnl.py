@@ -300,6 +300,17 @@ def horizon_weights(day_signals: pd.DataFrame, sign_history: list) -> pd.DataFra
     return weights
 
 
+def naive_ms(timestamps):
+    """Timestamps as timezone-naive UTC with millisecond resolution, whatever they came in as (Series or Index)."""
+    timestamps = pd.to_datetime(timestamps)
+    if isinstance(timestamps, pd.Series):
+        if timestamps.dt.tz is not None:
+            timestamps = timestamps.dt.tz_convert('UTC').dt.tz_localize(None)
+    elif timestamps.tz is not None:
+        timestamps = timestamps.tz_convert('UTC').tz_localize(None)
+    return timestamps.astype('datetime64[ms]')
+
+
 def paired_straddles(straddle_data: pl.LazyFrame) -> pd.DataFrame:
     """Today's straddles (both legs quoted at the bar), one row per straddle and bar, before any moneyness filter."""
     horizons = list(EXPIRY_WINDOWS)
@@ -322,12 +333,9 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
     horizons = signals.columns.get_level_values('D').unique().tolist()
     markets = signals.columns.get_level_values('market').unique().tolist()
     aggregations = signals.index.get_level_values('aggregated').unique().tolist()
-    bars = signals.index.get_level_values('timestamp').unique().sort_values()
-    if getattr(bars, 'tz', None) is not None:
-        bars = bars.tz_localize(None)
-    bars = pd.DatetimeIndex(bars).astype('datetime64[ms]')
+    bars = pd.DatetimeIndex(naive_ms(signals.index.get_level_values('timestamp').unique().sort_values()))
     signal_bar, entry = HOLD_SIGNAL_BAR, HOLD_SIGNAL_BAR + 1
-    straddles = straddles.assign(timestamp=pd.to_datetime(straddles['timestamp']).astype('datetime64[ms]'))
+    straddles = straddles.assign(timestamp=naive_ms(straddles['timestamp']))
     def wide(column):
         return straddles.pivot(index='timestamp', columns='symbol', values=column).reindex(bars)
     mid = wide('mid_price') if len(straddles) else pd.DataFrame(index=bars)
