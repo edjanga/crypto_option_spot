@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import glob
 import gc
+import os
 import optuna
 from dateutil.relativedelta import relativedelta
 from pandas.api.types import CategoricalDtype
@@ -300,15 +301,16 @@ def horizon_weights(day_signals: pd.DataFrame, sign_history: list) -> pd.DataFra
     return weights
 
 
-def naive_ms(timestamps):
-    """Timestamps as timezone-naive UTC with millisecond resolution, whatever they came in as (Series or Index)."""
+def naive_utc(timestamps):
+    """Timestamps as timezone-naive UTC with nanosecond resolution (the pandas default), whatever they came in as.
+    Nanoseconds are used on purpose: older pandas versions mishandle other resolutions in resample / Grouper."""
     timestamps = pd.to_datetime(timestamps)
     if isinstance(timestamps, pd.Series):
         if timestamps.dt.tz is not None:
             timestamps = timestamps.dt.tz_convert('UTC').dt.tz_localize(None)
     elif timestamps.tz is not None:
         timestamps = timestamps.tz_convert('UTC').tz_localize(None)
-    return timestamps.astype('datetime64[ms]')
+    return timestamps.astype('datetime64[ns]')
 
 
 def paired_straddles(straddle_data: pl.LazyFrame) -> pd.DataFrame:
@@ -333,9 +335,9 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
     horizons = signals.columns.get_level_values('D').unique().tolist()
     markets = signals.columns.get_level_values('market').unique().tolist()
     aggregations = signals.index.get_level_values('aggregated').unique().tolist()
-    bars = pd.DatetimeIndex(naive_ms(signals.index.get_level_values('timestamp').unique().sort_values()))
+    bars = pd.DatetimeIndex(naive_utc(signals.index.get_level_values('timestamp').unique().sort_values()))
     signal_bar, entry = HOLD_SIGNAL_BAR, HOLD_SIGNAL_BAR + 1
-    straddles = straddles.assign(timestamp=naive_ms(straddles['timestamp']))
+    straddles = straddles.assign(timestamp=naive_utc(straddles['timestamp']))
     def wide(column):
         return straddles.pivot(index='timestamp', columns='symbol', values=column).reindex(bars)
     mid = wide('mid_price') if len(straddles) else pd.DataFrame(index=bars)
@@ -346,13 +348,21 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
                                            for prefix in ['returns', 'returns_tc', 'returns_basc']], markets],
                                          names=[None, 'market'])
     pnl_today = dict([(a, pd.DataFrame(0., index=bars, columns=columns)) for a in aggregations])
+    # the held signal of each aggregation at the entry bar, looked up by time (not by row position)
+    entry_signal = dict()
+    for a in aggregations:
+        day_signal = signals.xs(a, level='aggregated')
+        day_signal = day_signal[~day_signal.index.duplicated(keep='last')]
+        day_signal.index = pd.DatetimeIndex(naive_utc(day_signal.index))
+        day_signal = day_signal.reindex(bars)
+        entry_signal[a] = day_signal.iloc[entry] if len(bars) > entry else day_signal.iloc[-1] * 0
     # ---- today's new tranches
     if len(bars) > entry and len(straddles):
         at_signal_bar = straddles[straddles['timestamp'] == bars[signal_bar]].set_index('symbol')
         in_band = at_signal_bar['moneyness'].between(lower_bound, upper_bound) & (at_signal_bar['mid_price'] > 0)
         for D in horizons:
             symbols = at_signal_bar.index[in_band & at_signal_bar[f'eligible_{D}'].astype(bool)].tolist()
-            signs = dict([((a, m), float(signals.loc[a].iloc[entry][(D, m)])) for a in aggregations for m in markets])
+            signs = dict([((a, m), float(entry_signal[a][(D, m)])) for a in aggregations for m in markets])
             signs = dict([(key, 0. if np.isnan(value) else value) for key, value in signs.items()])
             if len(symbols) == 0 or not any(signs.values()):
                 continue
@@ -556,6 +566,9 @@ if __name__ == '__main__':
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='./data_centre')
     parser.add_argument('--cpu_count', type=str, help='Number of CPUs to use to perform the analyses', default=1)
+    parser.add_argument('--load_pnl', action='store_true',
+                        help='Skip the backtest and rebuild the figures and tables from the daily P&L saved by the '
+                             'previous run (crypto_option_spot/daily_pnl.pkl).')
     args = parser.parse_args()
     print(args)
     ####################################################################################################################
@@ -617,6 +630,11 @@ if __name__ == '__main__':
     mean_bar = mean_bar.reindex(data_per_target['RV'].index).ffill()
     mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(date_range), :]
     target_underlying_names = list(itertools.product(['RV', 'returns'], list(pairs_order.categories)))
+    daily_pnl_path = f'{args.target_path}/crypto_option_spot/daily_pnl.pkl'
+    if args.load_pnl:
+        if not os.path.exists(daily_pnl_path):
+            raise FileNotFoundError(f'--load_pnl was given but {daily_pnl_path} does not exist; run without it first.')
+        target_underlying_names = list()                  # nothing to backtest: the saved daily P&L is used below
     file_cutoff = pd.Timestamp(args.start_date)
     pnl = \
         dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
@@ -987,18 +1005,34 @@ if __name__ == '__main__':
     daily_grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'),
                            pd.Grouper(level='transaction_fees'), pd.Grouper(level='spread'),
                            pd.Grouper(level='timestamp', freq='D')]
-    for underlying_name, target in list(itertools.product(list(pairs_order.categories), ['RV', 'returns'])):
-        try:
+    if args.load_pnl:
+        pnl = pd.read_pickle(daily_pnl_path)
+    else:
+        for underlying_name, target in list(itertools.product(list(pairs_order.categories), ['RV', 'returns'])):
+            if len(pnl[target][underlying_name]) == 0:
+                print(f'WARNING: no P&L was produced for {target} {underlying_name} -- it is left out.', flush=True)
+                del pnl[target][underlying_name]
+                continue
             index_names = pnl[target][underlying_name][0].index.names
-            combined = \
-                pd.concat(
-                    [df.reset_index() for df in pnl[target][underlying_name]], ignore_index=True).set_index(index_names)
+            combined = pd.concat([df.reset_index() for df in pnl[target][underlying_name]], ignore_index=True)
+            # one timestamp resolution for every piece before grouping by day
+            combined['timestamp'] = naive_utc(combined['timestamp'])
+            first_day, last_day = pd.Timestamp(args.start_date), pd.Timestamp(args.end_date) + pd.Timedelta(days=1)
+            outside = ~combined['timestamp'].between(first_day, last_day)
+            if outside.any():
+                print(f'WARNING: {int(outside.sum())} P&L rows of {target} {underlying_name} have a timestamp outside '
+                      f'[{args.start_date}, {args.end_date}] (e.g. {combined.loc[outside, "timestamp"].iloc[0]}) -- '
+                      f'they are dropped.', flush=True)
+                combined = combined.loc[~outside]
+            combined = combined.set_index(index_names)
             pnl[target][underlying_name] = combined.groupby(daily_grouper_level).sum()
             gc.collect()
-        except IndexError:
-            continue
-    for target in ['RV', 'returns']:
-        pnl[target] = pd.concat(pnl[target], axis=1)
+        for target in ['RV', 'returns']:
+            pnl[target] = pd.concat(pnl[target], axis=1)
+            pnl[target].index = pnl[target].index.remove_unused_levels()
+        # checkpoint: the figures and tables below can be rebuilt with --load_pnl without repeating the backtest
+        pd.to_pickle(pnl, daily_pnl_path)
+        print(f'Daily P&L saved to {daily_pnl_path}', flush=True)
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
                      pd.Grouper(level='spread')]
     ####################################################################################################################
