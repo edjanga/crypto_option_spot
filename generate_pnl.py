@@ -41,6 +41,15 @@ EXECUTION_LAG_BARS = 1
 # RV forecasts are annualised variances. True: the variance risk premium is computed volatility minus volatility,
 # i.e. svix - sqrt(annualised RV forecast). False: the old behaviour (svix minus the variance forecast).
 VRP_IN_VOLATILITY = True
+# In forecasts.parquet the RV target of the 30min and 1h models is about 1/2 and 1/4 of the 15min one for the same
+# timestamp and horizon (it scales with the bar length), and only the 15min one matches the variance realised over
+# the horizon. The RV forecasts and realised values of the selected frequency are therefore rescaled to this base
+# frequency before they are annualised and compared with the Crypto SVIX. None: no rescaling (the old behaviour).
+RV_BASE_FREQ = '15min'
+# generate_results.py builds the 30min and 1h RV targets over a window of D / freq rows of the 15min grid, so those
+# models forecast the variance of the next D/2 and D/4, not of the next D. Only the 15min models forecast the horizon
+# D. The RV model is therefore chosen among the models of this frequency. None: best MASE over all frequencies.
+RV_MODEL_FREQ = '15min'
 # True: every day a new position is opened per horizon D and held for HOLDING_DAYS[D] days (entry and exit at the same
 # bar of the day). The portfolio of a horizon is the equal-weighted average of its open positions (overlapping
 # tranches). False: positions are closed within the day (HOLD_FULL_DAY) or can change every bar.
@@ -615,6 +624,8 @@ if __name__ == '__main__':
     market_order = CategoricalDtype(categories=['$X^S$', '$X^{(S,O)}$'], ordered=True)
     date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='D', inclusive='left', tz='UTC')
     mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
+    if RV_MODEL_FREQ is not None:
+        mase = mase[(mase['target'] != 'RV') | (mase['freq'] == RV_MODEL_FREQ)]
     mase = mase.set_index('D')
     model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
                                      pd.Grouper(key='regression'),
@@ -644,6 +655,12 @@ if __name__ == '__main__':
         data_per_target[target] = tmp
     d_values = data_per_target['RV'].columns.get_level_values('D').str.lower()
     annualisation = pd.Series(360 / d_values.map(D_HORIZONS), index=data_per_target['RV'].columns)
+    if RV_BASE_FREQ is not None:
+        rv_freq_scale = pd.to_timedelta(best_model_tags['RV'][-1]) / pd.to_timedelta(RV_BASE_FREQ)
+        if rv_freq_scale != 1:
+            print(f"RV forecasts of frequency {best_model_tags['RV'][-1]} are rescaled by {rv_freq_scale:g} "
+                  f"to the {RV_BASE_FREQ} variance units.", flush=True)
+        annualisation = annualisation * rv_freq_scale
     data_per_target['RV'] = data_per_target['RV'].mul(annualisation, axis=1)
     if LAG_REALISED_BY_HORIZON:
         rv_data = data_per_target['RV']
