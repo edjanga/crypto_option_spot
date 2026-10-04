@@ -34,6 +34,13 @@ HOLD_FULL_DAY = True
 # Bar of the day (0 = first) whose signal sets the held position. Bar 0 cannot be used for the RV strategy: its filter
 # needs the previous bar's realised value, which does not exist for the day's first bar.
 HOLD_SIGNAL_BAR = 1
+# Execution latency, in bars of the trading frequency: the order decided on a bar is filled at the price observed
+# EXECUTION_LAG_BARS bars later (0 = filled at the price of the bar the signal is computed on).
+EXECUTION_LAG_BARS = 1
+# svix.parquet stores the Crypto SVIX as an annualised volatility (generate_svix.py takes the square root), while the
+# RV forecasts are annualised variances. True: the variance risk premium is computed volatility minus volatility,
+# i.e. svix - sqrt(annualised RV forecast). False: the old behaviour (svix minus the variance forecast).
+VRP_IN_VOLATILITY = True
 # True: every day a new position is opened per horizon D and held for HOLDING_DAYS[D] days (entry and exit at the same
 # bar of the day). The portfolio of a horizon is the equal-weighted average of its open positions (overlapping
 # tranches). False: positions are closed within the day (HOLD_FULL_DAY) or can change every bar.
@@ -41,6 +48,14 @@ HOLD_OVER_HORIZON = True
 HOLDING_DAYS = {'1D': 1, '1W': 7, '1M': 30}
 # An option is only bought into a tranche if it still has at least this many days to expiry when the tranche is closed.
 MIN_DAYS_TO_EXPIRY_AT_EXIT = 1
+# True: a held straddle's P&L is its price change divided by its entry price (a position that is bought or sold once
+# and left alone). False: sum of bar-by-bar log returns, which overstates the gains and understates the losses of a
+# short position, and does the opposite for a long one, once prices move a lot over the holding period.
+HOLD_SIMPLE_RETURNS = True
+# The realised value `y` stored at time t is measured over [t, t + D]: it is only known at t + D.
+# When True, the realised series used by the RV filter and by mean_bar is delayed by D so that only
+# fully observed realised variance enters the trading decision (removes the look-ahead).
+LAG_REALISED_BY_HORIZON = True
 
 
 def _reindex_cols(df, cols):
@@ -88,7 +103,7 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
             svix_dedup = svix[~svix.index.duplicated(keep='last')]
         forecast_broadcast = forecast_flat.reindex(svix_dedup.index.get_level_values('timestamp'))
         forecast_broadcast.index = svix_dedup.index
-        vrp = svix_dedup.sub(forecast_broadcast)
+        vrp = svix_dedup.sub(vrp_forecast(forecast_broadcast))
         markets = vrp.columns.get_level_values('market').unique().tolist()
         signals = (-1*np.sign(vrp)).groupby('aggregated', group_keys=False).apply(
             lambda x, y: lagged_signal(x.mul(y)), y=filter_signal.abs().gt(param['threshold_filter']).astype(int))
@@ -258,14 +273,25 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
     return trial.user_attrs['sharpe']
 
 
+def vrp_forecast(forecast: pd.DataFrame) -> pd.DataFrame:
+    """The annualised RV forecast in the units of the Crypto SVIX (volatility when VRP_IN_VOLATILITY)."""
+    return np.sqrt(forecast.clip(lower=0)) if VRP_IN_VOLATILITY else forecast
+
+
 def lagged_signal(x: pd.DataFrame) -> pd.DataFrame:
     """Signal usable at each bar (one-bar lag). With HOLD_FULL_DAY or HOLD_OVER_HORIZON the position is set from the
     signal of bar HOLD_SIGNAL_BAR and carried unchanged to the day's last bar."""
     x = x.shift()
     entry = HOLD_SIGNAL_BAR + 1
-    if (HOLD_FULL_DAY or HOLD_OVER_HORIZON) and len(x) > entry:
-        x.iloc[entry:] = np.tile(x.iloc[[entry]].to_numpy(), (len(x) - entry, 1))
-        x.iloc[:entry] = 0
+    start = entry + EXECUTION_LAG_BARS                      # first bar on which the position earns a return
+    if HOLD_FULL_DAY or HOLD_OVER_HORIZON:
+        if len(x) > start:
+            x.iloc[start:] = np.tile(x.iloc[[entry]].to_numpy(), (len(x) - start, 1))
+            x.iloc[:start] = 0
+        elif len(x) > entry:
+            x.iloc[:] = 0                                   # the day is too short to be filled
+    elif EXECUTION_LAG_BARS:
+        x = x.shift(EXECUTION_LAG_BARS)
     return x
 
 
@@ -282,7 +308,7 @@ def horizon_weights(day_signals: pd.DataFrame, sign_history: list) -> pd.DataFra
     """First-moment strategy with overlapping tranches. `day_signals` holds today's held signal (columns (D, market)).
     The weight of a horizon is the average of the signs of the last HOLDING_DAYS[D] days; it changes once per day, at
     the entry bar, so the entering and the expiring tranche are netted before costs are charged."""
-    entry = HOLD_SIGNAL_BAR + 1
+    entry = HOLD_SIGNAL_BAR + 1 + EXECUTION_LAG_BARS
     today_sign = day_signals.iloc[entry] if len(day_signals) > entry else day_signals.iloc[-1] * 0
     holding = day_signals.columns.get_level_values('D').map(HOLDING_DAYS).to_numpy()
     def average(history):
@@ -336,7 +362,9 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
     markets = signals.columns.get_level_values('market').unique().tolist()
     aggregations = signals.index.get_level_values('aggregated').unique().tolist()
     bars = pd.DatetimeIndex(naive_utc(signals.index.get_level_values('timestamp').unique().sort_values()))
-    signal_bar, entry = HOLD_SIGNAL_BAR, HOLD_SIGNAL_BAR + 1
+    signal_bar = HOLD_SIGNAL_BAR                            # the bar the decision is taken on
+    fill_bar = signal_bar + EXECUTION_LAG_BARS              # the bar whose price the order is filled at
+    entry = fill_bar + 1                                    # the first bar on which the position earns a return
     straddles = straddles.assign(timestamp=naive_utc(straddles['timestamp']))
     def wide(column):
         return straddles.pivot(index='timestamp', columns='symbol', values=column).reindex(bars)
@@ -362,12 +390,15 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
         in_band = at_signal_bar['moneyness'].between(lower_bound, upper_bound) & (at_signal_bar['mid_price'] > 0)
         for D in horizons:
             symbols = at_signal_bar.index[in_band & at_signal_bar[f'eligible_{D}'].astype(bool)].tolist()
+            fill_mid = mid.reindex(columns=symbols).iloc[fill_bar]
+            symbols = fill_mid.index[fill_mid.notna()].tolist()   # no quote at the fill bar: not traded
             signs = dict([((a, m), float(entry_signal[a][(D, m)])) for a in aggregations for m in markets])
             signs = dict([(key, 0. if np.isnan(value) else value) for key, value in signs.items()])
             if len(symbols) == 0 or not any(signs.values()):
                 continue
             tranches.append(dict(D=D, symbols=symbols, signs=signs, last_mid=None, new=True,
-                                 exit_time=bars[signal_bar] + pd.Timedelta(days=HOLDING_DAYS[D]),
+                                 entry_mid=mid.reindex(columns=symbols).iloc[fill_bar],
+                                 exit_time=bars[fill_bar] + pd.Timedelta(days=HOLDING_DAYS[D]),
                                  entry_fee=dict([(name, fee[name].reindex(columns=symbols).iloc[entry])
                                                  for name in fee])))
     # ---- mark every open tranche on today's bars
@@ -378,7 +409,8 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
         closed = False
         if tranche['new']:
             filled = prices.ffill()
-            returns = np.log(filled).diff()
+            returns = filled.diff().div(tranche['entry_mid'], axis=1) if HOLD_SIMPLE_RETURNS \
+                else np.log(filled).diff()
             returns.iloc[:entry] = np.nan                       # the position starts at the signal bar's price
             for name in fee:
                 cost[name].iloc[entry] = np.nanmean(tranche['entry_fee'][name].to_numpy(dtype=float)) \
@@ -388,7 +420,8 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
             previous = pd.DataFrame([tranche['last_mid'].reindex(symbols)],
                                     index=[bars[0] - pd.Timedelta(milliseconds=1)])
             filled = pd.concat([previous, prices]).ffill()
-            returns = np.log(filled).diff().iloc[1:]
+            returns = filled.diff().iloc[1:].div(tranche['entry_mid'], axis=1) if HOLD_SIMPLE_RETURNS \
+                else np.log(filled).diff().iloc[1:]
             exit_position = int(bars.searchsorted(tranche['exit_time']))
             if exit_position < len(bars):                       # the tranche is closed today
                 exit_position = max(exit_position, 0)
@@ -396,6 +429,8 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
                 for name in fee:
                     fees_now = fee[name].reindex(columns=symbols).ffill().iloc[exit_position]
                     fees_now = fees_now.fillna(tranche['entry_fee'][name])
+                    if HOLD_SIMPLE_RETURNS:                     # the exit cost in units of the entry price
+                        fees_now = fees_now * (filled.iloc[exit_position + 1] / tranche['entry_mid'])
                     cost[name].iloc[exit_position] = np.nanmean(fees_now.to_numpy(dtype=float)) \
                         if fees_now.notna().any() else 0.
                 closed = True
@@ -610,6 +645,20 @@ if __name__ == '__main__':
     d_values = data_per_target['RV'].columns.get_level_values('D').str.lower()
     annualisation = pd.Series(360 / d_values.map(D_HORIZONS), index=data_per_target['RV'].columns)
     data_per_target['RV'] = data_per_target['RV'].mul(annualisation, axis=1)
+    if LAG_REALISED_BY_HORIZON:
+        rv_data = data_per_target['RV']
+        lagged = dict()
+        for column in rv_data.columns:
+            if column[0] != 'values':
+                continue
+            d_position = rv_data.columns.names.index('D')
+            shifted = rv_data[column].dropna()
+            shifted.index = shifted.index + pd.Timedelta(days=DAYS_CONVERTER[column[d_position]])
+            lagged[column] = shifted.reindex(rv_data.index)
+        lagged = pd.DataFrame(lagged, index=rv_data.index)
+        lagged.columns.names = rv_data.columns.names
+        data_per_target['RV'] = \
+            pd.concat([rv_data.drop(columns='values', level=0), lagged], axis=1).sort_index(axis=1)
     svix_parquet = f'{args.target_path}/crypto_option_spot/svix.parquet'
     lazy = pl.scan_parquet(svix_parquet)
     lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
@@ -761,7 +810,7 @@ if __name__ == '__main__':
                     today_forecast_broadcast = \
                         today_forecast_flat.reindex(today_svix_dedup.index.get_level_values('timestamp'))
                     today_forecast_broadcast.index = today_svix_dedup.index
-                    today_vrp_underlying_name = today_svix_dedup.sub(today_forecast_broadcast)
+                    today_vrp_underlying_name = today_svix_dedup.sub(vrp_forecast(today_forecast_broadcast))
                     today_vrp_underlying_name = -1*np.sign(today_vrp_underlying_name)
                     today_vrp_underlying_name = today_vrp_underlying_name.mul(today_filter, level='timestamp')
                     today_vrp_underlying_name = today_vrp_underlying_name.groupby('aggregated', group_keys=False)
