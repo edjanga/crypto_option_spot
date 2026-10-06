@@ -31,17 +31,9 @@ MLP_HIDDEN_LAYERS = (64, 32)
 MLP_LEARNING_RATE = 1e-3
 MLP_VALIDATION_FRACTION = 0.1
 MLP_SEED = 123
-FEAT_IMP_N_ITER = 10
-# Sampling frequency of the rows of spot_features.parquet / option_features.parquet. The target of a horizon D is the
-# sum of the per-bar target over the next D, i.e. over D / BASE_FREQ rows of that grid, whatever the reporting
-# frequency of the model. (Counting the window in bars of the reporting frequency made the 30min and 1h models
-# forecast the next D/2 and D/4.)
+FEAT_IMP_N_ITER = 5
 BASE_FREQ = '15min'
-# True: MASE = |y - y_hat| / in-sample naive error. False: the previous formula |y_hat| / in-sample naive error.
 MASE_FROM_FORECAST_ERROR = True
-# The target of a row at time t is measured over [t, t + D]: it is only known at t + D. True: a model retrained at
-# date d is trained on rows with t < d - D only, so no training target contains data from d onwards (the period it
-# forecasts). The forecast span is extended by D accordingly. False: the previous behaviour (rows up to d).
 EMBARGO_TRAINING = True
 
 
