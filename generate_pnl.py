@@ -17,6 +17,7 @@ from plotly.subplots import make_subplots
 import plotly.express as px
 import polars as pl
 from scipy.stats import norm
+from generate_mase_best_models import select_best_models
 from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, DAYS_CONVERTER, VOL_REGIMES, \
                        TITLE_FONT_SIZE, LABEL_AXIS_FONT_SIZE, WIDTH, HEIGHT, D_HORIZONS
 DERIBIT_FEE_PREMIUM_PCT = 0.125
@@ -41,15 +42,21 @@ EXECUTION_LAG_BARS = 1
 # RV forecasts are annualised variances. True: the variance risk premium is computed volatility minus volatility,
 # i.e. svix - sqrt(annualised RV forecast). False: the old behaviour (svix minus the variance forecast).
 VRP_IN_VOLATILITY = True
-# In forecasts.parquet the RV target of the 30min and 1h models is about 1/2 and 1/4 of the 15min one for the same
-# timestamp and horizon (it scales with the bar length), and only the 15min one matches the variance realised over
-# the horizon. The RV forecasts and realised values of the selected frequency are therefore rescaled to this base
-# frequency before they are annualised and compared with the Crypto SVIX. None: no rescaling (the old behaviour).
-RV_BASE_FREQ = '15min'
-# generate_results.py builds the 30min and 1h RV targets over a window of D / freq rows of the 15min grid, so those
-# models forecast the variance of the next D/2 and D/4, not of the next D. Only the 15min models forecast the horizon
-# D. The RV model is therefore chosen among the models of this frequency. None: best MASE over all frequencies.
-RV_MODEL_FREQ = '15min'
+# Every (target, pair, horizon D) trades the forecasts of its own best (regression, freq), chosen by
+# generate_mase_best_models.select_best_models: lowest out-of-sample MASE averaged over X^S and X^(S,O), scored on the
+# timestamps where both markets have a forecast (a (pair, D) without any is chosen on X^S alone).
+# True: the MASE is measured over the whole forecast sample, backtest period included (the choice then uses data of the
+# period it is tested on). False: only forecasts whose outcome is realised before --start_date are scored
+# (t + D <= --start_date), so the choice uses no data of the backtest period.
+SELECT_MODELS_ON_WHOLE_SAMPLE = True
+# The strategies run on this bar grid. A forecast of a coarser frequency, made at t, is carried forward over the bars
+# of its own period (a 1h forecast made at 10:00 is used at 10:00, 10:15, 10:30 and 10:45): it is built from the
+# features of the bar starting at t, exactly like the 15min forecast made at t, so this uses no future information.
+TRADING_FREQ = '15min'
+# Forecasts, realised values and Crypto SVIX are loaded from this many days before --start_date: the RV filter needs
+# the realised value of D days earlier (up to 30) and its normalisation the average over the previous D-day period, so
+# the first days of the backtest can trade. P&L is only counted from --start_date.
+WARMUP_DAYS = 61
 # True: every day a new position is opened per horizon D and held for HOLDING_DAYS[D] days (entry and exit at the same
 # bar of the day). The portfolio of a horizon is the equal-weighted average of its open positions (overlapping
 # tranches). False: positions are closed within the day (HOLD_FULL_DAY) or can change every bar.
@@ -525,7 +532,7 @@ def return_spot_table(data: pl.DataFrame) -> pl.DataFrame:
                                        pl.col('mid_price[0]').log().diff().alias('returns'))
     spot_data = spot_data.sort('timestamp')
     spot_data = \
-        spot_data.group_by_dynamic(index_column='timestamp', every=best_model_tags['returns'][-1].replace('in', ''),
+        spot_data.group_by_dynamic(index_column='timestamp', every=TRADING_FREQ.replace('in', ''),
                                    group_by='underlying_name').agg(pl.col('spread').last(),
                                                                    pl.col('mid_price').last(),
                                                                    pl.col('returns').sum())
@@ -605,8 +612,11 @@ def _trim_leading_nan(series: pd.Series) -> pd.Series:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all P&L tables.')
-    parser.add_argument('--start_date', type=str, help='Start date.', default='2023-01-01')
-    parser.add_argument('--end_date', type=str, help='End date.', default='2025-07-01')
+    parser.add_argument('--start_date', type=str, default=None,
+                        help='First day of the backtest. Default: the first day of forecasts.parquet, so every pair is '
+                             'backtested over all the data it has.')
+    parser.add_argument('--end_date', type=str, default=None,
+                        help='Day after the last day of the backtest. Default: the day after the last forecast.')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='./data_centre')
     parser.add_argument('--cpu_count', type=str, help='Number of CPUs to use to perform the analyses', default=1)
@@ -622,32 +632,67 @@ if __name__ == '__main__':
     d_order = CategoricalDtype(categories=['1d', '1w', '1m'], ordered=True)
     volatility_order = CategoricalDtype(categories=['low', 'normal', 'high'], ordered=True)
     market_order = CategoricalDtype(categories=['$X^S$', '$X^{(S,O)}$'], ordered=True)
-    date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='D', inclusive='left', tz='UTC')
-    mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
-    if RV_MODEL_FREQ is not None:
-        mase = mase[(mase['target'] != 'RV') | (mase['freq'] == RV_MODEL_FREQ)]
-    mase = mase.set_index('D')
-    model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
-                                     pd.Grouper(key='regression'),
-                                     pd.Grouper(key='freq')])[['MASE']].mean()
-    best_model_tags = model_ranking.groupby('target').idxmin().to_dict()['MASE']
-    mase_comparison = \
-        model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
+    forecasts_parquet = f'{args.target_path}/crypto_option_spot/forecasts.parquet'
+    # Backtest period: by default all the data. Each pair and each market trades from its own first forecast (a day
+    # without a forecast is not traded), so every pair is backtested over all the data it has.
+    coverage = (pl.scan_parquet(forecasts_parquet)
+                .filter(pl.col('underlying_name').is_in(list(pairs_order.categories)))
+                .group_by(['underlying_name', 'market'])
+                .agg(pl.col('timestamp').min().alias('first'), pl.col('timestamp').max().alias('last'))
+                .sort(['underlying_name', 'market']).collect())
+    if args.start_date is None:
+        args.start_date = str(coverage['first'].min().date())
+    if args.end_date is None:
+        args.end_date = str((pd.Timestamp(coverage['last'].max()) + pd.Timedelta(days=1)).date())
+    # first day with a forecast of every (target, pair, D, market): no P&L is counted before it
+    first_forecast_day = (pl.scan_parquet(forecasts_parquet).drop_nulls('y_hat')
+                          .group_by(['target', 'underlying_name', 'D', 'market'])
+                          .agg(pl.col('timestamp').min()).collect())
+    first_forecast_day = dict([((r['target'], r['underlying_name'], r['D'], r['market']),
+                                pd.Timestamp(r['timestamp']).tz_convert('UTC').tz_localize(None).normalize())
+                               for r in first_forecast_day.iter_rows(named=True)])
+    print(f'Backtest period: [{args.start_date}, {args.end_date}). Forecasts available per pair and market:', flush=True)
+    for row in coverage.iter_rows(named=True):
+        print(f"  {row['underlying_name']} {'X^(S,O)' if row['market'] == 1 else 'X^S    '}: "
+              f"{row['first'].date()} to {row['last'].date()}", flush=True)
     start_ts = pd.Timestamp(args.start_date, tz='UTC')
     end_ts = pd.Timestamp(args.end_date, tz='UTC')
+    load_start_ts = start_ts - pd.Timedelta(days=WARMUP_DAYS)
+    # days whose forecasts, realised values and Crypto SVIX are loaded (warm-up included)
+    load_range = pd.date_range(start=load_start_ts, end=end_ts, freq='D', inclusive='left', tz='UTC')
+    best_models = select_best_models(forecasts_parquet,
+                                     selection_end=None if SELECT_MODELS_ON_WHOLE_SAMPLE else start_ts)
+    best_models = best_models.filter(pl.col('underlying_name').is_in(list(pairs_order.categories)))
+    selection_period = 'the whole forecast sample, backtest period included' if SELECT_MODELS_ON_WHOLE_SAMPLE \
+        else f'forecasts realised before {args.start_date}'
+    print(f'Models used in the backtest (chosen on {selection_period}):', flush=True)
+    for row in best_models.iter_rows(named=True):
+        print(f"  {row['target']:>7} {row['underlying_name']} {row['D']}: {row['regression']} {row['freq']} "
+              f"(MASE {row['MASE']:.3f}, {row['basis']}, {row['n']} forecasts)", flush=True)
     data_per_target = dict()
-    forecasts_parquet = f'{args.target_path}/crypto_option_spot/forecasts.parquet'
-    forecasts_csv = f'{args.target_path}/crypto_option_spot/forecasts.csv'
-    for target, values in mase_comparison.items():
-        regression = best_model_tags[target][1]
-        freq = best_model_tags[target][-1]
-        lazy = pl.scan_parquet(forecasts_parquet)
-        lazy = \
-            lazy.filter((pl.col('regression') == regression.lower()) & (pl.col('freq') == freq) &
-                        (pl.col('target') == target))
-        lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
-        tmp = lazy.collect().to_pandas()
-        tmp = tmp.rename(columns={'y_hat': 'forecast', 'y': 'values'})
+    for target in ['RV', 'returns']:
+        pieces = list()
+        for row in best_models.filter(pl.col('target') == target).iter_rows(named=True):
+            freq = row['freq']
+            selected = (pl.col('target') == target) & (pl.col('underlying_name') == row['underlying_name']) & \
+                       (pl.col('D') == row['D']) & (pl.col('regression') == row['regression'])
+            in_window = (pl.col('timestamp') >= pl.lit(load_start_ts)) & (pl.col('timestamp') < pl.lit(end_ts))
+            lazy = pl.scan_parquet(forecasts_parquet).filter(selected & in_window)
+            # realised values on the trading grid: the target is the same at every frequency, so the TRADING_FREQ
+            # rows of the selected regression give it at every bar
+            realised = lazy.filter(pl.col('freq') == TRADING_FREQ).select(
+                ['underlying_name', 'target', 'D', 'market', 'timestamp', pl.col('y').alias('values')])
+            forecast = lazy.filter(pl.col('freq') == freq).select(
+                ['market', 'timestamp', pl.col('y_hat').alias('forecast')])
+            realised = realised.collect().to_pandas().sort_values('timestamp')
+            forecast = forecast.collect().to_pandas().sort_values('timestamp')
+            # each forecast is used from its own bar until the next bar of its frequency (exact match when
+            # freq == TRADING_FREQ)
+            carry = pd.to_timedelta(freq) - pd.to_timedelta(TRADING_FREQ)
+            piece = pd.merge_asof(realised, forecast, on='timestamp', by='market', direction='backward',
+                                  tolerance=carry if carry > pd.Timedelta(0) else pd.Timedelta(0))
+            pieces.append(piece)
+        tmp = pd.concat(pieces, ignore_index=True)
         tmp = tmp.set_index('timestamp')
         tmp.index = pd.to_datetime(tmp.index, utc=True)
         tmp = pd.pivot_table(data=tmp, columns=['underlying_name', 'target', 'D', 'market'],
@@ -655,12 +700,6 @@ if __name__ == '__main__':
         data_per_target[target] = tmp
     d_values = data_per_target['RV'].columns.get_level_values('D').str.lower()
     annualisation = pd.Series(360 / d_values.map(D_HORIZONS), index=data_per_target['RV'].columns)
-    if RV_BASE_FREQ is not None:
-        rv_freq_scale = pd.to_timedelta(best_model_tags['RV'][-1]) / pd.to_timedelta(RV_BASE_FREQ)
-        if rv_freq_scale != 1:
-            print(f"RV forecasts of frequency {best_model_tags['RV'][-1]} are rescaled by {rv_freq_scale:g} "
-                  f"to the {RV_BASE_FREQ} variance units.", flush=True)
-        annualisation = annualisation * rv_freq_scale
     data_per_target['RV'] = data_per_target['RV'].mul(annualisation, axis=1)
     if LAG_REALISED_BY_HORIZON:
         rv_data = data_per_target['RV']
@@ -678,23 +717,20 @@ if __name__ == '__main__':
             pd.concat([rv_data.drop(columns='values', level=0), lagged], axis=1).sort_index(axis=1)
     svix_parquet = f'{args.target_path}/crypto_option_spot/svix.parquet'
     lazy = pl.scan_parquet(svix_parquet)
-    lazy = lazy.filter((pl.col('timestamp') >= pl.lit(start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
+    lazy = lazy.filter((pl.col('timestamp') >= pl.lit(load_start_ts)) & (pl.col('timestamp') < pl.lit(end_ts)))
     svix = lazy.collect().to_pandas()
     svix = svix.set_index(['aggregated', 'underlying_name', 'D', 'timestamp'])
     svix_agg = svix.xs(1, axis=0, level=0, drop_level=False)
     svix_non_agg = svix.xs(0, axis=0, level=0, drop_level=False)
     svix = pd.concat([svix_agg, svix_non_agg])
-    svix = svix.loc[svix.index.get_level_values('timestamp').normalize().isin(date_range), :]
+    svix = svix.loc[svix.index.get_level_values('timestamp').normalize().isin(load_range), :]
     svix = svix.groupby(
         ['aggregated', 'underlying_name', 'D',
-         pd.Grouper(level='timestamp', freq=best_model_tags['RV'][-1])]).last()
-    rv = data_per_target['RV'].xs('forecast', axis=1, level=0).xs('RV', axis=1, level=1)
-    rv = rv.resample(best_model_tags['RV'][-1]).sum().replace(0, np.nan)
-    rv.columns = rv.columns.set_levels(rv.columns.levels[-2].str.lower(), level=-2).dropna()
+         pd.Grouper(level='timestamp', freq=TRADING_FREQ)]).last()
     mean_bar = data_per_target['RV'].xs('RV', axis=1, level=2)['values'].apply(
         lambda x: x.resample(f'{DAYS_CONVERTER[x.name[1]]}D').mean().shift()).ffill()
     mean_bar = mean_bar.reindex(data_per_target['RV'].index).ffill()
-    mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(date_range), :]
+    mean_bar = mean_bar.loc[mean_bar.index.normalize().isin(load_range), :]
     target_underlying_names = list(itertools.product(['RV', 'returns'], list(pairs_order.categories)))
     daily_pnl_path = f'{args.target_path}/crypto_option_spot/daily_pnl.pkl'
     if args.load_pnl:
@@ -706,7 +742,6 @@ if __name__ == '__main__':
         dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
               for target in ['RV', 'returns']])
     forecast_underlying_name = pd.IndexSlice
-    number_freq_period_in_day = pd.to_timedelta('1D')//pd.to_timedelta(best_model_tags['RV'][-1])
     for target_underlying_name in tqdm(target_underlying_names):
         target, underlying_name = tuple(target_underlying_name)
         underlying_name_mean_bar = mean_bar.loc[:, mean_bar.columns.get_level_values(0) == underlying_name]
@@ -716,7 +751,7 @@ if __name__ == '__main__':
             underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
             underlying_name_dates = \
                 [date for date in underlying_name_dates if
-                 (pd.to_datetime(date) + relativedelta(days=1) > file_cutoff) &
+                 (pd.to_datetime(date) + relativedelta(days=1) >= file_cutoff) &
                  (pd.to_datetime(date) < pd.Timestamp(args.end_date))]
             open_tranches = list()
             for idx_file in range(1, len(underlying_name_dates)):
@@ -736,7 +771,7 @@ if __name__ == '__main__':
                     return_underlying_price_table(yesterday_spot_underlying_file).collect()
                 yesterday_straddle_data = \
                     return_straddle_table(data=yesterday_file,
-                                          freq=best_model_tags['RV'][-1].replace('in', ''),
+                                          freq=TRADING_FREQ.replace('in', ''),
                                           underlying_price=yesterday_underlying_price)
                 try:
                     yesterday_straddle_data = yesterday_straddle_data.collect().lazy()
@@ -747,10 +782,15 @@ if __name__ == '__main__':
                     continue
                 yesterday_mean_bar = \
                     underlying_name_mean_bar[underlying_name_mean_bar.index.date == yesterday_date.date()]
-                if yesterday_mean_bar.dropna().empty:
+                # the X^S columns decide whether the day can be traded (X^(S,O) may not have started yet)
+                spot_mean_bar = yesterday_mean_bar.loc[:, yesterday_mean_bar.columns.get_level_values('market') == 0]
+                if spot_mean_bar.dropna().empty:
                     continue
                 yesterday_data = data_per_target['RV'][data_per_target['RV'].index.date == yesterday_date.date()]
-                tradable_assets = yesterday_data.isnull().all().groupby('underlying_name').sum()
+                # a pair is traded when its X^S forecasts are there for every horizon; X^(S,O) only trades on the
+                # days it has forecasts too (before that its signal is empty, so it takes no position)
+                spot_only = yesterday_data.loc[:, yesterday_data.columns.get_level_values('market') == 0]
+                tradable_assets = spot_only.isnull().all().groupby('underlying_name').sum()
                 tradable_assets = tradable_assets[tradable_assets == 0].index
                 if underlying_name not in tradable_assets:
                     continue
@@ -789,7 +829,7 @@ if __name__ == '__main__':
                     today_spot_underlying_file = \
                         pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
                     today_underlying_price = return_underlying_price_table(today_spot_underlying_file).collect()
-                    straddle_data = return_straddle_table(data=file, freq=best_model_tags['RV'][1:][-1].replace('in', ''),
+                    straddle_data = return_straddle_table(data=file, freq=TRADING_FREQ.replace('in', ''),
                                                           underlying_price=today_underlying_price)
                     straddle_data = straddle_data.sort(['symbol', 'type', 'timestamp'])
                     if HOLD_OVER_HORIZON:
@@ -1091,7 +1131,14 @@ if __name__ == '__main__':
                       f'they are dropped.', flush=True)
                 combined = combined.loc[~outside]
             combined = combined.set_index(index_names)
-            pnl[target][underlying_name] = combined.groupby(daily_grouper_level).sum()
+            daily = combined.groupby(daily_grouper_level).sum()
+            # a (horizon, market) has no P&L before its first forecast: those days are empty, not zero, so the
+            # Sharpe ratios of X^S and X^(S,O) only cover the days each one could trade
+            days = daily.index.get_level_values('timestamp')
+            for column in daily.columns:
+                first = first_forecast_day.get((target, underlying_name, column[1], column[2]))
+                daily.loc[(days < first) if first is not None else slice(None), column] = np.nan
+            pnl[target][underlying_name] = daily
             gc.collect()
         for target in ['RV', 'returns']:
             pnl[target] = pd.concat(pnl[target], axis=1)
@@ -1099,6 +1146,10 @@ if __name__ == '__main__':
         # checkpoint: the figures and tables below can be rebuilt with --load_pnl without repeating the backtest
         pd.to_pickle(pnl, daily_pnl_path)
         print(f'Daily P&L saved to {daily_pnl_path}', flush=True)
+    # the pairs do not share the same days: joining them leaves the days in arrival order. Everything below
+    # (cumulative P&L, figures) needs them in chronological order.
+    for target in ['RV', 'returns']:
+        pnl[target] = pnl[target].sort_index()
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
                      pd.Grouper(level='spread')]
     ####################################################################################################################
@@ -1119,7 +1170,10 @@ if __name__ == '__main__':
                                         'P&L<sup><span>&#8212;</span>TF</sup>',
                                         'P&L<sup><span>&#8212;</span>BASC</sup>'],
                             column_titles=[f'<i>{D}</i>' for D in d_order.categories])
+        pairs_with_pnl = tmp_cum_pnl.columns.get_level_values('underlying_name').unique()
         for idx, pair in enumerate(list(pairs_order.categories)):
+            if pair not in pairs_with_pnl:                # a pair without data is left out of the figure
+                continue
             pair_slice = tmp_cum_pnl.xs(pair, axis=1, level='underlying_name', drop_level=True)
             pair_slice = pair_slice.groupby(['aggregated', 'transaction_fees', 'spread']).transform('ffill')
             pair_slice = pair_slice.xs(aggregated_flag, axis=0, level='aggregated', drop_level=True)
@@ -1139,6 +1193,8 @@ if __name__ == '__main__':
         # legend: first row = X^S (solid) for every pair, second row = X^(S,O) (dashed) under the same pair
         for _, dash, market_label in market_styles:
             for idx, pair in enumerate(list(pairs_order.categories)):
+                if pair not in pairs_with_pnl:
+                    continue
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines',
                                          line=dict(color=px.colors.qualitative.Plotly[idx], width=30, dash=dash),
                                          name=f'\u00a0{pair.replace("USDT", "/USDT")} - {market_label}\u00a0\u00a0\u00a0',
@@ -1180,8 +1236,9 @@ if __name__ == '__main__':
     sharpe.index = sharpe.index.set_levels(['0.0', '1.0', ''], level='aggregated')
     proba_sharpe.index = proba_sharpe.index.set_levels(['', '0.0', '1.0'], level='aggregated')
     sharpe_columns_order = \
-        pd.MultiIndex.from_product([pairs_order.categories.tolist(), market_order.categories.tolist()],
-                                   names=['underlying_name', 'market'])
+        pd.MultiIndex.from_product([[pair for pair in pairs_order.categories.tolist()
+                                     if pair in sharpe.columns.get_level_values('underlying_name')],
+                                    market_order.categories.tolist()], names=['underlying_name', 'market'])
     sharpe_index_order_aggregated = pd.MultiIndex.from_tuples(
         [(agg, target, rf'\textit{{{d}}}') for agg in ['', str(float(1))] for target in ['returns', 'RV']
          for d in d_order.categories.tolist()
