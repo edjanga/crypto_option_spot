@@ -9,6 +9,8 @@ from pandas.api.types import CategoricalDtype
 from functools import partial
 from optuna.samplers import RandomSampler
 import argparse
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import itertools
 from tqdm.auto import tqdm
 from datetime import datetime
@@ -610,6 +612,390 @@ def _trim_leading_nan(series: pd.Series) -> pd.Series:
     return series.loc[first_valid:]
 
 
+def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dict, mean_bar: pd.DataFrame,
+                         svix: pd.DataFrame, file_cutoff) -> tuple:
+    """Backtest of one (target, pair): the strategy run over every day of the pair. Returns (target, pair, list of
+    bar-level P&L frames in day order). The (target, pair) backtests share no state, so they can run in separate
+    processes (--cpu_count) with the same result as one after the other."""
+    global target, underlying_name                      # read by make_filter and objective_daily
+    target, underlying_name = target_name, pair
+    forecast_underlying_name = pd.IndexSlice
+    daily_pnl = list()
+    underlying_name_mean_bar = mean_bar.loc[:, mean_bar.columns.get_level_values(0) == underlying_name]
+    if target == 'RV':
+        files = glob.glob(f'{args.target_path}/crypto_option_spot/option_helper_files/*/{underlying_name}/*')
+        files.sort()
+        underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
+        underlying_name_dates = \
+            [date for date in underlying_name_dates if
+             (pd.to_datetime(date) + relativedelta(days=1) >= file_cutoff) &
+             (pd.to_datetime(date) < pd.Timestamp(args.end_date))]
+        open_tranches = list()
+        # today's straddle table, kept for the next day, where it is "yesterday's" (the file is read and built once)
+        straddle_cache = dict()
+        for idx_file in range(1, len(underlying_name_dates)):
+            yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
+            cached = straddle_cache.pop(underlying_name_dates[idx_file-1], None)
+            straddle_cache.clear()
+            if cached is not None:
+                yesterday_straddle_data = cached.lazy()
+            else:
+                yesterday_file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
+                                             f'{underlying_name_dates[idx_file-1].split("-")[0]}/{underlying_name}/'
+                                             f'{underlying_name_dates[idx_file-1]}',
+                                             schema_overrides={'timestamp': pl.Datetime(time_unit='ms'),
+                                                               'mid_price': pl.Float64,
+                                                               'spread': pl.Float64, 'moneyness': pl.Float64,
+                                                               'tau': pl.Float64})
+                yesterday_file = (
+                    yesterday_file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type']))
+                yesterday_spot_underlying_file = \
+                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file-1]}')
+                yesterday_underlying_price = \
+                    return_underlying_price_table(yesterday_spot_underlying_file).collect()
+                yesterday_straddle_data = \
+                    return_straddle_table(data=yesterday_file,
+                                          freq=TRADING_FREQ.replace('in', ''),
+                                          underlying_price=yesterday_underlying_price)
+                try:
+                    yesterday_straddle_data = yesterday_straddle_data.collect().lazy()
+                except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
+                    print(f"WARNING: RV {underlying_name} day {idx_file} "
+                          f"({underlying_name_dates[idx_file]}) failed reading/parsing yesterday's option file "
+                          f"({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
+                    continue
+            yesterday_mean_bar = \
+                underlying_name_mean_bar[underlying_name_mean_bar.index.date == yesterday_date.date()]
+            # the X^S columns decide whether the day can be traded (X^(S,O) may not have started yet)
+            spot_mean_bar = yesterday_mean_bar.loc[:, yesterday_mean_bar.columns.get_level_values('market') == 0]
+            if spot_mean_bar.dropna().empty:
+                continue
+            yesterday_data = data_per_target['RV'][data_per_target['RV'].index.date == yesterday_date.date()]
+            # a pair is traded when its X^S forecasts are there for every horizon; X^(S,O) only trades on the
+            # days it has forecasts too (before that its signal is empty, so it takes no position)
+            spot_only = yesterday_data.loc[:, yesterday_data.columns.get_level_values('market') == 0]
+            tradable_assets = spot_only.isnull().all().groupby('underlying_name').sum()
+            tradable_assets = tradable_assets[tradable_assets == 0].index
+            if underlying_name not in tradable_assets:
+                continue
+            yesterday_data = \
+                yesterday_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
+            yesterday_data = yesterday_data.droplevel(level=[1, 2], axis=1)
+            yesterday_filter = make_filter(data=yesterday_data, mean_bar=yesterday_mean_bar)
+            yesterday_svix_underlying_name = \
+                svix.loc[(svix.index.get_level_values(3).date == yesterday_date.date()) &
+                          (svix.index.get_level_values(1) == underlying_name), ['svix']]
+            yesterday_svix_underlying_name = yesterday_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
+            yesterday_svix_underlying_name = yesterday_svix_underlying_name.droplevel(axis=1, level=0)
+            yesterday_svix_underlying_name.columns = yesterday_svix_underlying_name.columns.str.upper()
+            study = \
+                optuna.create_study(direction='maximize',
+                                    study_name=f'Parameter optimisation RV: Process '
+                                               f'{underlying_name}_{underlying_name_dates[idx_file]} has started.',
+                                    sampler=RandomSampler(123))
+            objective = partial(objective_daily, option_chain_data=yesterday_straddle_data,
+                                data=yesterday_data.loc[:, forecast_underlying_name['forecast', :, :]],
+                                filter_signal=yesterday_filter, svix=yesterday_svix_underlying_name,
+                                target=target, tradable_assets=tradable_assets)
+            try:
+                study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
+                               n_jobs=N_JOBS, gc_after_trial=True)
+                lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
+                    study.user_attrs['lower_bound_atm'], \
+                    study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
+                file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
+                                   f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
+                                   f'{underlying_name_dates[idx_file]}',
+                                   schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
+                                                     'spread': pl.Float64, 'moneyness': pl.Float64,
+                                                     'tau': pl.Float64})
+                file = file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type'])
+                today_spot_underlying_file = \
+                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
+                today_underlying_price = return_underlying_price_table(today_spot_underlying_file).collect()
+                straddle_data = return_straddle_table(data=file, freq=TRADING_FREQ.replace('in', ''),
+                                                      underlying_price=today_underlying_price).collect()
+                straddle_cache[underlying_name_dates[idx_file]] = straddle_data      # tomorrow's "yesterday"
+                straddle_data = straddle_data.lazy().sort(['symbol', 'type', 'timestamp'])
+                if HOLD_OVER_HORIZON:
+                    today_straddles = paired_straddles(straddle_data)
+                straddle_data = straddle_data.filter(
+                    pl.col('moneyness').is_between(lower_bound=lower_bound_moneyness,
+                                                   upper_bound=upper_bound_moneyness))
+                straddle_data = straddle_data.filter(pl.len().over(['symbol', pl.col('timestamp')]) == 2)
+                today_date = pd.to_datetime(underlying_name_dates[idx_file])
+                today_mean_bar = underlying_name_mean_bar[mean_bar.index.date == today_date.date()]
+                today_data = \
+                    data_per_target['RV'].loc[data_per_target['RV'].index.date == today_date.date()]
+                today_data = today_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
+                today_data = today_data.droplevel(level=[1, 2], axis=1)
+                today_filter = make_filter(data=today_data, mean_bar=today_mean_bar)
+                today_filter = today_filter.abs().gt(threshold_filter).astype(int)
+                markets = today_data.columns.get_level_values('market').unique().tolist()
+                today_svix_underlying_name = \
+                    svix.loc[(svix.index.get_level_values(3).date == today_date.date()) &
+                            (svix.index.get_level_values(1) == underlying_name), ['svix']]
+                today_svix_underlying_name = today_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
+                today_svix_underlying_name = today_svix_underlying_name.droplevel(axis=1, level=0)
+                today_svix_underlying_name.columns = today_svix_underlying_name.columns.str.upper()
+                today_forecast_flat = today_data[['forecast']].droplevel(axis=1, level=0)
+                if not today_forecast_flat.index.is_unique:
+                    print(f"WARNING: duplicate timestamp(s) in today's forecast data "
+                          f"for {underlying_name} -- dropping duplicates (keep last).")
+                    today_forecast_flat = today_forecast_flat[~today_forecast_flat.index.duplicated(keep='last')]
+                today_svix_dedup = today_svix_underlying_name
+                if not today_svix_underlying_name.index.get_level_values('timestamp').is_unique:
+                    print(f"WARNING: duplicate timestamp(s) in today's svix data "
+                          f"for {underlying_name} -- dropping duplicates (keep last).")
+                    today_svix_dedup = \
+                        today_svix_underlying_name[~today_svix_underlying_name.index.duplicated(keep='last')]
+                today_forecast_broadcast = \
+                    today_forecast_flat.reindex(today_svix_dedup.index.get_level_values('timestamp'))
+                today_forecast_broadcast.index = today_svix_dedup.index
+                today_vrp_underlying_name = today_svix_dedup.sub(vrp_forecast(today_forecast_broadcast))
+                today_vrp_underlying_name = -1*np.sign(today_vrp_underlying_name)
+                today_vrp_underlying_name = today_vrp_underlying_name.mul(today_filter, level='timestamp')
+                today_vrp_underlying_name = today_vrp_underlying_name.groupby('aggregated', group_keys=False)
+                today_signals_underlying_name = today_vrp_underlying_name.apply(lagged_signal)
+                if HOLD_OVER_HORIZON:
+                    straddle_data = horizon_hold_pnl(
+                        straddles=today_straddles, signals=today_signals_underlying_name,
+                        tranches=open_tranches, lower_bound=lower_bound_moneyness,
+                        upper_bound=upper_bound_moneyness, target=target)
+                else:
+                    today_number_of_unique_straddles = straddle_data.select(pl.col('symbol').n_unique()).collect().item()
+                    if today_number_of_unique_straddles == 0:
+                        print(f"WARNING: RV {underlying_name} day {idx_file} ({underlying_name_dates[idx_file]}) "
+                              f"has no straddle inside the calibrated moneyness band -- skipping this day.",
+                              flush=True)
+                        continue
+                    today_active_count = today_signals_underlying_name.ne(0).sum(axis=1)
+                    today_straddles_per_horizon = eligible_straddle_counts(
+                        straddle_data, today_signals_underlying_name.columns.get_level_values('D').unique().tolist())
+                    today_signals_underlying_name = (
+                        today_signals_underlying_name
+                        .div(today_signals_underlying_name.columns.get_level_values('D').map(
+                            today_straddles_per_horizon).to_numpy(), axis=1)
+                        .div(today_active_count.replace(0, np.nan), axis=0)
+                        .fillna(0)
+                    )
+                    today_delta_weights = \
+                        today_signals_underlying_name.groupby('aggregated', group_keys=False).apply(weight_changes)
+                    today_delta_weights = \
+                        pl.from_pandas(today_delta_weights.stack('market').reset_index()).with_columns(
+                            pl.col('timestamp').cast(pl.Datetime('ms')),
+                            pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
+                        ).lazy()
+                    today_signals_underlying_name = \
+                        pl.from_pandas(today_signals_underlying_name.stack('market').reset_index()).with_columns(
+                            pl.col('timestamp').cast(pl.Datetime('ms')),
+                            pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
+                        ).lazy()
+                    straddle_data = straddle_data.join(today_signals_underlying_name, on='timestamp', how='left')
+                    straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
+                    straddle_data = \
+                        straddle_data.group_by(['symbol', 'aggregated', 'market', 'timestamp'], maintain_order=True)
+                    straddle_data = straddle_data.agg([pl.col('mid_price').sum(), pl.col('spread').sum(),
+                                                       pl.col('transaction_fees').sum()] +
+                                                      [pl.col(d).last() for d in
+                                                       today_filter.columns.get_level_values('D').unique().tolist()] +
+                                                      [pl.col(f'eligible_{d}').last() for d in
+                                                       today_filter.columns.get_level_values('D').unique().tolist()])
+                    straddle_data = \
+                        straddle_data.with_columns([(pl.col('mid_price').log().diff().over(['symbol', 'aggregated',
+                                                                                            'market'])).alias('returns'),
+                                                    (SPREAD_COST_SHARE * pl.col('spread') / pl.col('mid_price')).alias('basc_fees')])
+                    straddle_data = straddle_data.join(today_delta_weights, how='left', suffix='_delta_weights',
+                                                       on=['aggregated', 'market', 'timestamp'])
+                    exprs = []
+                    for D in today_filter.columns.get_level_values('D').unique().tolist():
+                        eligible = pl.col(f'eligible_{D}')
+                        exprs += [pl.when(eligible).then((pl.col('returns') * pl.col(D) - (pl.col('transaction_fees') *
+                                  pl.col(f'{D}_delta_weights')).abs()).fill_null(0)).alias(f'returns_tc_{D}'),
+                                  pl.when(eligible).then((pl.col('returns') * pl.col(D) - (pl.col('basc_fees') *
+                                  pl.col(f'{D}_delta_weights')).abs()).fill_null(0)).alias(f'returns_basc_{D}'),
+                                  pl.when(eligible).then(pl.col('returns') * pl.col(D)).alias(f'returns_{D}')]
+                    straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
+                    straddle_data = straddle_data.with_columns(exprs)
+                    straddle_data = \
+                        straddle_data.drop(['returns', 'spread', 'transaction_fees', 'mid_price'] +
+                                           today_filter.columns.get_level_values('D').unique().tolist() +
+                                           ['basc_fees'] +
+                                           [f'{d}_delta_weights' for d in
+                                            today_filter.columns.get_level_values('D').unique().tolist()])
+                    straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
+                    returns_cols = \
+                        [f'{prefix}_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()
+                         for prefix in ['returns', 'returns_tc', 'returns_basc']]
+                    straddle_data = straddle_data.group_by(['aggregated', 'market', 'timestamp'])
+                    straddle_data = \
+                        (straddle_data.agg([pl.col(c).mean().fill_null(0).alias(c) for c in returns_cols])
+                         .with_columns(pl.lit(target).alias('target')))
+                    straddle_data = \
+                        straddle_data.collect().to_pandas().set_index(['aggregated', 'market', 'target', 'timestamp'])
+                    straddle_data = straddle_data.unstack('market')
+                    straddle_data = straddle_data.dropna(how='all', axis=1)
+                returns_cols = pd.MultiIndex.from_product(
+                    [[f'returns_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()], markets])
+                returns = _reindex_cols(straddle_data, returns_cols)
+                returns_tc_cols = pd.MultiIndex.from_product(
+                    [[f'returns_tc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
+                     markets])
+                returns_tc = _reindex_cols(straddle_data, returns_tc_cols)
+                returns_basc_cols = \
+                    pd.MultiIndex.from_product(
+                        [[f'returns_basc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
+                         markets])
+                returns_basc = _reindex_cols(straddle_data, returns_basc_cols)
+                returns = returns_table(returns, fees=None, underlying_name=underlying_name)
+                returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
+                returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
+                returns_tmp = pd.concat([returns, returns_tc, returns_basc])
+                daily_pnl.append(returns_tmp)
+                del returns, returns_tc, returns_basc, straddle_data, study
+                if idx_file % 20 == 0:
+                    gc.collect()
+            except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError,
+                   pl.exceptions.InvalidOperationError) as exc:
+                print(f"WARNING: RV {underlying_name} day {idx_file} "
+                      f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
+                      f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
+                continue
+    elif target == 'returns':
+        files = glob.glob(f'{args.target_path}/{underlying_name}/*/spot/*')
+        files.sort()
+        underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
+        underlying_name_dates = [f for f in underlying_name_dates if
+                                 pd.to_datetime(f.split('/')[-1]) + relativedelta(days=1) >= file_cutoff][:-1]
+        sign_history = list()
+        for idx_file in range(1, len(underlying_name_dates)-1):
+            yesterday_date = pd.to_datetime(underlying_name_dates[idx_file - 1])
+            yesterday_file = pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/'
+                                             f'{underlying_name_dates[idx_file - 1]}')
+            yesterday_spot = return_spot_table(yesterday_file)
+            try:
+                yesterday_spot = yesterday_spot.collect().lazy()
+            except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
+                print(f"WARNING: returns {underlying_name} day {idx_file} "
+                      f"({underlying_name_dates[idx_file]}) failed reading/parsing yesterday's spot file "
+                      f"({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
+                continue
+            yesterday_data = \
+                data_per_target['returns'][data_per_target['returns'].index.date == yesterday_date.date()]
+            yesterday_data = yesterday_data.loc[:, forecast_underlying_name['forecast']].dropna(how='all', axis=1)
+            tradable_assets = yesterday_data.columns.get_level_values('underlying_name').unique().shape[0]
+            try:
+                yesterday_data = \
+                    yesterday_data.loc[:, forecast_underlying_name[underlying_name, target, :, :]]
+            except KeyError:
+                continue
+            yesterday_data = yesterday_data.droplevel(level=[0, 1], axis=1)
+            study = \
+                optuna.create_study(direction='maximize',
+                                    study_name=f'Parameter optimisation returns: Process '
+                                               f'{underlying_name}_{underlying_name_dates[idx_file]} has started.',
+                                    sampler=RandomSampler(123))
+            objective = partial(objective_daily, spot_data=yesterday_spot, data=yesterday_data, target=target,
+                                tradable_assets=tradable_assets)
+            try:
+                study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
+                               n_jobs=N_JOBS, gc_after_trial=True)
+                threshold_filter = study.user_attrs['threshold_filter']
+            except (ValueError, KeyError, pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
+                print(f"WARNING: returns {underlying_name} day {idx_file} "
+                      f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
+                      f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
+                continue
+            today_date = pd.to_datetime(underlying_name_dates[idx_file])
+            today_file = \
+                pl.scan_parquet(f'{args.target_path}/{underlying_name}/{today_date.year}/spot/'
+                                f'{underlying_name_dates[idx_file]}')
+            today_spot = return_spot_table(today_file)
+            today_data = \
+                data_per_target['returns'].loc[data_per_target['returns'].index.date == today_date.date(),
+                forecast_underlying_name[:, :, target, :]]
+            today_data = today_data.dropna(axis=1, how='all')
+            tradable_assets = today_data.columns.get_level_values('underlying_name').unique().shape[0]
+            try:
+                today_forecast = \
+                    today_data.loc[:, forecast_underlying_name['forecast', underlying_name, target, :]]
+            except KeyError:
+                continue
+            today_forecast = today_forecast.droplevel(level=[0, 1, 2], axis=1)
+            markets = today_forecast.columns.get_level_values('market').unique().tolist()
+            signals = np.sign(today_forecast)
+            quantiles = yesterday_data.abs().quantile(threshold_filter).reindex(today_forecast.columns)
+            signal_filter = (today_forecast.abs().gt(quantiles, axis=1)).astype(int)
+            signals = lagged_signal(signals.mul(signal_filter)).fillna(0)
+            if HOLD_OVER_HORIZON:
+                signals = horizon_weights(signals, sign_history)
+            else:
+                active_count = signals.ne(0).sum(axis=1)
+                signals = signals.div(active_count.replace(0, np.nan), axis=0).fillna(0)
+            today_delta_weights = weight_changes(signals)
+            signals = signals.stack('market').reset_index().assign(aggregated='')
+            today_delta_weights = today_delta_weights.stack('market').reset_index().assign(aggregated='')
+            signals = pl.from_pandas(signals).with_columns(
+                pl.col('timestamp').cast(pl.Datetime('ms')), pl.col('aggregated'),
+                pl.col('market').cast(pl.Int64)).lazy()
+            today_delta_weights = pl.from_pandas(today_delta_weights).with_columns(
+                pl.col('timestamp').cast(pl.Datetime('ms')), pl.col('aggregated'),
+                pl.col('market').cast(pl.Int64)).lazy()
+            today_spot = today_spot.join(signals, on='timestamp', how='left')
+            spot_data = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
+            today_spot = today_spot.group_by(['underlying_name', 'aggregated', 'market', 'timestamp'],
+                                             maintain_order=True)
+            today_spot = today_spot.agg([pl.col('returns').sum(), pl.col('basc_fees').last(),
+                                         pl.col('transaction_fees').last()]+
+                                        [pl.col(d).last() for d in
+                                         today_forecast.columns.get_level_values('D').unique().tolist()])
+            today_spot = today_spot.join(today_delta_weights, on=['aggregated', 'market', 'timestamp'],
+                                         how='left', suffix='_delta_weights')
+            exprs = []
+            for D in today_forecast.columns.get_level_values('D').unique().tolist():
+                exprs += pnl_expressions(return_col='returns', weight_col=D, delta_weight_col=f'{D}_delta_weights',
+                                         transaction_fee_col='transaction_fees', basc_fee_col='basc_fees', D=D)
+            today_spot = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
+            today_spot = today_spot.with_columns(exprs)
+            today_spot = today_spot.drop(
+                ['returns', 'transaction_fees']+
+                today_forecast.columns.get_level_values('D').unique().tolist()+
+                ['basc_fees']+
+                [f'{d}_delta_weights' for d in today_forecast.columns.get_level_values('D').unique().tolist()])
+            today_spot = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
+            returns_cols = \
+                [f'{prefix}_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist() for prefix in
+                 ['returns', 'returns_tc', 'returns_basc']]
+            today_spot = today_spot.group_by(['aggregated', 'market', 'timestamp'])
+            today_spot = \
+                today_spot.agg([pl.col(c).mean().alias(c) for c in returns_cols]).with_columns(
+                    pl.lit(target).alias('target'))
+            today_spot = \
+                today_spot.collect().to_pandas().set_index(['aggregated', 'target', 'market', 'timestamp'])
+            today_spot = today_spot.unstack('market')
+            returns_cols = \
+                pd.MultiIndex.from_product(
+                    [[f'returns_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist()],
+                     markets])
+            returns = _reindex_cols(today_spot, returns_cols)
+            returns_tc_cols = pd.MultiIndex.from_product(
+                [[f'returns_tc_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist()],
+                 markets])
+            returns_tc = _reindex_cols(today_spot, returns_tc_cols)
+            returns_basc_cols = pd.MultiIndex.from_product(
+                [[f'returns_basc_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist()],
+                 markets])
+            returns_basc = _reindex_cols(today_spot, returns_basc_cols)
+            returns = returns_table(returns, fees=None, underlying_name=underlying_name)
+            returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
+            returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
+            daily_pnl.append(pd.concat([returns, returns_tc, returns_basc]))
+            del returns, returns_tc, returns_basc, today_spot, study
+            if idx_file % 20 == 0:
+                gc.collect()
+    return target_name, pair, daily_pnl
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all P&L tables.')
     parser.add_argument('--start_date', type=str, default=None,
@@ -619,7 +1005,8 @@ if __name__ == '__main__':
                         help='Day after the last day of the backtest. Default: the day after the last forecast.')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='./data_centre')
-    parser.add_argument('--cpu_count', type=str, help='Number of CPUs to use to perform the analyses', default=1)
+    parser.add_argument('--cpu_count', type=int, default=1,
+                        help='Number of (target, pair) backtests run at the same time, one process each (at most 8).')
     parser.add_argument('--load_pnl', action='store_true',
                         help='Skip the backtest and rebuild the figures and tables from the daily P&L saved by the '
                              'previous run (crypto_option_spot/daily_pnl.pkl).')
@@ -742,372 +1129,26 @@ if __name__ == '__main__':
         dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
               for target in ['RV', 'returns']])
     forecast_underlying_name = pd.IndexSlice
-    for target_underlying_name in tqdm(target_underlying_names):
-        target, underlying_name = tuple(target_underlying_name)
-        underlying_name_mean_bar = mean_bar.loc[:, mean_bar.columns.get_level_values(0) == underlying_name]
-        if target == 'RV':
-            files = glob.glob(f'{args.target_path}/crypto_option_spot/option_helper_files/*/{underlying_name}/*')
-            files.sort()
-            underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
-            underlying_name_dates = \
-                [date for date in underlying_name_dates if
-                 (pd.to_datetime(date) + relativedelta(days=1) >= file_cutoff) &
-                 (pd.to_datetime(date) < pd.Timestamp(args.end_date))]
-            open_tranches = list()
-            for idx_file in range(1, len(underlying_name_dates)):
-                yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
-                yesterday_file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
-                                             f'{underlying_name_dates[idx_file-1].split("-")[0]}/{underlying_name}/'
-                                             f'{underlying_name_dates[idx_file-1]}',
-                                             schema_overrides={'timestamp': pl.Datetime(time_unit='ms'),
-                                                               'mid_price': pl.Float64,
-                                                               'spread': pl.Float64, 'moneyness': pl.Float64,
-                                                               'tau': pl.Float64})
-                yesterday_file = (
-                    yesterday_file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type']))
-                yesterday_spot_underlying_file = \
-                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file-1]}')
-                yesterday_underlying_price = \
-                    return_underlying_price_table(yesterday_spot_underlying_file).collect()
-                yesterday_straddle_data = \
-                    return_straddle_table(data=yesterday_file,
-                                          freq=TRADING_FREQ.replace('in', ''),
-                                          underlying_price=yesterday_underlying_price)
-                try:
-                    yesterday_straddle_data = yesterday_straddle_data.collect().lazy()
-                except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
-                    print(f"WARNING: RV {underlying_name} day {idx_file} "
-                          f"({underlying_name_dates[idx_file]}) failed reading/parsing yesterday's option file "
-                          f"({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
-                    continue
-                yesterday_mean_bar = \
-                    underlying_name_mean_bar[underlying_name_mean_bar.index.date == yesterday_date.date()]
-                # the X^S columns decide whether the day can be traded (X^(S,O) may not have started yet)
-                spot_mean_bar = yesterday_mean_bar.loc[:, yesterday_mean_bar.columns.get_level_values('market') == 0]
-                if spot_mean_bar.dropna().empty:
-                    continue
-                yesterday_data = data_per_target['RV'][data_per_target['RV'].index.date == yesterday_date.date()]
-                # a pair is traded when its X^S forecasts are there for every horizon; X^(S,O) only trades on the
-                # days it has forecasts too (before that its signal is empty, so it takes no position)
-                spot_only = yesterday_data.loc[:, yesterday_data.columns.get_level_values('market') == 0]
-                tradable_assets = spot_only.isnull().all().groupby('underlying_name').sum()
-                tradable_assets = tradable_assets[tradable_assets == 0].index
-                if underlying_name not in tradable_assets:
-                    continue
-                yesterday_data = \
-                    yesterday_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
-                yesterday_data = yesterday_data.droplevel(level=[1, 2], axis=1)
-                yesterday_filter = make_filter(data=yesterday_data, mean_bar=yesterday_mean_bar)
-                yesterday_svix_underlying_name = \
-                    svix.loc[(svix.index.get_level_values(3).date == yesterday_date.date()) &
-                              (svix.index.get_level_values(1) == underlying_name), ['svix']]
-                yesterday_svix_underlying_name = yesterday_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
-                yesterday_svix_underlying_name = yesterday_svix_underlying_name.droplevel(axis=1, level=0)
-                yesterday_svix_underlying_name.columns = yesterday_svix_underlying_name.columns.str.upper()
-                study = \
-                    optuna.create_study(direction='maximize',
-                                        study_name=f'Parameter optimisation RV: Process '
-                                                   f'{underlying_name}_{underlying_name_dates[idx_file]} has started.',
-                                        sampler=RandomSampler(123))
-                objective = partial(objective_daily, option_chain_data=yesterday_straddle_data,
-                                    data=yesterday_data.loc[:, forecast_underlying_name['forecast', :, :]],
-                                    filter_signal=yesterday_filter, svix=yesterday_svix_underlying_name,
-                                    target=target, tradable_assets=tradable_assets)
-                try:
-                    study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
-                                   n_jobs=N_JOBS, gc_after_trial=True)
-                    lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
-                        study.user_attrs['lower_bound_atm'], \
-                        study.user_attrs['upper_bound_atm'], study.user_attrs['threshold_filter']
-                    file = pl.scan_csv(f'{args.target_path}/crypto_option_spot/option_helper_files/'
-                                       f'{underlying_name_dates[idx_file].split("-")[0]}/{underlying_name}/'
-                                       f'{underlying_name_dates[idx_file]}',
-                                       schema_overrides={'timestamp': pl.Datetime(time_unit='ms'), 'mid_price': pl.Float64,
-                                                         'spread': pl.Float64, 'moneyness': pl.Float64,
-                                                         'tau': pl.Float64})
-                    file = file.select(['symbol', 'timestamp', 'mid_price', 'spread', 'moneyness', 'tau', 'type'])
-                    today_spot_underlying_file = \
-                        pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/{underlying_name_dates[idx_file]}')
-                    today_underlying_price = return_underlying_price_table(today_spot_underlying_file).collect()
-                    straddle_data = return_straddle_table(data=file, freq=TRADING_FREQ.replace('in', ''),
-                                                          underlying_price=today_underlying_price)
-                    straddle_data = straddle_data.sort(['symbol', 'type', 'timestamp'])
-                    if HOLD_OVER_HORIZON:
-                        today_straddles = paired_straddles(straddle_data)
-                    straddle_data = straddle_data.filter(
-                        pl.col('moneyness').is_between(lower_bound=lower_bound_moneyness,
-                                                       upper_bound=upper_bound_moneyness))
-                    straddle_data = straddle_data.filter(pl.len().over(['symbol', pl.col('timestamp')]) == 2)
-                    today_date = pd.to_datetime(underlying_name_dates[idx_file])
-                    today_mean_bar = underlying_name_mean_bar[mean_bar.index.date == today_date.date()]
-                    today_data = \
-                        data_per_target['RV'].loc[data_per_target['RV'].index.date == today_date.date()]
-                    today_data = today_data.loc[:, forecast_underlying_name[:, underlying_name, target, :]]
-                    today_data = today_data.droplevel(level=[1, 2], axis=1)
-                    today_filter = make_filter(data=today_data, mean_bar=today_mean_bar)
-                    today_filter = today_filter.abs().gt(threshold_filter).astype(int)
-                    markets = today_data.columns.get_level_values('market').unique().tolist()
-                    today_svix_underlying_name = \
-                        svix.loc[(svix.index.get_level_values(3).date == today_date.date()) &
-                                (svix.index.get_level_values(1) == underlying_name), ['svix']]
-                    today_svix_underlying_name = today_svix_underlying_name.unstack('D').droplevel(axis=0, level=1)
-                    today_svix_underlying_name = today_svix_underlying_name.droplevel(axis=1, level=0)
-                    today_svix_underlying_name.columns = today_svix_underlying_name.columns.str.upper()
-                    today_forecast_flat = today_data[['forecast']].droplevel(axis=1, level=0)
-                    if not today_forecast_flat.index.is_unique:
-                        print(f"WARNING: duplicate timestamp(s) in today's forecast data "
-                              f"for {underlying_name} -- dropping duplicates (keep last).")
-                        today_forecast_flat = today_forecast_flat[~today_forecast_flat.index.duplicated(keep='last')]
-                    today_svix_dedup = today_svix_underlying_name
-                    if not today_svix_underlying_name.index.get_level_values('timestamp').is_unique:
-                        print(f"WARNING: duplicate timestamp(s) in today's svix data "
-                              f"for {underlying_name} -- dropping duplicates (keep last).")
-                        today_svix_dedup = \
-                            today_svix_underlying_name[~today_svix_underlying_name.index.duplicated(keep='last')]
-                    today_forecast_broadcast = \
-                        today_forecast_flat.reindex(today_svix_dedup.index.get_level_values('timestamp'))
-                    today_forecast_broadcast.index = today_svix_dedup.index
-                    today_vrp_underlying_name = today_svix_dedup.sub(vrp_forecast(today_forecast_broadcast))
-                    today_vrp_underlying_name = -1*np.sign(today_vrp_underlying_name)
-                    today_vrp_underlying_name = today_vrp_underlying_name.mul(today_filter, level='timestamp')
-                    today_vrp_underlying_name = today_vrp_underlying_name.groupby('aggregated', group_keys=False)
-                    today_signals_underlying_name = today_vrp_underlying_name.apply(lagged_signal)
-                    if HOLD_OVER_HORIZON:
-                        straddle_data = horizon_hold_pnl(
-                            straddles=today_straddles, signals=today_signals_underlying_name,
-                            tranches=open_tranches, lower_bound=lower_bound_moneyness,
-                            upper_bound=upper_bound_moneyness, target=target)
-                    else:
-                        today_number_of_unique_straddles = straddle_data.select(pl.col('symbol').n_unique()).collect().item()
-                        if today_number_of_unique_straddles == 0:
-                            print(f"WARNING: RV {underlying_name} day {idx_file} ({underlying_name_dates[idx_file]}) "
-                                  f"has no straddle inside the calibrated moneyness band -- skipping this day.",
-                                  flush=True)
-                            continue
-                        today_active_count = today_signals_underlying_name.ne(0).sum(axis=1)
-                        today_straddles_per_horizon = eligible_straddle_counts(
-                            straddle_data, today_signals_underlying_name.columns.get_level_values('D').unique().tolist())
-                        today_signals_underlying_name = (
-                            today_signals_underlying_name
-                            .div(today_signals_underlying_name.columns.get_level_values('D').map(
-                                today_straddles_per_horizon).to_numpy(), axis=1)
-                            .div(today_active_count.replace(0, np.nan), axis=0)
-                            .fillna(0)
-                        )
-                        today_delta_weights = \
-                            today_signals_underlying_name.groupby('aggregated', group_keys=False).apply(weight_changes)
-                        today_delta_weights = \
-                            pl.from_pandas(today_delta_weights.stack('market').reset_index()).with_columns(
-                                pl.col('timestamp').cast(pl.Datetime('ms')),
-                                pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
-                            ).lazy()
-                        today_signals_underlying_name = \
-                            pl.from_pandas(today_signals_underlying_name.stack('market').reset_index()).with_columns(
-                                pl.col('timestamp').cast(pl.Datetime('ms')),
-                                pl.col('aggregated').cast(pl.Int64), pl.col('market').cast(pl.Int64)
-                            ).lazy()
-                        straddle_data = straddle_data.join(today_signals_underlying_name, on='timestamp', how='left')
-                        straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
-                        straddle_data = \
-                            straddle_data.group_by(['symbol', 'aggregated', 'market', 'timestamp'], maintain_order=True)
-                        straddle_data = straddle_data.agg([pl.col('mid_price').sum(), pl.col('spread').sum(),
-                                                           pl.col('transaction_fees').sum()] +
-                                                          [pl.col(d).last() for d in
-                                                           today_filter.columns.get_level_values('D').unique().tolist()] +
-                                                          [pl.col(f'eligible_{d}').last() for d in
-                                                           today_filter.columns.get_level_values('D').unique().tolist()])
-                        straddle_data = \
-                            straddle_data.with_columns([(pl.col('mid_price').log().diff().over(['symbol', 'aggregated',
-                                                                                                'market'])).alias('returns'),
-                                                        (SPREAD_COST_SHARE * pl.col('spread') / pl.col('mid_price')).alias('basc_fees')])
-                        straddle_data = straddle_data.join(today_delta_weights, how='left', suffix='_delta_weights',
-                                                           on=['aggregated', 'market', 'timestamp'])
-                        exprs = []
-                        for D in today_filter.columns.get_level_values('D').unique().tolist():
-                            eligible = pl.col(f'eligible_{D}')
-                            exprs += [pl.when(eligible).then((pl.col('returns') * pl.col(D) - (pl.col('transaction_fees') *
-                                      pl.col(f'{D}_delta_weights')).abs()).fill_null(0)).alias(f'returns_tc_{D}'),
-                                      pl.when(eligible).then((pl.col('returns') * pl.col(D) - (pl.col('basc_fees') *
-                                      pl.col(f'{D}_delta_weights')).abs()).fill_null(0)).alias(f'returns_basc_{D}'),
-                                      pl.when(eligible).then(pl.col('returns') * pl.col(D)).alias(f'returns_{D}')]
-                        straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
-                        straddle_data = straddle_data.with_columns(exprs)
-                        straddle_data = \
-                            straddle_data.drop(['returns', 'spread', 'transaction_fees', 'mid_price'] +
-                                               today_filter.columns.get_level_values('D').unique().tolist() +
-                                               ['basc_fees'] +
-                                               [f'{d}_delta_weights' for d in
-                                                today_filter.columns.get_level_values('D').unique().tolist()])
-                        straddle_data = straddle_data.sort(['symbol', 'aggregated', 'market', 'timestamp'])
-                        returns_cols = \
-                            [f'{prefix}_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()
-                             for prefix in ['returns', 'returns_tc', 'returns_basc']]
-                        straddle_data = straddle_data.group_by(['aggregated', 'market', 'timestamp'])
-                        straddle_data = \
-                            (straddle_data.agg([pl.col(c).mean().fill_null(0).alias(c) for c in returns_cols])
-                             .with_columns(pl.lit(target).alias('target')))
-                        straddle_data = \
-                            straddle_data.collect().to_pandas().set_index(['aggregated', 'market', 'target', 'timestamp'])
-                        straddle_data = straddle_data.unstack('market')
-                        straddle_data = straddle_data.dropna(how='all', axis=1)
-                    returns_cols = pd.MultiIndex.from_product(
-                        [[f'returns_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()], markets])
-                    returns = _reindex_cols(straddle_data, returns_cols)
-                    returns_tc_cols = pd.MultiIndex.from_product(
-                        [[f'returns_tc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
-                         markets])
-                    returns_tc = _reindex_cols(straddle_data, returns_tc_cols)
-                    returns_basc_cols = \
-                        pd.MultiIndex.from_product(
-                            [[f'returns_basc_{D}' for D in today_filter.columns.get_level_values('D').unique().tolist()],
-                             markets])
-                    returns_basc = _reindex_cols(straddle_data, returns_basc_cols)
-                    returns = returns_table(returns, fees=None, underlying_name=underlying_name)
-                    returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
-                    returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
-                    returns_tmp = pd.concat([returns, returns_tc, returns_basc])
-                    pnl[target][underlying_name].append(returns_tmp)
-                    del returns, returns_tc, returns_basc, straddle_data, study
-                    if idx_file % 20 == 0:
-                        gc.collect()
-                except (ValueError, KeyError, pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError,
-                       pl.exceptions.InvalidOperationError) as exc:
-                    print(f"WARNING: RV {underlying_name} day {idx_file} "
-                          f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
-                          f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
-                    continue
-        elif target == 'returns':
-            files = glob.glob(f'{args.target_path}/{underlying_name}/*/spot/*')
-            files.sort()
-            underlying_name_dates = list(map(lambda x: x.split('/')[-1], files))
-            underlying_name_dates = [f for f in underlying_name_dates if
-                                     pd.to_datetime(f.split('/')[-1]) + relativedelta(days=1) >= file_cutoff][:-1]
-            sign_history = list()
-            for idx_file in range(1, len(underlying_name_dates)-1):
-                yesterday_date = pd.to_datetime(underlying_name_dates[idx_file - 1])
-                yesterday_file = pl.scan_parquet(f'{args.target_path}/{underlying_name}/*/spot/'
-                                                 f'{underlying_name_dates[idx_file - 1]}')
-                yesterday_spot = return_spot_table(yesterday_file)
-                try:
-                    yesterday_spot = yesterday_spot.collect().lazy()
-                except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
-                    print(f"WARNING: returns {underlying_name} day {idx_file} "
-                          f"({underlying_name_dates[idx_file]}) failed reading/parsing yesterday's spot file "
-                          f"({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
-                    continue
-                yesterday_data = \
-                    data_per_target['returns'][data_per_target['returns'].index.date == yesterday_date.date()]
-                yesterday_data = yesterday_data.loc[:, forecast_underlying_name['forecast']].dropna(how='all', axis=1)
-                tradable_assets = yesterday_data.columns.get_level_values('underlying_name').unique().shape[0]
-                try:
-                    yesterday_data = \
-                        yesterday_data.loc[:, forecast_underlying_name[underlying_name, target, :, :]]
-                except KeyError:
-                    continue
-                yesterday_data = yesterday_data.droplevel(level=[0, 1], axis=1)
-                study = \
-                    optuna.create_study(direction='maximize',
-                                        study_name=f'Parameter optimisation returns: Process '
-                                                   f'{underlying_name}_{underlying_name_dates[idx_file]} has started.',
-                                        sampler=RandomSampler(123))
-                objective = partial(objective_daily, spot_data=yesterday_spot, data=yesterday_data, target=target,
-                                    tradable_assets=tradable_assets)
-                try:
-                    study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
-                                   n_jobs=N_JOBS, gc_after_trial=True)
-                    threshold_filter = study.user_attrs['threshold_filter']
-                except (ValueError, KeyError, pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
-                    print(f"WARNING: returns {underlying_name} day {idx_file} "
-                          f"({underlying_name_dates[idx_file]}) optuna optimization produced no usable "
-                          f"result ({exc.__class__.__name__}: {exc}) -- skipping this day.", flush=True)
-                    continue
-                today_date = pd.to_datetime(underlying_name_dates[idx_file])
-                today_file = \
-                    pl.scan_parquet(f'{args.target_path}/{underlying_name}/{today_date.year}/spot/'
-                                    f'{underlying_name_dates[idx_file]}')
-                today_spot = return_spot_table(today_file)
-                today_data = \
-                    data_per_target['returns'].loc[data_per_target['returns'].index.date == today_date.date(),
-                    forecast_underlying_name[:, :, target, :]]
-                today_data = today_data.dropna(axis=1, how='all')
-                tradable_assets = today_data.columns.get_level_values('underlying_name').unique().shape[0]
-                try:
-                    today_forecast = \
-                        today_data.loc[:, forecast_underlying_name['forecast', underlying_name, target, :]]
-                except KeyError:
-                    continue
-                today_forecast = today_forecast.droplevel(level=[0, 1, 2], axis=1)
-                markets = today_forecast.columns.get_level_values('market').unique().tolist()
-                signals = np.sign(today_forecast)
-                quantiles = yesterday_data.abs().quantile(threshold_filter).reindex(today_forecast.columns)
-                signal_filter = (today_forecast.abs().gt(quantiles, axis=1)).astype(int)
-                signals = lagged_signal(signals.mul(signal_filter)).fillna(0)
-                if HOLD_OVER_HORIZON:
-                    signals = horizon_weights(signals, sign_history)
-                else:
-                    active_count = signals.ne(0).sum(axis=1)
-                    signals = signals.div(active_count.replace(0, np.nan), axis=0).fillna(0)
-                today_delta_weights = weight_changes(signals)
-                signals = signals.stack('market').reset_index().assign(aggregated='')
-                today_delta_weights = today_delta_weights.stack('market').reset_index().assign(aggregated='')
-                signals = pl.from_pandas(signals).with_columns(
-                    pl.col('timestamp').cast(pl.Datetime('ms')), pl.col('aggregated'),
-                    pl.col('market').cast(pl.Int64)).lazy()
-                today_delta_weights = pl.from_pandas(today_delta_weights).with_columns(
-                    pl.col('timestamp').cast(pl.Datetime('ms')), pl.col('aggregated'),
-                    pl.col('market').cast(pl.Int64)).lazy()
-                today_spot = today_spot.join(signals, on='timestamp', how='left')
-                spot_data = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
-                today_spot = today_spot.group_by(['underlying_name', 'aggregated', 'market', 'timestamp'],
-                                                 maintain_order=True)
-                today_spot = today_spot.agg([pl.col('returns').sum(), pl.col('basc_fees').last(),
-                                             pl.col('transaction_fees').last()]+
-                                            [pl.col(d).last() for d in
-                                             today_forecast.columns.get_level_values('D').unique().tolist()])
-                today_spot = today_spot.join(today_delta_weights, on=['aggregated', 'market', 'timestamp'],
-                                             how='left', suffix='_delta_weights')
-                exprs = []
-                for D in today_forecast.columns.get_level_values('D').unique().tolist():
-                    exprs += pnl_expressions(return_col='returns', weight_col=D, delta_weight_col=f'{D}_delta_weights',
-                                             transaction_fee_col='transaction_fees', basc_fee_col='basc_fees', D=D)
-                today_spot = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
-                today_spot = today_spot.with_columns(exprs)
-                today_spot = today_spot.drop(
-                    ['returns', 'transaction_fees']+
-                    today_forecast.columns.get_level_values('D').unique().tolist()+
-                    ['basc_fees']+
-                    [f'{d}_delta_weights' for d in today_forecast.columns.get_level_values('D').unique().tolist()])
-                today_spot = today_spot.sort(['underlying_name', 'aggregated', 'market', 'timestamp'])
-                returns_cols = \
-                    [f'{prefix}_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist() for prefix in
-                     ['returns', 'returns_tc', 'returns_basc']]
-                today_spot = today_spot.group_by(['aggregated', 'market', 'timestamp'])
-                today_spot = \
-                    today_spot.agg([pl.col(c).mean().alias(c) for c in returns_cols]).with_columns(
-                        pl.lit(target).alias('target'))
-                today_spot = \
-                    today_spot.collect().to_pandas().set_index(['aggregated', 'target', 'market', 'timestamp'])
-                today_spot = today_spot.unstack('market')
-                returns_cols = \
-                    pd.MultiIndex.from_product(
-                        [[f'returns_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist()],
-                         markets])
-                returns = _reindex_cols(today_spot, returns_cols)
-                returns_tc_cols = pd.MultiIndex.from_product(
-                    [[f'returns_tc_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist()],
-                     markets])
-                returns_tc = _reindex_cols(today_spot, returns_tc_cols)
-                returns_basc_cols = pd.MultiIndex.from_product(
-                    [[f'returns_basc_{D}' for D in today_forecast.columns.get_level_values('D').unique().tolist()],
-                     markets])
-                returns_basc = _reindex_cols(today_spot, returns_basc_cols)
-                returns = returns_table(returns, fees=None, underlying_name=underlying_name)
-                returns_tc = returns_table(returns_tc, fees='transaction_fees', underlying_name=underlying_name)
-                returns_basc = returns_table(returns_basc, fees='basc_fees', underlying_name=underlying_name)
-                pnl[target][underlying_name].append(pd.concat([returns, returns_tc, returns_basc]))
-                del returns, returns_tc, returns_basc, today_spot, study
-                if idx_file % 20 == 0:
-                    gc.collect()
+    jobs = [tuple(job) for job in target_underlying_names]
+    try:
+        available_cpus = len(os.sched_getaffinity(0))   # the CPUs given to this job (e.g. by SLURM)
+    except AttributeError:
+        available_cpus = os.cpu_count() or 1
+    n_workers = max(1, min(int(args.cpu_count), len(jobs))) if jobs else 1
+    print(f'{len(jobs)} (target, pair) backtests on {n_workers} process(es).', flush=True)
+    if n_workers == 1:
+        results = [backtest_target_pair(t, p, args, data_per_target, mean_bar, svix, file_cutoff)
+                   for t, p in tqdm(jobs)]
+    else:
+        # each process gets its share of the CPUs for polars (read when the process starts)
+        os.environ['POLARS_MAX_THREADS'] = str(max(1, available_cpus // n_workers))
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context('spawn')) as pool:
+            futures = [pool.submit(backtest_target_pair, t, p, args, data_per_target, mean_bar, svix, file_cutoff)
+                       for t, p in jobs]
+            results = [future.result() for future in tqdm(as_completed(futures), total=len(futures),
+                                                          desc='(target, pair) backtests')]
+    for job_target, job_pair, job_pnl in results:
+        pnl[job_target][job_pair].extend(job_pnl)
     daily_grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'),
                            pd.Grouper(level='transaction_fees'), pd.Grouper(level='spread'),
                            pd.Grouper(level='timestamp', freq='D')]
