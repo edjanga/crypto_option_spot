@@ -575,6 +575,62 @@ def returns_table(data, fees, underlying_name):
     return data
 
 
+def pair_label(pair: str) -> str:
+    """Display name of a pair in the tables: BTCUSDT -> BTC/USDT."""
+    return pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') and '/' not in pair else pair
+
+
+SHARPE_TARGET_LABELS = {'returns': 'First', 'RV': 'Second'}   # first column (Moment) of the Sharpe tables
+
+
+def sharpe_table_latex(table: pd.DataFrame) -> str:
+    """A Sharpe or probabilistic Sharpe table as a LaTeX tabular (booktabs and multirow packages).
+    table: rows indexed by (target, D) or (target, vol_regime, D), labels already formatted (\\textit{1d}); columns
+    indexed by (underlying_name, market); cells are LaTeX strings (already formatted, e.g. bold) or numbers (printed
+    with two decimals; missing values as NaN). The header shows the pairs and the markets only, so the file compiles
+    as is (no pandas index names, whose underscores are not valid LaTeX); the first column is headed Moment (on the
+    row of the markets) and the targets are written First (returns) and Second (RV)."""
+    def cell(value):
+        if isinstance(value, str):
+            return value
+        return 'NaN' if pd.isna(value) else f'{value:.2f}'
+    n_index = table.index.nlevels
+    pairs = list(dict.fromkeys(table.columns.get_level_values('underlying_name')))
+    n_columns = n_index + table.shape[1]
+    lines = [r'\begin{tabular}{' + 'l' * n_index + 'r' * table.shape[1] + '}', r'\toprule']
+    header, rules, position = [], [], n_index + 1
+    for pair in pairs:
+        width = int((table.columns.get_level_values('underlying_name') == pair).sum())
+        header.append(rf'\multicolumn{{{width}}}{{c}}{{{pair_label(pair)}}}')
+        rules.append(rf'\cmidrule(lr){{{position}-{position + width - 1}}}')
+        position += width
+    lines.append(' & ' * n_index + ' & '.join(header) + r' \\')
+    lines.append(' '.join(rules))
+    lines.append('Moment' + ' & ' * n_index + ' & '.join(table.columns.get_level_values('market')) + r' \\')
+    lines.append(r'\midrule')
+    rows = list(table.index)
+    for i, (key, values) in enumerate(zip(rows, table.to_numpy(dtype=object))):
+        labels = []
+        for level in range(n_index):
+            first_of_group = i == 0 or rows[i - 1][:level + 1] != key[:level + 1]
+            if level < n_index - 1 and first_of_group:
+                size = sum(1 for other in rows if other[:level + 1] == key[:level + 1])
+                label = SHARPE_TARGET_LABELS.get(key[level], key[level]) if level == 0 else key[level]
+                labels.append(rf'\multirow[t]{{{size}}}{{*}}{{{label}}}')
+            elif level < n_index - 1:
+                labels.append('')
+            else:
+                labels.append(str(key[level]))
+        if i > 0:
+            # rule above a new group: across the whole table for a new target, from the regime column otherwise
+            changed = next((level for level in range(n_index - 1) if rows[i - 1][level] != key[level]), None)
+            if changed is not None:
+                lines.append(rf'\cline{{{changed + 1}-{n_columns}}}')
+        lines.append(' & '.join(labels + [cell(value) for value in values]) + r' \\')
+    lines += [r'\bottomrule', r'\end{tabular}']
+    return '\n'.join(lines) + '\n'
+
+
 def probabilistic_sharpe_ratio(pnl, benchmark=0.0, periods_per_year=360, vol_regime= False):
     if not vol_regime:
         pnl = pnl.droplevel(0, 1).groupby(['aggregated', 'target', 'transaction_fees', 'spread'])
@@ -613,10 +669,11 @@ def _trim_leading_nan(series: pd.Series) -> pd.Series:
 
 
 def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dict, mean_bar: pd.DataFrame,
-                         svix: pd.DataFrame, file_cutoff) -> tuple:
+                         svix: pd.DataFrame, file_cutoff, progress_bar: bool = True) -> tuple:
     """Backtest of one (target, pair): the strategy run over every day of the pair. Returns (target, pair, list of
     bar-level P&L frames in day order). The (target, pair) backtests share no state, so they can run in separate
-    processes (--cpu_count) with the same result as one after the other."""
+    processes (--cpu_count) with the same result as one after the other. progress_bar: the daily calibration's progress
+    bar, switched off in parallel processes (several processes drawing bars on one log breaks tqdm)."""
     global target, underlying_name                      # read by make_filter and objective_daily
     target, underlying_name = target_name, pair
     forecast_underlying_name = pd.IndexSlice
@@ -698,7 +755,7 @@ def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dic
                                 filter_signal=yesterday_filter, svix=yesterday_svix_underlying_name,
                                 target=target, tradable_assets=tradable_assets)
             try:
-                study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
+                study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=progress_bar,
                                n_jobs=N_JOBS, gc_after_trial=True)
                 lower_bound_moneyness, upper_bound_moneyness, threshold_filter = \
                     study.user_attrs['lower_bound_atm'], \
@@ -898,7 +955,7 @@ def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dic
             objective = partial(objective_daily, spot_data=yesterday_spot, data=yesterday_data, target=target,
                                 tradable_assets=tradable_assets)
             try:
-                study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=True,
+                study.optimize(objective, n_trials=N_TRIALS // 20, callbacks=[callback], show_progress_bar=progress_bar,
                                n_jobs=N_JOBS, gc_after_trial=True)
                 threshold_filter = study.user_attrs['threshold_filter']
             except (ValueError, KeyError, pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
@@ -1143,8 +1200,8 @@ if __name__ == '__main__':
         # each process gets its share of the CPUs for polars (read when the process starts)
         os.environ['POLARS_MAX_THREADS'] = str(max(1, available_cpus // n_workers))
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context('spawn')) as pool:
-            futures = [pool.submit(backtest_target_pair, t, p, args, data_per_target, mean_bar, svix, file_cutoff)
-                       for t, p in jobs]
+            futures = [pool.submit(backtest_target_pair, t, p, args, data_per_target, mean_bar, svix, file_cutoff,
+                                   False) for t, p in jobs]
             results = [future.result() for future in tqdm(as_completed(futures), total=len(futures),
                                                           desc='(target, pair) backtests')]
     for job_target, job_pair, job_pnl in results:
@@ -1320,14 +1377,13 @@ if __name__ == '__main__':
         tmp_sharpe.loc[:, pd.IndexSlice[:, '$X^{(S,O)}$']] = np.vectorize(_bold_if, otypes=[object])(
             sharpe_x_so.to_numpy(), ~xs_wins.to_numpy())
         with open(f'{args.target_path}/crypto_option_spot/'
-                  f'sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.txt',
+                  f'sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
                   'w') as sharpe_file:
-            sharpe_file.writelines(tmp_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
+            sharpe_file.write(sharpe_table_latex(tmp_sharpe.droplevel('aggregated', axis=0)))
         with open(f'{args.target_path}/crypto_option_spot/'
-                  f'proba_sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.txt',
+                  f'proba_sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
                   'w') as proba_sharpe_file:
-            proba_sharpe_file.writelines(
-                tmp_proba_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
+            proba_sharpe_file.write(sharpe_table_latex(tmp_proba_sharpe.droplevel('aggregated', axis=0)))
     start = datetime.fromisoformat(str(args.start_date))
     end = datetime.fromisoformat(str(args.end_date))
     rv = pl.scan_parquet(f'{args.target_path}/*/*/spot/*').select(['symbol', 'timestamp', 'mid_price[0]'])
@@ -1443,13 +1499,11 @@ if __name__ == '__main__':
         tmp_sharpe.loc[:, pd.IndexSlice[:, '$X^{(S,O)}$']] = np.vectorize(_bold_if, otypes=[object])(
             sharpe_per_volatility_regime_x_so.to_numpy(), ~xs_wins.to_numpy())
         with open(f'{args.target_path}/crypto_option_spot/'
-                  f'sharpe_per_volatility{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.txt',
+                  f'sharpe_per_volatility{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
                   'w') as sharpe_file:
-            sharpe_file.writelines(
-                tmp_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
+            sharpe_file.write(sharpe_table_latex(tmp_sharpe.droplevel('aggregated', axis=0)))
         with open(f'{args.target_path}/crypto_option_spot/'
                   f'proba_sharpe_per_volatility'
-                  f'{dict([(False, "_non_aggregated"),(True, "_aggregated")])[aggregated]}{fee_suffix}.txt',
+                  f'{dict([(False, "_non_aggregated"),(True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
                   'w') as proba_sharpe_file:
-            proba_sharpe_file.writelines(
-                tmp_proba_sharpe.droplevel('aggregated', axis=0).to_latex(escape=False, float_format='%.2f'))
+            proba_sharpe_file.write(sharpe_table_latex(tmp_proba_sharpe.droplevel('aggregated', axis=0)))
