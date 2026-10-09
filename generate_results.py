@@ -1426,6 +1426,7 @@ from tqdm_joblib import tqdm_joblib
 import random
 from constants import EARLY_STOPPING_PATIENCE
 from typing import Dict
+from generate_mase_best_models import select_best_models
 contemporanous_features = {'returns': ['m2', 'm3', 'm4', 'm5', 'm6'], 'RV': []}
 regression_dd = {'ml': ['LGBMRegressor'], 'dl': ['MLPRegressor']}
 model_names = {**model_names, 'MLPRegressor': 'mlp'}
@@ -1439,6 +1440,8 @@ MLP_LEARNING_RATE = 1e-3
 MLP_VALIDATION_FRACTION = 0.1
 MLP_SEED = 123
 FEAT_IMP_N_ITER = 5
+FEAT_IMP_TOP = 5                                    # features per row of the feature-importance table
+TABLE_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']   # pairs (rows) of the feature-importance table
 BASE_FREQ = '15min'
 MASE_FROM_FORECAST_ERROR = True
 EMBARGO_TRAINING = True
@@ -1815,38 +1818,43 @@ def run_for_target(target: str, args):
               f'and freq={REPORT_FREQS}.')
 
 
-def window_errors(forecast_df: pd.DataFrame, naive: pd.DataFrame) -> pd.DataFrame:
-    """Per pair: number of forecasts, mean |y - y_hat| and mean |y - y_naive| on the same forecasts, where y_naive is
-    the naive forecast y(t - D) (the out-of-sample MASE of the window is their ratio)."""
+def window_errors(forecast_df: pd.DataFrame, naive: pd.DataFrame, regimes: pd.DataFrame) -> pd.DataFrame:
+    """Per (pair, volatility regime): number of forecasts, mean |y - y_hat| and mean |y - y_naive| on the same
+    forecasts, where y_naive is the naive forecast y(t - D). Every forecast row takes the regime of its own timestamp
+    (as in the forecasting run), not the regime of the start of its window."""
     merged = forecast_df.assign(timestamp=pd.to_datetime(forecast_df['timestamp']).astype('datetime64[ns]'))
     merged = merged.merge(naive, on=['underlying_name', 'timestamp'], how='inner')
+    merged = merged.merge(regimes, on='timestamp', how='inner')
     merged = merged.dropna(subset=['y', 'y_hat', 'y_naive'])
     merged = merged.assign(abs_error=(merged['y'] - merged['y_hat']).abs(),
                            abs_error_naive=(merged['y'] - merged['y_naive']).abs())
-    return merged.groupby('underlying_name').agg(n=('abs_error', 'size'), abs_error=('abs_error', 'mean'),
-                                                 abs_error_naive=('abs_error_naive', 'mean'))
+    return merged.groupby(['underlying_name', 'volatility_regime'], observed=True).agg(
+        n=('abs_error', 'size'), abs_error=('abs_error', 'mean'), abs_error_naive=('abs_error_naive', 'mean'))
 
 
 def feature_importance_window(model, main_features_i: pl.DataFrame, target: str, market: int, D: str, freq: str,
-                              date_test, horizon_end, tmp_sum: int, seed: int, champion_regression: str,
-                              champion_regression_type: str) -> list:
-    """Feature importance of one test window. A module-level function that receives only its own window (features,
-    model): a worker process never holds the full feature set, so memory stays flat with --cpu_count."""
+                              date_test, horizon_end, tmp_sum: int, seed: int, regression: str,
+                              regression_type: str, pairs: list, regimes: pd.DataFrame) -> list:
+    """Feature importance of one test window of one (regression, freq, D, market) model, scored on the pairs whose
+    best model it is (`pairs`). A module-level function that receives only its own window (features, model, regimes):
+    a worker process never holds the full feature set, so memory stays flat with --cpu_count.
+    The noise added to a feature is scaled by its standard deviation over all pairs of the window, so the
+    perturbation of a pair does not depend on which other pairs selected the same model."""
     torch.set_num_threads(1)
     start = pd.Timestamp(date_test)
     horizon_end = pd.Timestamp(horizon_end)
 
-    def champion_forecast(mf: pl.DataFrame):
-        fc = evaluate_one_window(model=model, regression=champion_regression_type, target=target, freq=freq,
+    def model_forecast(mf: pl.DataFrame):
+        fc = evaluate_one_window(model=model, regression=regression_type, target=target, freq=freq,
                                  n_steps_ahead_scaler=tmp_sum, main_features=mf, keep_from=start,
                                  keep_to=horizon_end)
         return fc.loc[(fc.timestamp >= start) & (fc.timestamp < horizon_end) &
-                      (fc.regression == champion_regression.lower())]
+                      (fc.regression == regression.lower()) & fc.underlying_name.isin(pairs)]
     try:
-        baseline_forecast = champion_forecast(main_features_i)
+        baseline_forecast = model_forecast(main_features_i)
     except Exception as e:
         print(f'WARNING: baseline evaluate_one_window failed for feature importance window '
-              f'{date_test}/{champion_regression}/market={market}/D={D}/freq={freq} '
+              f'{date_test}/{regression}/market={market}/D={D}/freq={freq} '
               f'({type(e).__name__}: {e}) -- skipping window.')
         return []
     if baseline_forecast.empty:
@@ -1857,7 +1865,7 @@ def feature_importance_window(model, main_features_i: pl.DataFrame, target: str,
     naive = naive.rename(columns={target: 'y_naive'})
     naive['timestamp'] = (pd.to_datetime(naive['timestamp']) + pd.Timedelta(days=DAYS_CONVERTER[D])).astype(
         'datetime64[ns]')
-    baseline = window_errors(baseline_forecast, naive)
+    baseline = window_errors(baseline_forecast, naive, regimes)
     if baseline.empty:
         return []
     main_features_pd = main_features_i.to_pandas()
@@ -1872,90 +1880,53 @@ def feature_importance_window(model, main_features_i: pl.DataFrame, target: str,
         for _ in range(FEAT_IMP_N_ITER):
             main_features_pd[col] = original_col + rng_local.normal(scale=noise_scale, size=len(main_features_pd))
             try:
-                jittered_forecast = champion_forecast(pl.from_pandas(main_features_pd))
+                jittered_forecast = model_forecast(pl.from_pandas(main_features_pd))
             except Exception:
                 continue
             if jittered_forecast.empty:
                 continue
-            window_scores.append(window_errors(jittered_forecast, naive)['abs_error'])
+            window_scores.append(window_errors(jittered_forecast, naive, regimes)['abs_error'])
         main_features_pd[col] = original_col
         if not window_scores:
             continue
         jittered_error = pd.concat(window_scores, axis=1).mean(axis=1)        # averaged over the noise draws
-        for underlying_name, row in baseline.iterrows():
-            if underlying_name not in jittered_error.index or row['abs_error_naive'] == 0:
+        for (underlying_name, regime), row in baseline.iterrows():
+            if (underlying_name, regime) not in jittered_error.index or row['abs_error_naive'] == 0:
                 continue
-            records.append({'target': target, 'market': market, 'D': D, 'freq': freq,
-                            'regression': champion_regression, 'timestamp': date_test, 'feature': col,
-                            'underlying_name': underlying_name, 'n': int(row['n']),
-                            'abs_error': float(jittered_error[underlying_name]),
+            records.append({'target': target, 'market': market, 'D': D, 'freq': freq, 'regression': regression,
+                            'timestamp': date_test, 'feature': col, 'underlying_name': underlying_name,
+                            'volatility_regime': regime, 'n': int(row['n']),
+                            'abs_error': float(jittered_error[(underlying_name, regime)]),
                             'abs_error_baseline': float(row['abs_error']),
                             'abs_error_naive': float(row['abs_error_naive'])})
     return records
 
 
-def load_forecasts(target_path: str, target: str) -> pl.LazyFrame:
-    """Out-of-sample forecasts of `target` written by the forecasting run: forecasts.parquet when it exists, otherwise
-    the forecasts_{target}_market{0,1}.csv files (appended to by every run, so duplicates are dropped)."""
-    parquet = f'{target_path}/crypto_option_spot/forecasts.parquet'
-    keys = ['underlying_name', 'timestamp', 'regression', 'freq', 'target', 'market', 'D']
-    if os.path.exists(parquet):
-        forecasts = pl.scan_parquet(parquet).filter(pl.col('target') == target)
-    else:
-        paths = [f'{target_path}/crypto_option_spot/forecasts_{target}_market{market}.csv' for market in (0, 1)]
-        missing = [path for path in paths if not os.path.exists(path)]
-        if missing:
-            raise FileNotFoundError(f'feature importance needs the out-of-sample forecasts of target={target}: '
-                                    f'{missing} not found. Run the forecasting part (--feature_importance 0) first.')
-        forecasts = pl.concat([pl.scan_csv(path, schema_overrides={'timestamp': pl.String, 'market': pl.Int64})
-                               for path in paths])
-        forecasts = forecasts.with_columns(
-            pl.col('timestamp').str.to_datetime(format='%Y-%m-%d %H:%M:%S%z', time_unit='us').dt.convert_time_zone('UTC'))
-        forecasts = forecasts.unique(subset=keys, keep='last')
-    return forecasts.select(keys + ['y', 'y_hat'])
-
-
-def out_of_sample_mase(forecasts: pl.LazyFrame) -> pl.DataFrame:
-    """Out-of-sample MASE of every (regression, freq, underlying_name, D): mean |y - y_hat| divided by the mean
-    |y - y(t - D)| of the naive forecast (the realised value known at t), on the timestamps where both markets have a
-    forecast, averaged over the two markets (the definition of generate_mase_best_models.py)."""
-    keys = ['underlying_name', 'regression', 'freq', 'D']
-    horizon = pl.duration(days=pl.col('D').replace_strict(DAYS_CONVERTER, return_dtype=pl.Int64))
-    scores = []
-    for regression, freq in sorted(forecasts.select(['regression', 'freq']).unique().collect().rows()):
-        fc = forecasts.filter((pl.col('regression') == regression) & (pl.col('freq') == freq))
-        naive = (fc.select(['underlying_name', 'freq', 'D', 'timestamp', 'y'])
-                 .unique(subset=['underlying_name', 'freq', 'D', 'timestamp'])
-                 .with_columns((pl.col('timestamp') + horizon).alias('timestamp')).rename({'y': 'y_naive'}))
-        both = (fc.filter(pl.col('market') == 0).select(keys + ['timestamp', 'y', pl.col('y_hat').alias('y_hat_0')])
-                .join(fc.filter(pl.col('market') == 1).select(keys + ['timestamp', pl.col('y_hat').alias('y_hat_1')]),
-                      on=keys + ['timestamp'], how='inner')
-                .join(naive, on=['underlying_name', 'freq', 'D', 'timestamp'], how='inner')
-                .drop_nulls(['y', 'y_naive', 'y_hat_0', 'y_hat_1']))
-        scores.append(both.group_by(keys).agg(
-            ((pl.col('y') - pl.col('y_hat_0')).abs().mean() + (pl.col('y') - pl.col('y_hat_1')).abs().mean()) / 2
-            / (pl.col('y') - pl.col('y_naive')).abs().mean()).collect().rename({'y': 'MASE'}))
-    return pl.concat(scores)
-
-
-def run_feature_importance(target_path: str, target: str, args):
-    # champion (regression, freq): lowest out-of-sample MASE averaged over pairs and horizons, both markets
-    mase_by_model = out_of_sample_mase(load_forecasts(target_path, target))
-    mase_by_model = (mase_by_model.group_by(['regression', 'freq']).agg(pl.col('MASE').mean())
-                     .sort(['MASE', 'regression', 'freq']))
-    print(f'[FeatureImportance] target={target}: out-of-sample MASE per (regression, freq), averaged over pairs and '
-          f'horizons:\n{mase_by_model}')
-    champion_regression, champion_freq, champion_mase = mase_by_model.row(0)
+def run_feature_importance(target_path: str, target: str, args) -> pd.DataFrame:
+    """Top features of every (target, underlying_name, D, volatility regime), each (pair, D) scored with its own best
+    (regression, freq) of generate_mase_best_models.py (lowest out-of-sample MASE averaged over X^S and X^(S,O), whole
+    sample, as in generate_pnl.py). Returns the ranking (also written to features_importance_ranked_{target}.csv)."""
+    forecasts_path = f'{target_path}/crypto_option_spot/forecasts.parquet'
+    if not os.path.exists(forecasts_path):
+        raise FileNotFoundError(f'feature importance selects the best (regression, freq) of every (pair, D) from '
+                                f'{forecasts_path}, which does not exist: run csv_2_parquet.py first.')
+    best = select_best_models(forecasts_path).filter(pl.col('target') == target)
+    if best.is_empty():
+        raise ValueError(f'{forecasts_path} has no forecasts of target={target}')
+    print(f'[FeatureImportance] target={target}: best (regression, freq) per (pair, D):\n'
+          f'{best.select(["underlying_name", "D", "regression", "freq", "MASE", "basis"])}', flush=True)
     model_names_reverse = {v: k for k, v in model_names.items()}
-    champion_model_key = model_names_reverse[champion_regression.lower()]
-    champion_regression_type = 'dl' if champion_model_key == 'MLPRegressor' else 'ml'
-    print(
-        f'[FeatureImportance] target={target}: '
-        f'champion regression={champion_regression!r} '
-        f'({champion_model_key}, type={champion_regression_type}), best with freq={champion_freq}, '
-        f'out-of-sample champion_mase={champion_mase:.6f}. '
-        f'Forecasting every (D, freq) pair with D in {D_LIST} and freq in {REPORT_FREQS}.'
-    )
+    regression_types = {r: 'dl' if model_names_reverse[r.lower()] == 'MLPRegressor' else 'ml'
+                        for r in best['regression'].unique().to_list()}
+    # the models to train and evaluate: one per (D, regression, freq) selected by at least one pair; the pairs it
+    # is scored on are those that selected it (the models are trained on all pairs, as in the forecasting run)
+    pairs_by_model = {(D, regression, freq): sorted(g['underlying_name'].to_list())
+                      for (D, regression, freq), g in best.group_by(['D', 'regression', 'freq'])}
+    models = sorted(pairs_by_model)
+    model_Ds = sorted({D for D, _, _ in models}, key=D_LIST.index)
+    model_freqs = sorted({freq for _, _, freq in models}, key=REPORT_FREQS.index)
+    print(f'[FeatureImportance] target={target}: {len(models)} (D, regression, freq) model(s) to evaluate: '
+          f'{models}', flush=True)
     dates = pd.date_range(args.start_date, args.end_date, freq='1D', tz=pytz.UTC, inclusive='left').date.tolist()
     volatility_regime = pl.scan_parquet(f'{args.target_path}/spot_features.parquet')
     volatility_regime = volatility_regime.filter((pl.col('target') == 'RV') & (pl.col('freq') == '15min'))
@@ -1972,6 +1943,12 @@ def run_feature_importance(target_path: str, target: str, args):
                                                pd.to_datetime(args.end_date, utc=True).date())]
     volatility_regime.index.name = 'timestamp'
     volatility_regime = volatility_regime.reset_index()
+    # the forecasts carry naive UTC timestamps (the feature timestamps are made naive below)
+    volatility_regime['timestamp'] = (pd.to_datetime(volatility_regime['timestamp'], utc=True)
+                                      .dt.tz_localize(None).astype('datetime64[ns]'))
+    volatility_regime['volatility_regime'] = volatility_regime['volatility_regime'].astype(str)
+    regimes_by_freq = {freq: g[['timestamp', 'volatility_regime']].sort_values('timestamp').reset_index(drop=True)
+                       for freq, g in volatility_regime.groupby('freq')}
     features = pl.scan_parquet(f'{args.target_path}/spot_features.parquet').filter(pl.col('target') == target).collect()
     features = features.with_columns([pl.col('features_values').cast(pl.Float32, strict=False)])
     features = features.pivot(values='features_values',
@@ -1989,7 +1966,7 @@ def run_feature_importance(target_path: str, target: str, args):
     main_features_base = main_features_base.with_columns(pl.col('timestamp').dt.replace_time_zone(None))
     check_base_grid(main_features_base)
     main_features_by_D = dict()
-    for D, freq in itertools.product(D_LIST, REPORT_FREQS):
+    for D, freq in itertools.product(model_Ds, model_freqs):
         n_heads_agg = int(pd.to_timedelta(DAYS_CONVERTER[D], unit='d') // pd.to_timedelta(BASE_FREQ))
         rolled = (main_features_base.sort(['underlying_name', 'timestamp']).with_columns(pl.col(target).rolling_sum(
                     window_size=n_heads_agg, min_samples=n_heads_agg).shift(-(n_heads_agg - 1)).over('underlying_name')
@@ -2008,26 +1985,18 @@ def run_feature_importance(target_path: str, target: str, args):
             (main_features_by_D[(D, freq)]['timestamp'] <
              pl.lit(d - relativedelta(days=embargo_days(D))))
         )
-        for d, D, freq in itertools.product(date_grid, D_LIST, REPORT_FREQS)
+        for d, (D, _, freq) in itertools.product(date_grid, models)
     }
-    date_grid_regressions_markets_Ds_freqs = \
-        list(itertools.product(date_grid, [champion_regression_type], [0, 1], D_LIST, REPORT_FREQS))
-    print(
-        f'[FeatureImportance] '
-        f'{len(date_grid_regressions_markets_Ds_freqs)} '
-        f'(date, market, D, freq) windows to train '
-        f'across {args.cpu_count} worker(s) '
-        f'for target={target}, '
-        f'regression_type={champion_regression_type}.'
-    )
-
+    training_windows = [(date, D, regression_types[regression], freq, market)
+                        for date, (D, regression, freq), market in itertools.product(date_grid, models, [0, 1])]
+    print(f'[FeatureImportance] {len(training_windows)} (date, D, regression, freq, market) windows to train across '
+          f'{args.cpu_count} worker(s) for target={target}.', flush=True)
     with tqdm_joblib(tqdm(desc=f'Feature importance training windows (target={target})',
-                          total=len(date_grid_regressions_markets_Ds_freqs))
-    ):
+                          total=len(training_windows))):
         trained_models = dict(Parallel(n_jobs=args.cpu_count, backend='loky')(delayed(train_one_window)(
-            date, main_features_by_D[(D, freq)].filter(date_masks[(date, D, freq)]), champion_regression_type,
+            date, main_features_by_D[(D, freq)].filter(date_masks[(date, D, freq)]), regression_type,
             market, D, target, freq, L_days)
-            for date, _, market, D, freq in date_grid_regressions_markets_Ds_freqs))
+            for date, D, regression_type, freq, market in training_windows))
     date_grid_np = np.array(date_grid)
     end = np.datetime64(args.end_date)
     date_grid_test_by_D = dict()
@@ -2035,7 +2004,7 @@ def run_feature_importance(target_path: str, target: str, args):
     in_sample_dates_by_D = dict()
     horizon_dates_by_D = dict()
     n_steps_ahead_scaler_by_D_freq = dict()
-    for D, freq in itertools.product(D_LIST, REPORT_FREQS):
+    for D, freq in itertools.product(model_Ds, model_freqs):
         D_days = DAYS_CONVERTER[D]
         grid_test = dates[dates.index(date_grid[0])::D_days]
         date_masks_tests_by_D[(D, freq)] = {
@@ -2064,54 +2033,134 @@ def run_feature_importance(target_path: str, target: str, args):
     window_stride = 5
     tasks = []
     for market in [1, 0]:
-        for D in D_LIST:
-            for freq in REPORT_FREQS:
-                date_grid_test = date_grid_test_by_D[(D, freq)]
-                windows_to_run = [i for i in range(len(date_grid_test)) if i % window_stride == 0]
-                tasks += [(market, D, freq, i) for i in windows_to_run]
+        for D, regression, freq in models:
+            date_grid_test = date_grid_test_by_D[(D, freq)]
+            windows_to_run = [i for i in range(len(date_grid_test)) if i % window_stride == 0]
+            tasks += [(market, D, regression, freq, i) for i in windows_to_run]
 
     def window_jobs():
-        """One job per window, built when joblib asks for it: only that window's features and model are sent to a
-        worker, and only a few windows exist at a time."""
-        for market, D, freq, i in tasks:
+        """One job per window, built when joblib asks for it: only that window's features, model and regimes are
+        sent to a worker, and only a few windows exist at a time."""
+        for market, D, regression, freq, i in tasks:
             date_test = date_grid_test_by_D[(D, freq)][i]
+            horizon_end = horizon_dates_by_D[(D, freq)][i]
             trained_entry = resolve_trained_entry(trained_models, date_grid, in_sample_dates_by_D[(D, freq)][i],
-                                                  champion_regression_type, market, D, freq)
+                                                  regression_types[regression], market, D, freq)
             if trained_entry is None:
                 continue
             main_features_i = filter_market_features(
                 main_features_by_D[(D, freq)].filter(date_masks_tests_by_D[(D, freq)][date_test]), target, market)
+            regimes = regimes_by_freq[freq]
+            regimes = regimes.loc[(regimes['timestamp'] >= pd.Timestamp(date_test)) &
+                                  (regimes['timestamp'] < pd.Timestamp(horizon_end))]
             yield delayed(feature_importance_window)(
-                trained_entry[0], main_features_i, target, market, D, freq, date_test,
-                horizon_dates_by_D[(D, freq)][i], n_steps_ahead_scaler_by_D_freq[(D, freq)][i], 123 + i,
-                champion_regression, champion_regression_type)
-    print(f'[FeatureImportance] {len(tasks)} (market, D, freq, window) tasks to evaluate across '
-          f'{args.cpu_count} worker(s) for target={target}.')
+                trained_entry[0], main_features_i, target, market, D, freq, date_test, horizon_end,
+                n_steps_ahead_scaler_by_D_freq[(D, freq)][i], 123 + i, regression, regression_types[regression],
+                pairs_by_model[(D, regression, freq)], regimes)
+    print(f'[FeatureImportance] {len(tasks)} (market, D, regression, freq, window) tasks to evaluate across '
+          f'{args.cpu_count} worker(s) for target={target}.', flush=True)
     with tqdm_joblib(tqdm(desc=f'Feature importance windows (target={target})', total=len(tasks))):
         results = Parallel(n_jobs=args.cpu_count, backend='loky', pre_dispatch='2*n_jobs')(window_jobs())
-    importance_records = [record for window_records in results for record in window_records]
-    importance_df = pd.DataFrame(importance_records)
-    importance_df['timestamp'] = pd.to_datetime(importance_df['timestamp'], utc=True)
-    importance_df = pd.merge(importance_df, volatility_regime, on=['timestamp', 'freq'], how='left')
-    # out-of-sample MASE of each group and pair = mean absolute error over all its forecasts / mean absolute error
-    # of the naive forecast over the same forecasts; then averaged over the pairs (each pair has its own scale)
-    group = ['target', 'market', 'D', 'volatility_regime', 'freq', 'regression', 'feature']
+    importance_df = pd.DataFrame([record for window_records in results for record in window_records])
+    if importance_df.empty:
+        raise ValueError(f'feature importance of target={target} produced no record: check the warnings above')
+    # out-of-sample MASE of each (pair, D, regime, market, feature) = mean absolute error over all its forecasts /
+    # mean absolute error of the naive forecast over the same forecasts (every pair has one model per D)
+    group = ['target', 'underlying_name', 'D', 'volatility_regime', 'market', 'regression', 'freq', 'feature']
     for column in ['abs_error', 'abs_error_baseline', 'abs_error_naive']:
         importance_df[f'{column}_sum'] = importance_df[column] * importance_df['n']
-    per_pair = importance_df.groupby(group + ['underlying_name'], observed=True)[
-        ['abs_error_sum', 'abs_error_baseline_sum', 'abs_error_naive_sum']].sum()
-    per_pair['MASE'] = per_pair['abs_error_sum'] / per_pair['abs_error_naive_sum']
-    per_pair['MASE_baseline'] = per_pair['abs_error_baseline_sum'] / per_pair['abs_error_naive_sum']
-    averaged = per_pair.groupby(group, observed=True)[['MASE', 'MASE_baseline']].mean().reset_index()
+    per_market = importance_df.groupby(group, observed=True).agg(
+        n=('n', 'sum'), abs_error_sum=('abs_error_sum', 'sum'), abs_error_baseline_sum=('abs_error_baseline_sum', 'sum'),
+        abs_error_naive_sum=('abs_error_naive_sum', 'sum'))
+    per_market['MASE'] = per_market['abs_error_sum'] / per_market['abs_error_naive_sum']
+    per_market['MASE_baseline'] = per_market['abs_error_baseline_sum'] / per_market['abs_error_naive_sum']
     # relative_MASE > 1: perturbing the feature worsens the forecasts, i.e. the feature matters
-    averaged['relative_MASE'] = averaged['MASE'] / averaged['MASE_baseline']
-    averaged['regression'] = averaged['regression'].str.lower()
+    per_market['relative_MASE'] = per_market['MASE'] / per_market['MASE_baseline']
+    per_market = per_market[['n', 'MASE', 'MASE_baseline', 'relative_MASE']].reset_index()
     detail_path = f'{args.target_path}/crypto_option_spot/features_importance_{target}.csv'
-    averaged.to_csv(detail_path, mode='w', header=True, index=False)
-    print(f'[Done] target={target}: out-of-sample feature MASE computed for champion regression='
-          f'{champion_regression!r} ({champion_regression_type}, champion_mase={champion_mase:.6f}), '
-          f'averaged over every {window_stride}th test window across D={D_LIST} x freq={REPORT_FREQS}, '
-          f'{averaged["feature"].nunique()} features, and stored with relative_MASE.')
+    per_market.to_csv(detail_path, mode='w', header=True, index=False)
+    # averaged over X^S and X^(S,O); an option feature exists in X^(S,O) only, so it is ranked on X^(S,O) alone
+    ranked = (per_market.groupby([c for c in group if c != 'market'], observed=True)
+              .agg(relative_MASE=('relative_MASE', 'mean'), n_markets=('market', 'nunique')).reset_index())
+    ranked = ranked.sort_values(['target', 'underlying_name', 'D', 'volatility_regime', 'relative_MASE', 'feature'],
+                                ascending=[True, True, True, True, False, True])
+    ranked['rank'] = ranked.groupby(['target', 'underlying_name', 'D', 'volatility_regime']).cumcount() + 1
+    ranked_path = f'{args.target_path}/crypto_option_spot/features_importance_ranked_{target}.csv'
+    ranked.to_csv(ranked_path, mode='w', header=True, index=False)
+    print(f'[Done] target={target}: out-of-sample feature importance of {len(models)} best (D, regression, freq) '
+          f'model(s), every {window_stride}th test window, {ranked["feature"].nunique()} features; per market in '
+          f'{detail_path}, ranking (averaged over the markets) in {ranked_path}.', flush=True)
+    return ranked
+
+
+def pair_label(pair: str) -> str:
+    """Display name of a pair in the tables: BTCUSDT -> BTC/USDT."""
+    return pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') and '/' not in pair else pair
+
+
+def feature_importance_latex(ranked: pd.DataFrame, top: int = FEAT_IMP_TOP) -> str:
+    """The top `top` features of every (target, pair, D, volatility regime) with their relative MASE, as a LaTeX
+    table (needs the booktabs, multirow, graphicx and float packages)."""
+    ranked = ranked[ranked['rank'] <= top]
+    escape = lambda text: str(text).replace('_', r'\_')
+    cell = {key: g.sort_values('rank') for key, g in
+            ranked.groupby(['target', 'underlying_name', 'D', 'volatility_regime'], observed=True)}
+    targets = [t for t in TARGET_LIST if t in ranked['target'].unique()][::-1]       # returns first, then RV
+    regimes = [r for r in VOL_REGIMES if r in ranked['volatility_regime'].unique()]
+    rows = {target: {pair: [D for D in D_LIST if any((target, pair, D, r) in cell for r in regimes)]
+                     for pair in TABLE_PAIRS} for target in targets}
+    rows = {target: {pair: Ds for pair, Ds in pairs.items() if Ds} for target, pairs in rows.items()}
+    n_columns = 4 + 2 * top
+    lines = [r'\begin{table}[H]', r'    \centering', r'    \resizebox{\textwidth}{!}{',
+             r'        \begin{tabular}{llll|' + '|'.join(['ll'] * top) + '}', r'            \toprule',
+             '            &  &  &  & ' + ' & '.join(
+                 rf'\multicolumn{{2}}{{c{"|" if k < top else ""}}}{{Rank {k}}}' for k in range(1, top + 1)) + r' \\',
+             '            ' + ' & ' * (n_columns - 1) + r'\\', r'            \midrule']
+    for i_target, target in enumerate(rows):
+        if i_target > 0:
+            lines.append(rf'            \cline{{1-{n_columns}}}')
+        n_target = sum(len(Ds) for Ds in rows[target].values()) * len(regimes)
+        for i_pair, (pair, Ds) in enumerate(rows[target].items()):
+            if i_pair > 0:
+                lines.append(rf'            \cline{{2-{n_columns}}}')
+            for i_D, D in enumerate(Ds):
+                if i_D > 0:
+                    lines.append(rf'            \cline{{3-{n_columns}}}')
+                for i_regime, regime in enumerate(regimes):
+                    first = [rf'\multirow[t]{{{n_target}}}{{*}}{{{escape(target)}}}'
+                             if i_pair == 0 and i_D == 0 and i_regime == 0 else '',
+                             rf'\multirow[t]{{{len(Ds) * len(regimes)}}}{{*}}{{{escape(pair_label(pair))}}}'
+                             if i_D == 0 and i_regime == 0 else '',
+                             rf'\multirow[t]{{{len(regimes)}}}{{*}}{{\textit{{{D.lower()}}}}}' if i_regime == 0 else '',
+                             rf'\textit{{{regime.lower()}}}']
+                    g = cell.get((target, pair, D, regime))
+                    values = [] if g is None else [f'{escape(r.feature)} & {r.relative_MASE:.4f}'
+                                                   for r in g.itertuples()]
+                    values += ['-- & --'] * (top - len(values))
+                    lines.append('            ' + ' & '.join(first) + '\n            & ' + ' & '.join(values) + r' \\')
+    lines += [r'            \bottomrule', r'        \end{tabular}', r'    }',
+              rf'    \caption{{Top {top} predictive features by target, pair, forecast horizon and volatility regime. '
+              r'Each (pair, horizon) uses its best (regression, frequency), the one with the lowest out-of-sample '
+              r'MASE averaged over $X^S$ and $X^{(S,O)}$. The value is the relative MASE: the out-of-sample MASE '
+              r'with the feature perturbed by Gaussian noise divided by the MASE without perturbation, averaged over '
+              r'$X^S$ and $X^{(S,O)}$ (over $X^{(S,O)}$ alone for option features); above 1, the feature matters.}',
+              r'    \label{tab:featureimportance}', r'\end{table}']
+    return '\n'.join(lines) + '\n'
+
+
+def write_feature_importance_table(target_path: str) -> None:
+    """Pooled LaTeX table of both targets from the features_importance_ranked_{target}.csv files that exist."""
+    folder = f'{target_path}/crypto_option_spot'
+    paths = [f'{folder}/features_importance_ranked_{target}.csv' for target in TARGET_LIST]
+    paths = [path for path in paths if os.path.exists(path)]
+    if not paths:
+        print('WARNING: no features_importance_ranked_*.csv found -- no feature-importance table written.')
+        return
+    ranked = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
+    path = f'{folder}/features_importance.tex'
+    with open(path, 'w') as file:
+        file.write(feature_importance_latex(ranked))
+    print(f'[Done] pooled feature-importance table (top {FEAT_IMP_TOP}) written to {path}', flush=True)
 
 
 if __name__ == "__main__":
@@ -2135,4 +2184,6 @@ if __name__ == "__main__":
             run_for_target(target, args)
         else:
             run_feature_importance(args.target_path, target, args)
+    if args.feature_importance != 0:
+        write_feature_importance_table(args.target_path)
     print('[Done] All targets, markets, D, and reporting frequencies processed.')
