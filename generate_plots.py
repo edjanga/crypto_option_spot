@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 import polars as pl
 from itertools import product
 from pathlib import Path
+from generate_mase_best_models import select_best_models
 
 ########################################################################################################################
 ## Order
@@ -120,14 +121,6 @@ if __name__ == '__main__':
                         default='../data_centre')
     args = parser.parse_args()
     print(args)
-    mase = pd.read_csv(f'{args.target_path}/crypto_option_spot/metric.csv')
-    mase = mase.set_index('D')
-    model_ranking = mase.groupby(by=[pd.Grouper(key='target'),
-                                     pd.Grouper(key='regression'),
-                                     pd.Grouper(key='freq')])[['MASE']].mean()
-    mase_comparison = \
-        model_ranking.groupby(['target', 'regression', 'freq'])['MASE'].mean().groupby(level='target').idxmin()
-    best_model_tags = model_ranking.groupby('target').idxmin().to_dict()['MASE']
     ####################################################################################################################
     ## Crypto SVIX, RV, and VRP
     ####################################################################################################################
@@ -146,19 +139,33 @@ if __name__ == '__main__':
         ## Crypto SVIX, RV, and VRP
         ####################################################################
         forecasts_parquet = Path(f'{args.target_path}/crypto_option_spot/forecasts.parquet')
+        if not forecasts_parquet.exists():
+            raise FileNotFoundError(f'{forecasts_parquet} does not exist: run csv_2_parquet.py first.')
+        # every (pair, horizon) shows the RV forecasts of its own best (regression, freq), selected as in
+        # generate_mase_best_models.py and generate_pnl.py: lowest out-of-sample MASE averaged over X^S and X^(S,O)
+        best_rv = select_best_models(str(forecasts_parquet)).filter(pl.col('target') == 'RV')
+        print(f'Best (regression, freq) per (pair, D) for RV:\n{best_rv}')
+        best_rv = {(row['underlying_name'], row['D']): (row['regression'], row['freq'])
+                   for row in best_rv.iter_rows(named=True)}
         rv_cols = ['timestamp', 'underlying_name', 'y_hat', 'y', 'regression', 'target', 'D', 'market', 'freq']
-        regression, freq = best_model_tags['RV'][1:]
-        if forecasts_parquet.exists():
-            rv = pl.scan_parquet(str(forecasts_parquet)).select(rv_cols).filter((pl.col('target') == 'RV')
-                                                                                & (pl.col('freq') == freq)
-                                                                                & (pl.col('regression') == regression))
+        rv_all = pl.scan_parquet(str(forecasts_parquet)).select(rv_cols).filter(pl.col('target') == 'RV')
+
+        def best_rv_forecasts(pair: str, D: str):
+            """RV forecasts and realised values of (pair, D) from its best (regression, freq), one row per market and
+            bar of that freq. Returns (frame, regression, freq), or None when the (pair, D) has no selected model."""
+            model = best_rv.get((pair, D))
+            if model is None:
+                return None
+            regression, freq = model
+            rv = rv_all.filter((pl.col('underlying_name') == pair) & (pl.col('D') == D)
+                               & (pl.col('regression') == regression) & (pl.col('freq') == freq))
             rv = rv.drop(['freq']).with_columns([pl.col('timestamp').cast(pl.Datetime('ms')),
                                                  pl.col('y_hat').alias('forecast'), pl.col('y').alias('rv')])
-        rv = rv.sort(['underlying_name', 'market', 'D', 'timestamp'])
-
-        rv = rv.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
-                                 group_by=['underlying_name', 'market', 'D'])
-        rv = rv.agg([pl.col('regression').last(), pl.col('forecast').sum(), pl.col('rv').sum()])
+            rv = rv.sort(['underlying_name', 'market', 'D', 'timestamp'])
+            rv = rv.group_by_dynamic(index_column='timestamp', every=freq.replace('in', ''),
+                                     group_by=['underlying_name', 'market', 'D'])
+            rv = rv.agg([pl.col('regression').last(), pl.col('forecast').sum(), pl.col('rv').sum()])
+            return rv, regression, freq
         ####################################################################
         ## Plot SVIX, RV, and VRP
         ####################################################################
@@ -172,7 +179,12 @@ if __name__ == '__main__':
             for D, pair in product(list(d_order.categories), list(pairs_order.categories)):
                 tmp_pair = tmp_crypto_svix.xs(D, axis=0, level=0, drop_level=False)
                 tmp_pair = tmp_pair.query(f'underlying_name == "{pair}"')
-                rv_pair = rv.filter((pl.col('underlying_name') == pair) & (pl.col('D') == D.upper()))
+                selected = best_rv_forecasts(pair, D.upper())
+                if selected is None:
+                    print(f'WARNING: no selected RV model for {pair} {D} -- subplot left empty.')
+                    continue
+                rv_pair, regression, freq = selected
+                print(f'{pair} {D}: RV forecasts of {regression} {freq}')
                 rv_pair = rv_pair.collect().to_pandas().drop('regression', axis=1)
                 rv_pair = rv_pair.groupby([pd.Grouper(key='market'), pd.Grouper(key='timestamp', freq=freq)])
                 rv_pair = rv_pair[['forecast', 'rv']].last()
@@ -244,5 +256,5 @@ if __name__ == '__main__':
                 size=LABEL_AXIS_FONT_SIZE), itemwidth=40, tracegroupgap=25, bgcolor='rgba(255,255,255,0.95)',
                                           bordercolor='rgba(0,0,0,0.3)', borderwidth=1))
             fig.write_image(
-                f'{args.target_figures}/rv_svix_vrp {dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
+                f'{args.target_figures}/rv_svix_vrp{dict([(True, ""), (False, "_non_aggregated")])[aggregated]}.pdf',
                 format='pdf')
