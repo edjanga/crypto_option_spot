@@ -1,11 +1,17 @@
+import os
+import argparse
+# --cpu_count must be known before polars is imported: polars sizes its thread pool once, at import
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument('--cpu_count', type=int, default=None)
+_cpu_count = _pre_parser.parse_known_args()[0].cpu_count
+if _cpu_count:
+    os.environ['POLARS_MAX_THREADS'] = str(_cpu_count)
 import itertools
 from pathlib import Path
 import pandas as pd
 import numpy as np
 from constants import DOTM, OTM, ITM, DITM, LABELS, SYMBOLS
-import argparse
 import polars as pl
-from scipy.stats.mstats import winsorize
 
 # pairs (columns) of the option summary table, in this order
 OPTION_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
@@ -17,6 +23,15 @@ FILES_PER_BATCH = 200
 # (constants.MONEYNESS_BINS only logs the two middle ones, and polars sorts unsorted breaks silently)
 MONEYNESS_LOG_BINS = list(np.log([DOTM, OTM, ITM, DITM]))
 TYPES = ['call', 'put']
+# spot summary: returns are built from the last mid price of every SPOT_FREQ bar
+SPOT_FREQ = '5m'
+BARS_PER_DAY = 288
+# days with fewer 5-minute returns than this are left out (incomplete days would understate the realised variance)
+MIN_BARS_PER_DAY = BARS_PER_DAY // 2
+# daily realised variance is printed in units of 10^-4 (multiplied by this factor), returns as they are
+RV_SCALE = 1e4
+SPOT_STATS = [('max', 'max'), ('mean', 'mean'), ('min', 'min'), ('75', r'75$^{\text{th}}$'),
+              ('50', r'50$^{\text{th}}$'), ('25', r'25$^{\text{th}}$')]
 STATS = ['max', 'mean', 'min']
 
 
@@ -50,6 +65,13 @@ def collect_fast(query: pl.LazyFrame) -> pl.DataFrame:
         return query.collect()
 
 
+def spot_bars(paths: list) -> pl.LazyFrame:
+    """Last mid price of every SPOT_FREQ bar of a set of spot files (bars labelled by their start)."""
+    spot = pl.scan_parquet(paths).select([pl.col('timestamp').cast(pl.Datetime('ms')), pl.col('mid_price[0]').alias('mid')])
+    spot = spot.filter(pl.col('mid') > 0)
+    return spot.group_by(pl.col('timestamp').dt.truncate(SPOT_FREQ).alias('bar')).agg(
+        pl.col('mid').sort_by('timestamp').last(), pl.col('timestamp').max().alias('last_update'))
+
 class EDA:
 
     def __init__(self, target_path: str):
@@ -79,7 +101,8 @@ class EDA:
                         pl.col('n').sum()).iter_rows():
                     categories[labels[category_index]] += n
                 stats = dict(categories=categories, total=int(rows['n'].sum()),
-                             strikes=rows.select(pl.col('strikes').explode().drop_nulls().n_unique()).item())
+                             strikes=len(set(strike for strikes in rows['strikes'].to_list() for strike in strikes
+                                               if strike is not None)))
                 for variable in ['moneyness', 'iv', 'ttm']:
                     n = rows[f'{variable}_n'].sum()
                     stats[variable] = dict(max=rows[f'{variable}_max'].max(), mean=rows[f'{variable}_sum'].sum() / n,
@@ -129,7 +152,10 @@ class EDA:
                   r'\mc{across each moneyness category}. The (max, mean, min) triplets represent the maximum, average, '
                   r'and minimum values of the variables \mc{across observations} in the dataset. The figures reported '
                   r'across the different moneyness categories indicate the number of contracts classified into each '
-                  r'category.}',
+                  r'category. Calls and puts share the same log-moneyness, strike, implied volatility and time-to-maturity '
+                  r'statistics because \deribit{} lists a call and a put for every strike and expiry, and both legs carry the '
+                  r'same mark implied volatility. For the same reason, the moneyness counts of calls and puts mirror each other: '
+                  r'a strike that is deep out of the money for the call is deep in the money for the put.}',
                   r'\label{tab:data_summary_option}', r'\label{tab:moneyness_obs}', r'\end{table}']
         return '\n'.join(lines) + '\n'
 
@@ -141,35 +167,79 @@ class EDA:
                 summary_file.write(self.option_latex(self.option_statistics()))
             print(f'[EXPORT]: Summary EDA table for options has been exported to {path}.')
             return
-        underlying_price = pl.scan_parquet(f'{self._target_path}/*/*/spot/*-*-*')
-        underlying_price = underlying_price.select(['symbol', 'timestamp', 'mid_price[0]'])
-        underlying_price = \
-            underlying_price.collect().pivot(index='timestamp', values='mid_price[0]', on='symbol').to_pandas()
-        underlying_price = underlying_price.set_index('timestamp').sort_index()
-        returns = np.log(underlying_price.div(underlying_price.shift())).resample('1D').sum()
-        returns = returns.apply(lambda x: winsorize(x, [.005, .005]))
-        rv = (np.log(underlying_price.div(underlying_price.shift()))).apply(lambda x: winsorize(x, [.005, .005]))
-        rv = rv.pow(2).resample('1D').sum()
-        freq = returns.index[1] - returns.index[0]
-        rv = rv.mul((pd.to_timedelta(360, unit='d')//freq) ** .5)
-        summary_eda['Returns'] = \
-            returns.agg(['max', 'mean', 'min', lambda x: x.quantile(.75), lambda x: x.quantile(.5),
-                         lambda x: x.quantile(.25)])
-        summary_eda['Returns'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
-        summary_eda['Annualised RV'] = rv.agg(['max', 'mean', 'min', lambda x: x.quantile(.75),
-                                               lambda x: x.quantile(.5), lambda x: x.quantile(.25)])
-        summary_eda['Annualised RV'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
-        summary_eda = pd.concat(summary_eda)[SYMBOLS]
-        summary_eda = summary_eda.style.format(decimal='.', thousands=',', precision=4)
-        with open(f'{self._target_path}/crypto_option_spot/summary.txt', 'w') as summary_file:
-            summary_file.writelines(summary_eda.to_latex())
-            print('[EXPORT]: Summary EDA table for the spot market has been exported.')
+        path = f'{self._target_path}/crypto_option_spot/data_summary_spot.tex'
+        with open(path, 'w') as summary_file:
+            summary_file.write(self.spot_latex(self.spot_statistics()))
+        print(f'[EXPORT]: Summary EDA table for the spot market has been exported to {path}.')
+
+    def spot_statistics(self) -> dict:
+        """Daily log returns and daily realised variance of every pair, from 5-minute log returns of the mid price:
+        the daily log return is the sum of the day's 5-minute log returns (close to close), the daily realised variance
+        the sum of their squares. Returns {pair: {'returns': {stat: value}, 'rv': {stat: value}, 'days': n}}."""
+        out = dict()
+        for pair in OPTION_PAIRS:
+            paths = sorted(str(path) for year in YEARS
+                           for path in Path(f'{self._target_path}/{pair}/{year}/spot').glob('*-*-*'))
+            if not paths:
+                print(f'WARNING: no spot file for {pair} in {YEARS} -- its column is left as NA.')
+                continue
+            bars = pl.concat([collect_fast(spot_bars(paths[start:start + FILES_PER_BATCH]))
+                              for start in range(0, len(paths), FILES_PER_BATCH)])
+            # a bar split across two batches (files overlapping midnight) keeps its latest price
+            bars = bars.sort(['bar', 'last_update']).group_by('bar', maintain_order=True).last()
+            returns = bars.select('bar', pl.col('mid').log().diff().alias('r')).drop_nulls()
+            daily = returns.group_by(pl.col('bar').dt.date().alias('date')).agg(
+                pl.col('r').sum().alias('returns'), pl.col('r').pow(2).sum().alias('rv'), pl.len().alias('n_bars'))
+            kept = daily.filter(pl.col('n_bars') >= MIN_BARS_PER_DAY)
+            print(f'[EDA] {pair}: {len(paths)} spot files, {daily.height} days, {daily.height - kept.height} day(s) '
+                  f'with fewer than {MIN_BARS_PER_DAY} 5-minute returns left out', flush=True)
+            out[pair] = dict(days=kept.height)
+            for variable in ['returns', 'rv']:
+                x = kept[variable]
+                out[pair][variable] = dict(max=x.max(), mean=x.mean(), min=x.min(),
+                                           **dict((q, x.quantile(int(q) / 100, interpolation='linear'))
+                                                  for q in ['75', '50', '25']))
+        return out
+
+    @staticmethod
+    def spot_latex(stats: dict) -> str:
+        """The spot summary table, in the layout of the paper."""
+        def number(value, scale=1., decimals=4):
+            return 'NA' if value is None or not np.isfinite(value) else f'{value * scale:.{decimals}f}'
+
+        lines = [r'\begin{table}[H]', r'\centering', r'\small', r'\setlength{\tabcolsep}{3pt}',
+                 r'\begin{tabular}{l l ' + 'r' * len(OPTION_PAIRS) + '}', r'\toprule',
+                 ' &  & ' + ' & '.join(pair_label(pair) for pair in OPTION_PAIRS) + r' \\', r'\midrule']
+        for i_variable, (variable, label, scale, decimals) in enumerate(
+                [('returns', 'Returns', 1., 4), ('rv', r'RV ($\times 10^{-4}$)', RV_SCALE, 2)]):
+            if i_variable:
+                lines.append(r'\midrule')
+            for i, (stat, name) in enumerate(SPOT_STATS):
+                first = rf'\multirow[c]{{{len(SPOT_STATS)}}}{{*}}{{{label}}}' if i == 0 else ''
+                values = [number(stats.get(pair, {}).get(variable, {}).get(stat), scale, decimals)
+                          for pair in OPTION_PAIRS]
+                lines.append(f'{first} & {name} & ' + ' & '.join(values) + r' \\')
+        lines += [r'\bottomrule', r'\end{tabular}',
+                  r'\caption{Summary statistics for daily \mc{log-}returns and daily realised variance (RV). '
+                  r'\edd{Both are computed from non-overlapping 5-minute log-returns of the mid price, 288 per day: the '
+                  r'daily log-return is their sum and the daily RV the sum of their squares. RV is reported in units of '
+                  r'$10^{-4}$.}}',
+                  r'\label{tab:data_summary_spot}', r'\end{table}']
+        return '\n'.join(lines) + '\n'
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Script generating all performance tables.')
     parser.add_argument('--target_path', type=str, help='Directory where database is located',
                         default='../data_centre')
+    parser.add_argument('--cpu_count', type=int, default=None,
+                        help='Number of CPUs polars may use (default: all the CPUs it can see).')
+    parser.add_argument('--table', type=str, default='both', choices=['option', 'spot', 'both'],
+                        help='Summary table(s) to export.')
     args = parser.parse_args()
+    print(f'polars uses {pl.thread_pool_size()} thread(s)', flush=True)
     eda_obj = EDA(target_path=args.target_path)
-    eda_obj.summary(options=True)
+    if args.table in ('option', 'both'):
+        eda_obj.summary(options=True)
+    if args.table in ('spot', 'both'):
+        eda_obj.summary(options=False)
