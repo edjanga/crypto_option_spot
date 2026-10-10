@@ -1,12 +1,53 @@
 import itertools
-import pdb
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from constants import MONEYNESS_BINS, LABELS, SYMBOLS
+from constants import DOTM, OTM, ITM, DITM, LABELS, SYMBOLS
 import argparse
 import polars as pl
 from scipy.stats.mstats import winsorize
+
+# pairs (columns) of the option summary table, in this order
+OPTION_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
+YEARS = list(range(2023, 2026))
+# option files aggregated per query: one query per batch bounds the size of a query plan; the streaming engine
+# bounds memory within a batch
+FILES_PER_BATCH = 200
+# moneyness in the option files is log(S/K): the category thresholds are the logs of the S/K ratios in constants.py
+# (constants.MONEYNESS_BINS only logs the two middle ones, and polars sorts unsorted breaks silently)
+MONEYNESS_LOG_BINS = list(np.log([DOTM, OTM, ITM, DITM]))
+TYPES = ['call', 'put']
+STATS = ['max', 'mean', 'min']
+
+
+def pair_label(pair: str) -> str:
+    return pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') else pair
+
+
+def option_aggregation(paths: list) -> pl.LazyFrame:
+    """One aggregation of a set of option files per (option type, moneyness category): number of rows, sum, count,
+    min and max of log-moneyness, mark IV and time to maturity, and the distinct strikes."""
+    chain = pl.scan_parquet(paths).select(['type', 'timestamp', 'strike_price', 'expiration', 'moneyness', 'mark_iv'])
+    # exact time to maturity in years of 360 days
+    ttm = (pl.col('expiration') - pl.col('timestamp')).dt.total_milliseconds() / (86_400_000 * 360)
+    # moneyness category 0..4 (DOTM..DITM for a call), intervals closed on the right as in polars' cut
+    category = pl.sum_horizontal([(pl.col('moneyness') > b).cast(pl.Int8) for b in MONEYNESS_LOG_BINS])
+    category = pl.when(pl.col('moneyness').is_null()).then(None).otherwise(category)
+    chain = chain.select('type', 'strike_price', category.alias('category'), pl.col('moneyness'),
+                         pl.col('mark_iv').alias('iv'), ttm.alias('ttm'))
+    return chain.group_by(['type', 'category']).agg(
+        [pl.len().alias('n'), pl.col('strike_price').unique().alias('strikes')] +
+        [expr for variable in ['moneyness', 'iv', 'ttm'] for expr in (
+            pl.col(variable).sum().alias(f'{variable}_sum'), pl.col(variable).count().alias(f'{variable}_n'),
+            pl.col(variable).min().alias(f'{variable}_min'), pl.col(variable).max().alias(f'{variable}_max'))])
+
+
+def collect_fast(query: pl.LazyFrame) -> pl.DataFrame:
+    """Runs a query on polars' streaming engine (bounded memory, all cores), or the default engine on old polars."""
+    try:
+        return query.collect(engine='streaming')
+    except TypeError:
+        return query.collect()
 
 
 class EDA:
@@ -14,193 +55,115 @@ class EDA:
     def __init__(self, target_path: str):
         self._target_path = target_path
 
+    def option_statistics(self) -> dict:
+        """Exact summary statistics of the option chains of every pair and option type, over every option file of
+        YEARS: number of observations per moneyness category and in total, (max, mean, min) of log-moneyness, mark IV
+        and time to maturity (means over all observations), and number of distinct strikes.
+        Every file is read once: a single aggregation query per batch of files, run on polars' streaming engine."""
+        out = dict()
+        for pair in OPTION_PAIRS:
+            paths = sorted(str(path) for year in YEARS
+                           for path in Path(f'{self._target_path}/{pair}/{year}/options').glob('*-*-*'))
+            if not paths:
+                print(f'WARNING: no option file for {pair} in {YEARS} -- its columns are left as NA.')
+                continue
+            parts = [collect_fast(option_aggregation(paths[start:start + FILES_PER_BATCH]))
+                     for start in range(0, len(paths), FILES_PER_BATCH)]
+            parts = pl.concat(parts)
+            print(f'[EDA] {pair}: {len(paths)} option files read', flush=True)
+            for option_type in TYPES:
+                rows = parts.filter(pl.col('type') == option_type)
+                labels = LABELS if option_type == 'call' else LABELS[::-1]   # a deep OTM call is a deep ITM put
+                categories = dict((label, 0) for label in LABELS)
+                for category_index, n in rows.filter(pl.col('category').is_not_null()).group_by('category').agg(
+                        pl.col('n').sum()).iter_rows():
+                    categories[labels[category_index]] += n
+                stats = dict(categories=categories, total=int(rows['n'].sum()),
+                             strikes=rows.select(pl.col('strikes').explode().drop_nulls().n_unique()).item())
+                for variable in ['moneyness', 'iv', 'ttm']:
+                    n = rows[f'{variable}_n'].sum()
+                    stats[variable] = dict(max=rows[f'{variable}_max'].max(), mean=rows[f'{variable}_sum'].sum() / n,
+                                           min=rows[f'{variable}_min'].min()) if n else None
+                out[(pair, option_type)] = stats
+        return out
+
+    @staticmethod
+    def option_latex(stats: dict) -> str:
+        """The option summary table, in the layout of the paper."""
+        columns = [(pair, option_type) for pair in OPTION_PAIRS for option_type in TYPES]
+
+        def count(value):
+            return 'NA' if value is None or value == 0 else f'{value:,}'
+
+        def number(value):
+            return 'NA' if value is None or not np.isfinite(value) else f'{value:.2f}'
+
+        def row(label, name, values):
+            return f' {label} & {name} & ' + ' & '.join(values) + r' \\'
+
+        def get(column, *keys):
+            value = stats.get(column)
+            for key in keys:
+                value = None if value is None else value.get(key) if isinstance(value, dict) else None
+            return value
+
+        lines = [r'\begin{table}[H]', r'\centering', r'\scriptsize', r'\setlength{\tabcolsep}{1.5pt}',
+                 r'\begin{tabular}{l l ' + 'r' * len(columns) + '}', r'\toprule',
+                 ' &  & ' + ' & '.join(rf'\multicolumn{{2}}{{c}}{{{pair_label(pair)}}}' for pair in OPTION_PAIRS)
+                 + r' \\',
+                 ' '.join(rf'\cmidrule(lr){{{3 + 2 * i}-{4 + 2 * i}}}' for i in range(len(OPTION_PAIRS))),
+                 ' & No. obs. & ' + ' & '.join(option_type.capitalize() for _, option_type in columns) + r' \\',
+                 r'\midrule']
+        for label in LABELS:
+            lines.append(row('', label, [count(get(c, 'categories', label)) for c in columns]))
+        lines += [r'\midrule', row('', 'Total', [count(get(c, 'total')) for c in columns]), r'\midrule']
+        for variable, label in [('moneyness', r'\textit{log m}'), ('strikes', None), ('iv', 'IV'), ('ttm', 'TTM')]:
+            if variable == 'strikes':
+                lines += [row('', 'Strikes', [count(get(c, 'strikes')) for c in columns]), r'\midrule']
+                continue
+            for i, stat in enumerate(STATS):
+                lines.append(row(label if i == 0 else '', stat, [number(get(c, variable, stat)) for c in columns]))
+            lines.append(r'\midrule' if variable != 'ttm' else r'\bottomrule')
+        lines += [r'\end{tabular}',
+                  r'\caption{Summary statistics of option chain data. We report the total number of observations '
+                  r'\mc{across each moneyness category}. The (max, mean, min) triplets represent the maximum, average, '
+                  r'and minimum values of the variables \mc{across observations} in the dataset. The figures reported '
+                  r'across the different moneyness categories indicate the number of contracts classified into each '
+                  r'category.}',
+                  r'\label{tab:data_summary_option}', r'\label{tab:moneyness_obs}', r'\end{table}']
+        return '\n'.join(lines) + '\n'
+
     def summary(self, options: bool = True) -> None:
         summary_eda = dict()
         if options:
-            moneyness_eda, iv_eda, strikes_eda, time2mat_eda, trading_days, n_obs_eda = \
-                dict(), dict(), dict(), dict(), dict(), dict()
-            for symbol, year in itertools.product(SYMBOLS, list(range(2023, 2026))):
-                paths = list(Path(f'{self._target_path}/{symbol}/{year}/options').glob('*-*-*'))
-                if len(paths) == 0:
-                    continue
-                chunksize = len(paths)//13
-                for chunk in list(range(0, chunksize, len(paths)+1)):
-                    option_chain = pl.scan_parquet(paths[chunk:chunk+chunksize])
-                    option_chain = \
-                        option_chain.select(['symbol', 'underlying_name', 'timestamp', 'type', 'strike_price',
-                                             'expiration', 'moneyness', 'mid_price', 'mark_iv'])
-                    option_chain = option_chain.with_columns(
-                        ((pl.col('expiration')-pl.col('timestamp')).dt.total_days()/360).alias('tau'))
-                    option_chain = \
-                        option_chain.with_columns(pl.when(pl.col('type') == 'call').then(pl.col('moneyness').cut(
-                        breaks=MONEYNESS_BINS, labels=LABELS)).when(pl.col('type') == 'put').then(pl.col('moneyness')
-                        .cut(breaks=MONEYNESS_BINS, labels=LABELS[::-1])).otherwise(None).alias('moneyness_label'))
-                    ####################################################################################################
-                    ## MONEYNESS
-                    ####################################################################################################
-                    moneyness_label = option_chain.select(['underlying_name', 'type', 'moneyness_label', 'moneyness'])
-                    moneyness_label = \
-                        moneyness_label.sort(by=[pl.col('underlying_name'), pl.col('type'), pl.col('moneyness_label')])
-                    moneyness = moneyness_label.group_by(['underlying_name', 'type', 'moneyness_label']).agg(
-                        pl.len().alias(''), pl.col('moneyness').min().alias('min'),
-                        pl.col('moneyness').mean().alias('mean'), pl.col('moneyness').max().alias('max')
-                    ).collect().to_pandas()
-                    tmp_moneyness_label = pd.pivot(moneyness.iloc[:, :4].dropna(),
-                                                   columns=['underlying_name', 'type'], index='moneyness_label',
-                                                   values='')
-                    tmp_moneyness_label = tmp_moneyness_label.loc[['DOTM', 'OTM', 'ATM', 'ITM', 'DITM'], :]
-                    tmp_moneyness_values = \
-                        moneyness.drop(['', 'moneyness_label'], axis=1).groupby(['underlying_name', 'type'])
-                    tmp_moneyness_values = \
-                        tmp_moneyness_values.agg({'min': 'min', 'mean': 'mean', 'max': 'max'}).transpose()
-                    tmp_moneyness_values = tmp_moneyness_values.loc[['max', 'mean', 'min'], :]
-                    tmp_moneyness = pd.concat([tmp_moneyness_label, tmp_moneyness_values])
-                    tmp_moneyness.index = pd.MultiIndex.from_product([['$\log m$'],
-                                                                      ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM',
-                                                                       'max', 'mean', 'min']])
-                    if moneyness_eda.get(symbol) is None:
-                        moneyness_eda[symbol] = tmp_moneyness
-                    else:
-                        moneyness_eda[symbol].iloc[:-3, :] = \
-                            moneyness_eda[symbol].iloc[:-3, :].add(tmp_moneyness.iloc[:-3, :])
-                        ############################################### CALL ###########################################
-                        moneyness_eda[symbol].iloc[-3, 0] = \
-                            tmp_moneyness.iloc[-3, 0] if tmp_moneyness.iloc[-3, 0] > moneyness_eda[symbol].iloc[-3, 0] \
-                                else moneyness_eda[symbol].iloc[-3, 0]
-                        moneyness_eda[symbol].iloc[-2, 0] = \
-                            .5*(tmp_moneyness.iloc[-2, 0]+moneyness_eda[symbol].iloc[-2, 0])
-                        moneyness_eda[symbol].iloc[-3, 0] = \
-                            tmp_moneyness.iloc[-1, 0] if tmp_moneyness.iloc[-1, 0] < moneyness_eda[symbol].iloc[-1, 0] \
-                                else moneyness_eda[symbol].iloc[-1, 0]
-                        ############################################### PUT ############################################
-                        moneyness_eda[symbol].iloc[-3, 1] = \
-                            tmp_moneyness.iloc[-3, 1] if tmp_moneyness.iloc[-3, 1] > moneyness_eda[symbol].iloc[-3, 1] \
-                                else moneyness_eda[symbol].iloc[-3, 1]
-                        moneyness_eda[symbol].iloc[-2, 1] = .5 * (
-                                    tmp_moneyness.iloc[-2, 1] + moneyness_eda[symbol].iloc[-2, 1])
-                        moneyness_eda[symbol].iloc[-3, 1] = \
-                            tmp_moneyness.iloc[-1, 1] if tmp_moneyness.iloc[-1, 1] < moneyness_eda[symbol].iloc[-1, 1] \
-                                else moneyness_eda[symbol].iloc[-1, 1]
-                    ####################################################################################################
-                    ## IV
-                    ####################################################################################################
-                    iv = option_chain.select(['underlying_name', 'type', 'mark_iv'])
-                    iv = iv.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                    iv = iv.group_by(['underlying_name', 'type']).agg(pl.col('mark_iv').min().alias('min'),
-                                                                      pl.col('mark_iv').mean().alias('mean'),
-                                                                      pl.col('mark_iv').max().alias('max'),
-                                                                      pl.col('mark_iv').quantile(0.75).alias('75'),
-                                                                      pl.col('mark_iv').quantile(0.50).alias('50'),
-                                                                      pl.col('mark_iv').quantile(0.25).alias('25'),
-                                                                      ).collect()
-                    iv = \
-                        iv.to_pandas().set_index(['underlying_name', 'type']).transpose().loc[
-                        ['max', 'mean', 'min', '75', '50', '25'], :]
-                    iv.index = pd.MultiIndex.from_product([['IV'], ['max', 'mean', 'min', '75', '50', '25']])
-                    if iv_eda.get(symbol) is None:
-                        iv_eda[symbol] = iv
-                    else:
-                        ############################################### CALL ###########################################
-                        iv_eda[symbol].iloc[0, 0] = \
-                            iv.iloc[0, 0] if iv.iloc[0, 0] > iv_eda[symbol].iloc[0, 0] else iv_eda[symbol].iloc[0, 0]
-                        iv_eda[symbol].iloc[1, 0] = .5*(iv.iloc[1, 0]+iv_eda[symbol].iloc[1, 0])
-                        iv_eda[symbol].iloc[2, 0] = \
-                            iv.iloc[2, 0] if iv.iloc[2, 0] < iv_eda[symbol].iloc[2, 0] else iv_eda[symbol].iloc[2, 0]
-                        ############################################### PUT ############################################
-                        iv_eda[symbol].iloc[0, 1] = \
-                            iv.iloc[0, 1] if iv.iloc[0, 1] > iv_eda[symbol].iloc[0, 1] else iv_eda[symbol].iloc[0, 1]
-                        iv_eda[symbol].iloc[1, 1] = .5 * (iv.iloc[1, 1] + iv_eda[symbol].iloc[1, 1])
-                        iv_eda[symbol].iloc[2, 1] = \
-                            iv.iloc[2, 1] if iv.iloc[2, 1] < iv_eda[symbol].iloc[2, 1] else iv_eda[symbol].iloc[2, 1]
-                    ####################################################################################################
-                    ## Strikes
-                    ####################################################################################################
-                    strikes = option_chain.select(['underlying_name', 'type', 'strike_price'])
-                    strikes = strikes.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                    strikes = strikes.group_by(['underlying_name', 'type'])
-                    strikes = strikes.agg(pl.col('strike_price').n_unique().alias('strike_count')).collect().to_pandas()
-                    strikes = strikes.set_index(['underlying_name', 'type']).transpose()
-                    strikes.index = pd.MultiIndex.from_product([['Total strikes'], ['']])
-                    strikes_eda[symbol] = \
-                        strikes if strikes_eda.get(symbol) is None else strikes_eda[symbol].add(strikes)
-                    ####################################################################################################
-                    ## Time to expiration
-                    ####################################################################################################
-                    time2mat = option_chain.select(['underlying_name', 'type', 'tau'])
-                    time2mat = time2mat.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                    time2mat = time2mat.group_by(['underlying_name', 'type']).agg(
-                        pl.col('tau').min().alias('min'), pl.col('tau').mean().alias('mean'),
-                        pl.col('tau').max().alias('max'), pl.col('tau').quantile(0.75).alias('75'),
-                        pl.col('tau').quantile(0.50).alias('50'), pl.col('tau').quantile(0.25).alias('25')
-                    ).collect().to_pandas()
-                    time2mat = \
-                        time2mat.set_index(['underlying_name', 'type']).transpose().loc[
-                        ['max', 'mean', 'min', '75', '50', '25'], :]
-                    time2mat.index = pd.MultiIndex.from_product([['Time to maturity'],
-                                                                 ['max', 'mean', 'min', '75', '50', '25']])
-                    if time2mat_eda.get(symbol) is None:
-                        time2mat_eda[symbol] = time2mat
-                    else:
-                        ############################################### CALL ###########################################
-                        time2mat_eda[symbol].iloc[0, 0] = \
-                            time2mat.iloc[0, 0] if time2mat.iloc[0, 0] > time2mat_eda[symbol].iloc[0, 0] \
-                                else time2mat_eda[symbol].iloc[0, 0]
-                        time2mat_eda[symbol].iloc[1, 0] = .5 * (time2mat_eda[symbol].iloc[1, 0] + time2mat.iloc[1, 0])
-                        time2mat_eda[symbol].iloc[2, 0] = \
-                            time2mat[symbol].iloc[2, 0] if time2mat.iloc[2, 0] < time2mat_eda[symbol].iloc[2, 0] \
-                                else time2mat_eda[symbol].iloc[2, 0]
-                        ############################################### PUT ############################################
-                        time2mat_eda[symbol].iloc[0, 1] = \
-                            time2mat.iloc[0, 1] if time2mat.iloc[0, 1] > time2mat_eda[symbol].iloc[0, 1] else \
-                                time2mat_eda[symbol].iloc[0, 1]
-                        time2mat_eda[symbol].iloc[1, 1] = .5 * (time2mat.iloc[1, 1] + time2mat_eda[symbol].iloc[1, 1])
-                        time2mat_eda[symbol].iloc[2, 1] = \
-                            time2mat.iloc[2, 1] if time2mat.iloc[2, 1] < time2mat_eda[symbol].iloc[2, 1] else \
-                                time2mat_eda[symbol].iloc[2, 1]
-                    ####################################################################################################
-                    ## Total observations
-                    ####################################################################################################
-                    tmp_symbol = \
-                        option_chain.filter(pl.col('underlying_name') == symbol).select(['underlying_name', 'type',
-                                                                                         'timestamp'])
-                    tmp_symbol = tmp_symbol.with_columns(pl.col('timestamp').dt.date().alias('date'))
-                    tmp_symbol = tmp_symbol.sort(by=[pl.col('underlying_name'), pl.col('type')])
-                    tmp_n_obs = \
-                        tmp_symbol.group_by(['underlying_name',
-                                             'type']).agg(pl.col('date').len().alias('Total observations')).collect()
-                    tmp_n_obs = tmp_n_obs.to_pandas().set_index(['underlying_name', 'type']).transpose()
-                    tmp_n_obs.index = pd.MultiIndex.from_product([['Total observations'], ['']])
-                    n_obs_eda[symbol] = tmp_n_obs if n_obs_eda.get(symbol) is None else n_obs_eda[symbol].add(tmp_n_obs)
-            summary_eda = pd.concat([pd.concat(moneyness_eda.values(), axis=1), pd.concat(iv_eda.values(), axis=1),
-                                     pd.concat(strikes_eda.values(), axis=1), pd.concat(time2mat_eda.values(), axis=1),
-                                     pd.concat(n_obs_eda.values(), axis=1)])
-        else:
-            underlying_price = pl.scan_parquet(f'{self._target_path}/*/*/spot/*-*-*')
-            underlying_price = underlying_price.select(['symbol', 'timestamp', 'mid_price[0]'])
-            underlying_price = \
-                underlying_price.collect().pivot(index='timestamp', values='mid_price[0]', on='symbol').to_pandas()
-            underlying_price = underlying_price.set_index('timestamp').sort_index()
-            returns = np.log(underlying_price.div(underlying_price.shift())).resample('1D').sum()
-            returns = returns.apply(lambda x: winsorize(x, [.005, .005]))
-            rv = (np.log(underlying_price.div(underlying_price.shift()))).apply(lambda x: winsorize(x, [.005, .005]))
-            rv = rv.pow(2).resample('1D').sum()
-            freq = returns.index[1] - returns.index[0]
-            rv = rv.mul((pd.to_timedelta(360, unit='d')//freq) ** .5)
-            summary_eda['Returns'] = \
-                returns.agg(['max', 'mean', 'min', lambda x: x.quantile(.75), lambda x: x.quantile(.5),
-                             lambda x: x.quantile(.25)])
-            summary_eda['Returns'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
-            summary_eda['Annualised RV'] = rv.agg(['max', 'mean', 'min', lambda x: x.quantile(.75),
-                                                   lambda x: x.quantile(.5), lambda x: x.quantile(.25)])
-            summary_eda['Annualised RV'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
-            summary_eda = pd.concat(summary_eda)[SYMBOLS]
-        summary_eda = summary_eda.style.format(decimal='.', thousands=',', precision={True: 2, False: 4}[options])
-        with open(f'{self._target_path}'
-                  f'/crypto_option_spot/summary{dict([(True, "_options"), (False, "")])[options]}.txt', 'w') as \
-                summary_file:
+            path = f'{self._target_path}/crypto_option_spot/data_summary_option.tex'
+            with open(path, 'w') as summary_file:
+                summary_file.write(self.option_latex(self.option_statistics()))
+            print(f'[EXPORT]: Summary EDA table for options has been exported to {path}.')
+            return
+        underlying_price = pl.scan_parquet(f'{self._target_path}/*/*/spot/*-*-*')
+        underlying_price = underlying_price.select(['symbol', 'timestamp', 'mid_price[0]'])
+        underlying_price = \
+            underlying_price.collect().pivot(index='timestamp', values='mid_price[0]', on='symbol').to_pandas()
+        underlying_price = underlying_price.set_index('timestamp').sort_index()
+        returns = np.log(underlying_price.div(underlying_price.shift())).resample('1D').sum()
+        returns = returns.apply(lambda x: winsorize(x, [.005, .005]))
+        rv = (np.log(underlying_price.div(underlying_price.shift()))).apply(lambda x: winsorize(x, [.005, .005]))
+        rv = rv.pow(2).resample('1D').sum()
+        freq = returns.index[1] - returns.index[0]
+        rv = rv.mul((pd.to_timedelta(360, unit='d')//freq) ** .5)
+        summary_eda['Returns'] = \
+            returns.agg(['max', 'mean', 'min', lambda x: x.quantile(.75), lambda x: x.quantile(.5),
+                         lambda x: x.quantile(.25)])
+        summary_eda['Returns'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
+        summary_eda['Annualised RV'] = rv.agg(['max', 'mean', 'min', lambda x: x.quantile(.75),
+                                               lambda x: x.quantile(.5), lambda x: x.quantile(.25)])
+        summary_eda['Annualised RV'].index = ['max', 'mean', 'min', '75%', '50%', '25%']
+        summary_eda = pd.concat(summary_eda)[SYMBOLS]
+        summary_eda = summary_eda.style.format(decimal='.', thousands=',', precision=4)
+        with open(f'{self._target_path}/crypto_option_spot/summary.txt', 'w') as summary_file:
             summary_file.writelines(summary_eda.to_latex())
-            print(f'[EXPORT]: '
-                  f'Summary EDA table for {dict([(True, "_options"), (False, "")])[options]} has been exported.')
+            print('[EXPORT]: Summary EDA table for the spot market has been exported.')
 
 
 if __name__ == '__main__':
