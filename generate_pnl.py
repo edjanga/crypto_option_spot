@@ -25,54 +25,19 @@ from constants import LOW_ATM_MONEYNESS, HIGH_ATM_MONEYNESS, N_TRIALS, N_JOBS, D
 DERIBIT_FEE_PREMIUM_PCT = 0.125
 BINANCE_TF = 0.001
 MIN_FEE_BPS_UNDERLYING = 0.0006
-# Share of the quoted bid-ask spread paid on each trade. P&L is measured mid to mid, so buying at the ask or selling at
-# the bid costs half the spread; a round trip costs one full spread.
 SPREAD_COST_SHARE = 0.5
-# Days to expiry [min, max) of the straddles traded for each forecasting horizon D: the option maturity is matched to
-# the horizon, and options in their last two days are never traded.
 EXPIRY_WINDOWS = {'1D': (2, 7), '1W': (7, 21), '1M': (30, 60)}
-# True: the position is set once per day from the first bar's signal, held until the day's last bar and closed there.
-# False: the position can change at every bar (original behaviour).
 HOLD_FULL_DAY = True
-# Bar of the day (0 = first) whose signal sets the held position. Bar 0 cannot be used for the RV strategy: its filter
-# needs the previous bar's realised value, which does not exist for the day's first bar.
 HOLD_SIGNAL_BAR = 1
-# Execution latency, in bars of the trading frequency: the order decided on a bar is filled at the price observed
-# EXECUTION_LAG_BARS bars later (0 = filled at the price of the bar the signal is computed on).
 EXECUTION_LAG_BARS = 1
-# svix.parquet stores the Crypto SVIX as an annualised volatility (generate_svix.py takes the square root), while the
-# RV forecasts are annualised variances. True: the variance risk premium is computed volatility minus volatility,
-# i.e. svix - sqrt(annualised RV forecast). False: the old behaviour (svix minus the variance forecast).
 VRP_IN_VOLATILITY = True
-# Every (target, pair, horizon D) trades the forecasts of its own best (regression, freq), chosen by
-# generate_mase_best_models.select_best_models: lowest out-of-sample MASE averaged over X^S and X^(S,O), scored on the
-# timestamps where both markets have a forecast (a (pair, D) without any is chosen on X^S alone).
-# True: the MASE is measured over the whole forecast sample, backtest period included (the choice then uses data of the
-# period it is tested on). False: only forecasts whose outcome is realised before --start_date are scored
-# (t + D <= --start_date), so the choice uses no data of the backtest period.
 SELECT_MODELS_ON_WHOLE_SAMPLE = True
-# The strategies run on this bar grid. A forecast of a coarser frequency, made at t, is carried forward over the bars
-# of its own period (a 1h forecast made at 10:00 is used at 10:00, 10:15, 10:30 and 10:45): it is built from the
-# features of the bar starting at t, exactly like the 15min forecast made at t, so this uses no future information.
 TRADING_FREQ = '15min'
-# Forecasts, realised values and Crypto SVIX are loaded from this many days before --start_date: the RV filter needs
-# the realised value of D days earlier (up to 30) and its normalisation the average over the previous D-day period, so
-# the first days of the backtest can trade. P&L is only counted from --start_date.
 WARMUP_DAYS = 61
-# True: every day a new position is opened per horizon D and held for HOLDING_DAYS[D] days (entry and exit at the same
-# bar of the day). The portfolio of a horizon is the equal-weighted average of its open positions (overlapping
-# tranches). False: positions are closed within the day (HOLD_FULL_DAY) or can change every bar.
 HOLD_OVER_HORIZON = True
 HOLDING_DAYS = {'1D': 1, '1W': 7, '1M': 30}
-# An option is only bought into a tranche if it still has at least this many days to expiry when the tranche is closed.
 MIN_DAYS_TO_EXPIRY_AT_EXIT = 1
-# True: a held straddle's P&L is its price change divided by its entry price (a position that is bought or sold once
-# and left alone). False: sum of bar-by-bar log returns, which overstates the gains and understates the losses of a
-# short position, and does the opposite for a long one, once prices move a lot over the holding period.
 HOLD_SIMPLE_RETURNS = True
-# The realised value `y` stored at time t is measured over [t, t + D]: it is only known at t + D.
-# When True, the realised series used by the RV filter and by mean_bar is delayed by D so that only
-# fully observed realised variance enters the trading decision (removes the look-ahead).
 LAG_REALISED_BY_HORIZON = True
 
 
@@ -292,30 +257,25 @@ def objective_daily(trial: optuna.trial.Trial, **kwargs) -> float:
 
 
 def vrp_forecast(forecast: pd.DataFrame) -> pd.DataFrame:
-    """The annualised RV forecast in the units of the Crypto SVIX (volatility when VRP_IN_VOLATILITY)."""
     return np.sqrt(forecast.clip(lower=0)) if VRP_IN_VOLATILITY else forecast
 
 
 def lagged_signal(x: pd.DataFrame) -> pd.DataFrame:
-    """Signal usable at each bar (one-bar lag). With HOLD_FULL_DAY or HOLD_OVER_HORIZON the position is set from the
-    signal of bar HOLD_SIGNAL_BAR and carried unchanged to the day's last bar."""
     x = x.shift()
     entry = HOLD_SIGNAL_BAR + 1
-    start = entry + EXECUTION_LAG_BARS                      # first bar on which the position earns a return
+    start = entry + EXECUTION_LAG_BARS
     if HOLD_FULL_DAY or HOLD_OVER_HORIZON:
         if len(x) > start:
             x.iloc[start:] = np.tile(x.iloc[[entry]].to_numpy(), (len(x) - start, 1))
             x.iloc[:start] = 0
         elif len(x) > entry:
-            x.iloc[:] = 0                                   # the day is too short to be filled
+            x.iloc[:] = 0
     elif EXECUTION_LAG_BARS:
         x = x.shift(EXECUTION_LAG_BARS)
     return x
 
 
 def weight_changes(x: pd.DataFrame) -> pd.DataFrame:
-    """Traded amount at each bar. With HOLD_FULL_DAY (and no multi-day holding) the position is closed on the day's
-    last bar, so both the entry and the exit are charged."""
     delta = x.diff()
     if HOLD_FULL_DAY and not HOLD_OVER_HORIZON and len(x) > 1:
         delta.iloc[-1] = -x.iloc[-1].to_numpy()
@@ -323,9 +283,6 @@ def weight_changes(x: pd.DataFrame) -> pd.DataFrame:
 
 
 def horizon_weights(day_signals: pd.DataFrame, sign_history: list) -> pd.DataFrame:
-    """First-moment strategy with overlapping tranches. `day_signals` holds today's held signal (columns (D, market)).
-    The weight of a horizon is the average of the signs of the last HOLDING_DAYS[D] days; it changes once per day, at
-    the entry bar, so the entering and the expiring tranche are netted before costs are charged."""
     entry = HOLD_SIGNAL_BAR + 1 + EXECUTION_LAG_BARS
     today_sign = day_signals.iloc[entry] if len(day_signals) > entry else day_signals.iloc[-1] * 0
     holding = day_signals.columns.get_level_values('D').map(HOLDING_DAYS).to_numpy()
@@ -346,8 +303,6 @@ def horizon_weights(day_signals: pd.DataFrame, sign_history: list) -> pd.DataFra
 
 
 def naive_utc(timestamps):
-    """Timestamps as timezone-naive UTC with nanosecond resolution (the pandas default), whatever they came in as.
-    Nanoseconds are used on purpose: older pandas versions mishandle other resolutions in resample / Grouper."""
     timestamps = pd.to_datetime(timestamps)
     if isinstance(timestamps, pd.Series):
         if timestamps.dt.tz is not None:
@@ -358,7 +313,6 @@ def naive_utc(timestamps):
 
 
 def paired_straddles(straddle_data: pl.LazyFrame) -> pd.DataFrame:
-    """Today's straddles (both legs quoted at the bar), one row per straddle and bar, before any moneyness filter."""
     horizons = list(EXPIRY_WINDOWS)
     out = straddle_data.filter(pl.len().over(['symbol', 'timestamp']) == 2).group_by(['symbol', 'timestamp'])
     out = out.agg([pl.col('mid_price').sum(), pl.col('spread').sum(), pl.col('transaction_fees').sum(),
@@ -368,14 +322,6 @@ def paired_straddles(straddle_data: pl.LazyFrame) -> pd.DataFrame:
 
 def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: list, lower_bound: float,
                      upper_bound: float, target: str) -> pd.DataFrame:
-    """Second-moment strategy with positions held over the forecasting horizon.
-    A tranche is opened every day for each horizon D: the straddles inside the calibrated moneyness band and inside
-    the expiry window of D at bar HOLD_SIGNAL_BAR, equally weighted, long or short according to the day's signal. It
-    is closed HOLDING_DAYS[D] days later at the same bar. Open tranches are marked on every bar, including the move
-    from the previous day's last quote to today's first one. The P&L of a horizon is the sum of its open tranches,
-    each with weight 1 / HOLDING_DAYS[D]. Entry and exit each pay the transaction fee / the bid-ask spread.
-    `tranches` is the list of open tranches; it is updated in place.
-    Returns the bar-level P&L in the layout the rest of the script expects."""
     horizons = signals.columns.get_level_values('D').unique().tolist()
     markets = signals.columns.get_level_values('market').unique().tolist()
     aggregations = signals.index.get_level_values('aggregated').unique().tolist()
@@ -394,7 +340,6 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
                                            for prefix in ['returns', 'returns_tc', 'returns_basc']], markets],
                                          names=[None, 'market'])
     pnl_today = dict([(a, pd.DataFrame(0., index=bars, columns=columns)) for a in aggregations])
-    # the held signal of each aggregation at the entry bar, looked up by time (not by row position)
     entry_signal = dict()
     for a in aggregations:
         day_signal = signals.xs(a, level='aggregated')
@@ -402,7 +347,6 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
         day_signal.index = pd.DatetimeIndex(naive_utc(day_signal.index))
         day_signal = day_signal.reindex(bars)
         entry_signal[a] = day_signal.iloc[entry] if len(bars) > entry else day_signal.iloc[-1] * 0
-    # ---- today's new tranches
     if len(bars) > entry and len(straddles):
         at_signal_bar = straddles[straddles['timestamp'] == bars[signal_bar]].set_index('symbol')
         in_band = at_signal_bar['moneyness'].between(lower_bound, upper_bound) & (at_signal_bar['mid_price'] > 0)
@@ -419,7 +363,6 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
                                  exit_time=bars[fill_bar] + pd.Timedelta(days=HOLDING_DAYS[D]),
                                  entry_fee=dict([(name, fee[name].reindex(columns=symbols).iloc[entry])
                                                  for name in fee])))
-    # ---- mark every open tranche on today's bars
     for tranche in list(tranches):
         D, symbols, weight = tranche['D'], tranche['symbols'], 1. / HOLDING_DAYS[tranche['D']]
         prices = mid.reindex(columns=symbols)
@@ -469,8 +412,6 @@ def horizon_hold_pnl(straddles: pd.DataFrame, signals: pd.DataFrame, tranches: l
 
 
 def expiry_eligibility_expressions() -> list:
-    """One boolean column per horizon D: True when the option's days to expiry fall in EXPIRY_WINDOWS[D]. When
-    positions are held over the horizon, the option must also outlive the holding period."""
     days_to_expiry = pl.col('tau').mul(360).round(6)
     out = []
     for D, (low, high) in EXPIRY_WINDOWS.items():
@@ -481,7 +422,6 @@ def expiry_eligibility_expressions() -> list:
 
 
 def eligible_straddle_counts(straddles: pl.LazyFrame, horizons: list) -> dict:
-    """Number of distinct straddles eligible for each horizon D (NaN when there is none)."""
     counts = straddles.group_by('symbol').agg([pl.col(f'eligible_{D}').any() for D in horizons])
     counts = counts.select([pl.col(f'eligible_{D}').sum() for D in horizons]).collect()
     if counts.height == 0:
@@ -493,7 +433,6 @@ def eligible_straddle_counts(straddles: pl.LazyFrame, horizons: list) -> dict:
 def pnl_expressions(return_col: str, weight_col: str, delta_weight_col: str,
                     transaction_fee_col: str, basc_fee_col: str, D: str):
     gross = pl.col(return_col) * pl.col(weight_col)
-    # a bar with no trade (or no fee quote) costs nothing; it must not blank the P&L of a position carried into it
     tf_cost = (pl.col(transaction_fee_col) * pl.col(delta_weight_col)).abs().fill_null(0)
     basc_cost = (pl.col(basc_fee_col) * pl.col(delta_weight_col)).abs().fill_null(0)
     return [(gross - tf_cost).fill_null(0).alias(f'returns_tc_{D}'),
@@ -584,12 +523,6 @@ SHARPE_TARGET_LABELS = {'returns': 'First', 'RV': 'Second'}   # first column (Mo
 
 
 def sharpe_table_latex(table: pd.DataFrame) -> str:
-    """A Sharpe or probabilistic Sharpe table as a LaTeX tabular (booktabs and multirow packages).
-    table: rows indexed by (target, D) or (target, vol_regime, D), labels already formatted (\\textit{1d}); columns
-    indexed by (underlying_name, market); cells are LaTeX strings (already formatted, e.g. bold) or numbers (printed
-    with two decimals; missing values as NaN). The header shows the pairs and the markets only, so the file compiles
-    as is (no pandas index names, whose underscores are not valid LaTeX); the first column is headed Moment (on the
-    row of the markets) and the targets are written First (returns) and Second (RV)."""
     def cell(value):
         if isinstance(value, str):
             return value
@@ -622,13 +555,116 @@ def sharpe_table_latex(table: pd.DataFrame) -> str:
             else:
                 labels.append(str(key[level]))
         if i > 0:
-            # rule above a new group: across the whole table for a new target, from the regime column otherwise
             changed = next((level for level in range(n_index - 1) if rows[i - 1][level] != key[level]), None)
             if changed is not None:
                 lines.append(rf'\cline{{{changed + 1}-{n_columns}}}')
         lines.append(' & '.join(labels + [cell(value) for value in values]) + r' \\')
     lines += [r'\bottomrule', r'\end{tabular}']
     return '\n'.join(lines) + '\n'
+STRATEGY_TABLES = [('first_moment', 'returns', ''), ('second_moment_aggregated', 'RV', '1'),
+                   ('second_moment_non_aggregated', 'RV', '0')]
+COST_VARIANTS = [(0, 0, ''), (1, 0, '_tf'), (0, 1, '_basc')]
+REGIME_COLUMNS = [('all', ''), ('low', r'\textit{low}'), ('normal', r'\textit{normal}'), ('high', r'\textit{high}')]
+TABLE_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
+TABLE_HORIZONS = ['1d', '1w', '1m']
+
+def _plain(label) -> str:
+    text = str(label)
+    for token in [r'\textit{', '}']:
+        text = text.replace(token, '')
+    return text.strip().lower()
+
+
+def _aggregated_key(value) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)) or str(value).strip() in ('', 'nan'):
+        return ''
+    return str(int(float(value)))
+
+
+def strategy_sharpe_long(pnl: dict, regime_sharpe: pd.DataFrame, regime_psr: pd.DataFrame,
+                         regime_mean: pd.DataFrame = None) -> pd.DataFrame:
+    rows = []
+    keys = ['aggregated', 'target', 'transaction_fees', 'spread']
+    for target in ['returns', 'RV']:
+        daily = pnl[target].droplevel(0, axis=1)
+        grouped = daily.groupby(level=keys)
+        sharpe = grouped.mean().div(grouped.std()).mul(360 ** .5)
+        psr = probabilistic_sharpe_ratio(pnl=pnl[target])
+        for metric, frame in [('sharpe', sharpe), ('psr', psr), ('mean', grouped.mean())]:
+            stacked = frame.stack(list(range(frame.columns.nlevels)), future_stack=True)
+            for key, value in stacked.items():
+                (aggregated, tgt, tf, spread), (pair, D, market) = key[:4], key[4:]
+                rows.append((tgt, _aggregated_key(aggregated), int(tf), int(spread), 'all', _plain(D), pair,
+                             int(market), metric, value))
+    for key, value in regime_sharpe.iloc[:, 0].items():
+        aggregated, tgt, tf, spread, regime, D, pair, market = key
+        rows.append((tgt, _aggregated_key(aggregated), int(tf), int(spread), _plain(regime), _plain(D), pair,
+                     int(market), 'sharpe', value))
+    if regime_mean is not None:
+        for key, value in regime_mean.iloc[:, 0].items():
+            aggregated, tgt, tf, spread, regime, D, pair, market = key
+            rows.append((tgt, _aggregated_key(aggregated), int(tf), int(spread), _plain(regime), _plain(D), pair,
+                         int(market), 'mean', value))
+    stacked = regime_psr.stack(list(range(regime_psr.columns.nlevels)), future_stack=True)
+    for key, value in stacked.items():
+        aggregated, tgt, tf, spread, regime, D, pair, market = key
+        rows.append((tgt, _aggregated_key(aggregated), int(tf), int(spread), _plain(regime), _plain(D), pair,
+                     int(market), 'psr', value))
+    return pd.DataFrame(rows, columns=['target', 'aggregated', 'transaction_fees', 'spread', 'regime', 'D', 'pair',
+                                       'market', 'metric', 'value'])
+
+
+def strategy_table_latex(long: pd.DataFrame, metric: str) -> str:
+    values = long[long['metric'] == metric].set_index(['pair', 'D', 'regime', 'market'])['value']
+    values = values[~values.index.duplicated(keep='last')]
+
+    def get(pair, D, regime, market):
+        value = values.get((pair, D, regime, market), np.nan)
+        return float(value) if value is not None else np.nan
+
+    def cell(value, bold):
+        if not np.isfinite(value):
+            return 'NaN'
+        signed = metric in ('sharpe', 'mean') and bold is not None
+        decimals = 3 if metric == 'mean' else 2
+        text = f'{value:+.{decimals}f}' if signed else f'{value:.{decimals}f}'
+        return rf'$\mathbf{{{text}}}$' if bold else (f'${text}$' if metric in ('sharpe', 'mean') else text)
+
+    title = {'sharpe': 'Sharpe ratio', 'psr': 'PSR', 'mean': r'Daily mean P\&L (\%)'}[metric]
+    scale = 100. if metric == 'mean' else 1.
+    n = 2 * len(REGIME_COLUMNS)
+    lines = [r'\begin{tabular}{ll' + 'rr' * len(REGIME_COLUMNS) + '}',
+             rf' &  & \multicolumn{{{n}}}{{r}}{{{title}}} \\',
+             ' &  & ' + ' & '.join(rf'\multicolumn{{2}}{{r}}{{{label}}}' for _, label in REGIME_COLUMNS) + r' \\',
+             ' &  & ' + ' & '.join(r'$X^S$ & $X^{(S,O)}$' for _ in REGIME_COLUMNS) + r' \\']
+    for pair in TABLE_PAIRS:
+        for i, D in enumerate(TABLE_HORIZONS):
+            cells = []
+            for regime, _ in REGIME_COLUMNS:
+                spot, augmented = scale * get(pair, D, regime, 0), scale * get(pair, D, regime, 1)
+                if metric in ('sharpe', 'mean'):
+                    change = augmented - spot
+                    cells += [cell(spot, None), cell(change, bool(np.isfinite(change) and change > 0))]
+                else:
+                    cells += [cell(spot, bool(np.isfinite(spot) and spot > .95)),
+                              cell(augmented, bool(np.isfinite(augmented) and augmented > .95))]
+            label = pair_label(pair) if i == 0 else ''
+            lines.append(f'{label} & \\textit{{{D}}} & ' + ' & '.join(cells) + r' \\')
+    lines.append(r'\end{tabular}')
+    return '\n'.join(lines) + '\n'
+
+
+def write_strategy_tables(long: pd.DataFrame, folder: str) -> list:
+    paths = []
+    for (name, target, aggregated), (tf, spread, suffix) in itertools.product(STRATEGY_TABLES, COST_VARIANTS):
+        subset = long[(long['target'] == target) & (long['aggregated'] == aggregated)
+                      & (long['transaction_fees'] == tf) & (long['spread'] == spread)]
+        for metric, prefix in [('sharpe', 'sharpe'), ('psr', 'proba_sharpe'), ('mean', 'mean_pnl')]:
+            path = f'{folder}/{prefix}_{name}{suffix}.tex'
+            with open(path, 'w') as file:
+                file.write(strategy_table_latex(subset, metric))
+            paths.append(path)
+    return paths
 
 
 def probabilistic_sharpe_ratio(pnl, benchmark=0.0, periods_per_year=360, vol_regime= False):
@@ -652,16 +688,12 @@ def probabilistic_sharpe_ratio(pnl, benchmark=0.0, periods_per_year=360, vol_reg
 
 
 def regime_annualisation(n_days: pd.DataFrame, periods_per_year: int = 360) -> pd.DataFrame:
-    """Annualisation factor of a regime-conditional Sharpe ratio: sqrt(periods_per_year * p), where p is the share
-    of the strategy's days that fall in the regime (days in the cell / days of that strategy over all regimes)."""
     other_levels = [name for name in n_days.index.names if name != 'vol_regime']
     share = n_days / n_days.groupby(level=other_levels, dropna=False).transform('sum')
     return (periods_per_year * share) ** .5
 
 
 def _trim_leading_nan(series: pd.Series) -> pd.Series:
-    """Drop rows before the series' first non-NaN value, so a trace's x-axis
-    starts at that series' own first valid date instead of the shared index start."""
     first_valid = series.first_valid_index()
     if first_valid is None:
         return series.iloc[0:0]
@@ -670,11 +702,7 @@ def _trim_leading_nan(series: pd.Series) -> pd.Series:
 
 def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dict, mean_bar: pd.DataFrame,
                          svix: pd.DataFrame, file_cutoff, progress_bar: bool = True) -> tuple:
-    """Backtest of one (target, pair): the strategy run over every day of the pair. Returns (target, pair, list of
-    bar-level P&L frames in day order). The (target, pair) backtests share no state, so they can run in separate
-    processes (--cpu_count) with the same result as one after the other. progress_bar: the daily calibration's progress
-    bar, switched off in parallel processes (several processes drawing bars on one log breaks tqdm)."""
-    global target, underlying_name                      # read by make_filter and objective_daily
+    global target, underlying_name
     target, underlying_name = target_name, pair
     forecast_underlying_name = pd.IndexSlice
     daily_pnl = list()
@@ -688,7 +716,6 @@ def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dic
              (pd.to_datetime(date) + relativedelta(days=1) >= file_cutoff) &
              (pd.to_datetime(date) < pd.Timestamp(args.end_date))]
         open_tranches = list()
-        # today's straddle table, kept for the next day, where it is "yesterday's" (the file is read and built once)
         straddle_cache = dict()
         for idx_file in range(1, len(underlying_name_dates)):
             yesterday_date = pd.to_datetime(underlying_name_dates[idx_file-1])
@@ -723,13 +750,10 @@ def backtest_target_pair(target_name: str, pair: str, args, data_per_target: dic
                     continue
             yesterday_mean_bar = \
                 underlying_name_mean_bar[underlying_name_mean_bar.index.date == yesterday_date.date()]
-            # the X^S columns decide whether the day can be traded (X^(S,O) may not have started yet)
             spot_mean_bar = yesterday_mean_bar.loc[:, yesterday_mean_bar.columns.get_level_values('market') == 0]
             if spot_mean_bar.dropna().empty:
                 continue
             yesterday_data = data_per_target['RV'][data_per_target['RV'].index.date == yesterday_date.date()]
-            # a pair is traded when its X^S forecasts are there for every horizon; X^(S,O) only trades on the
-            # days it has forecasts too (before that its signal is empty, so it takes no position)
             spot_only = yesterday_data.loc[:, yesterday_data.columns.get_level_values('market') == 0]
             tradable_assets = spot_only.isnull().all().groupby('underlying_name').sum()
             tradable_assets = tradable_assets[tradable_assets == 0].index
@@ -1077,8 +1101,6 @@ if __name__ == '__main__':
     volatility_order = CategoricalDtype(categories=['low', 'normal', 'high'], ordered=True)
     market_order = CategoricalDtype(categories=['$X^S$', '$X^{(S,O)}$'], ordered=True)
     forecasts_parquet = f'{args.target_path}/crypto_option_spot/forecasts.parquet'
-    # Backtest period: by default all the data. Each pair and each market trades from its own first forecast (a day
-    # without a forecast is not traded), so every pair is backtested over all the data it has.
     coverage = (pl.scan_parquet(forecasts_parquet)
                 .filter(pl.col('underlying_name').is_in(list(pairs_order.categories)))
                 .group_by(['underlying_name', 'market'])
@@ -1122,16 +1144,12 @@ if __name__ == '__main__':
                        (pl.col('D') == row['D']) & (pl.col('regression') == row['regression'])
             in_window = (pl.col('timestamp') >= pl.lit(load_start_ts)) & (pl.col('timestamp') < pl.lit(end_ts))
             lazy = pl.scan_parquet(forecasts_parquet).filter(selected & in_window)
-            # realised values on the trading grid: the target is the same at every frequency, so the TRADING_FREQ
-            # rows of the selected regression give it at every bar
             realised = lazy.filter(pl.col('freq') == TRADING_FREQ).select(
                 ['underlying_name', 'target', 'D', 'market', 'timestamp', pl.col('y').alias('values')])
             forecast = lazy.filter(pl.col('freq') == freq).select(
                 ['market', 'timestamp', pl.col('y_hat').alias('forecast')])
             realised = realised.collect().to_pandas().sort_values('timestamp')
             forecast = forecast.collect().to_pandas().sort_values('timestamp')
-            # each forecast is used from its own bar until the next bar of its frequency (exact match when
-            # freq == TRADING_FREQ)
             carry = pd.to_timedelta(freq) - pd.to_timedelta(TRADING_FREQ)
             piece = pd.merge_asof(realised, forecast, on='timestamp', by='market', direction='backward',
                                   tolerance=carry if carry > pd.Timedelta(0) else pd.Timedelta(0))
@@ -1180,7 +1198,7 @@ if __name__ == '__main__':
     if args.load_pnl:
         if not os.path.exists(daily_pnl_path):
             raise FileNotFoundError(f'--load_pnl was given but {daily_pnl_path} does not exist; run without it first.')
-        target_underlying_names = list()                  # nothing to backtest: the saved daily P&L is used below
+        target_underlying_names = list()
     file_cutoff = pd.Timestamp(args.start_date)
     pnl = \
         dict([(target, dict([(underlying_name, list()) for underlying_name in pairs_order.categories]))
@@ -1188,7 +1206,7 @@ if __name__ == '__main__':
     forecast_underlying_name = pd.IndexSlice
     jobs = [tuple(job) for job in target_underlying_names]
     try:
-        available_cpus = len(os.sched_getaffinity(0))   # the CPUs given to this job (e.g. by SLURM)
+        available_cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         available_cpus = os.cpu_count() or 1
     n_workers = max(1, min(int(args.cpu_count), len(jobs))) if jobs else 1
@@ -1197,7 +1215,6 @@ if __name__ == '__main__':
         results = [backtest_target_pair(t, p, args, data_per_target, mean_bar, svix, file_cutoff)
                    for t, p in tqdm(jobs)]
     else:
-        # each process gets its share of the CPUs for polars (read when the process starts)
         os.environ['POLARS_MAX_THREADS'] = str(max(1, available_cpus // n_workers))
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context('spawn')) as pool:
             futures = [pool.submit(backtest_target_pair, t, p, args, data_per_target, mean_bar, svix, file_cutoff,
@@ -1230,8 +1247,6 @@ if __name__ == '__main__':
                 combined = combined.loc[~outside]
             combined = combined.set_index(index_names)
             daily = combined.groupby(daily_grouper_level).sum()
-            # a (horizon, market) has no P&L before its first forecast: those days are empty, not zero, so the
-            # Sharpe ratios of X^S and X^(S,O) only cover the days each one could trade
             days = daily.index.get_level_values('timestamp')
             for column in daily.columns:
                 first = first_forecast_day.get((target, underlying_name, column[1], column[2]))
@@ -1241,11 +1256,8 @@ if __name__ == '__main__':
         for target in ['RV', 'returns']:
             pnl[target] = pd.concat(pnl[target], axis=1)
             pnl[target].index = pnl[target].index.remove_unused_levels()
-        # checkpoint: the figures and tables below can be rebuilt with --load_pnl without repeating the backtest
         pd.to_pickle(pnl, daily_pnl_path)
         print(f'Daily P&L saved to {daily_pnl_path}', flush=True)
-    # the pairs do not share the same days: joining them leaves the days in arrival order. Everything below
-    # (cumulative P&L, figures) needs them in chronological order.
     for target in ['RV', 'returns']:
         pnl[target] = pnl[target].sort_index()
     grouper_level = [pd.Grouper(level='aggregated'), pd.Grouper(level='target'), pd.Grouper(level='transaction_fees'),
@@ -1288,7 +1300,6 @@ if __name__ == '__main__':
                                                                  dash=dash),
                                                        name=f'{pair.replace("USDT", "/USDT")}', showlegend=False),
                                       col=col + 1, row=row + 1)
-        # legend: first row = X^S (solid) for every pair, second row = X^(S,O) (dashed) under the same pair
         for _, dash, market_label in market_styles:
             for idx, pair in enumerate(list(pairs_order.categories)):
                 if pair not in pairs_with_pnl:
@@ -1376,14 +1387,6 @@ if __name__ == '__main__':
             sharpe_xs.to_numpy(), xs_wins.to_numpy())
         tmp_sharpe.loc[:, pd.IndexSlice[:, '$X^{(S,O)}$']] = np.vectorize(_bold_if, otypes=[object])(
             sharpe_x_so.to_numpy(), ~xs_wins.to_numpy())
-        with open(f'{args.target_path}/crypto_option_spot/'
-                  f'sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
-                  'w') as sharpe_file:
-            sharpe_file.write(sharpe_table_latex(tmp_sharpe.droplevel('aggregated', axis=0)))
-        with open(f'{args.target_path}/crypto_option_spot/'
-                  f'proba_sharpe{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
-                  'w') as proba_sharpe_file:
-            proba_sharpe_file.write(sharpe_table_latex(tmp_proba_sharpe.droplevel('aggregated', axis=0)))
     start = datetime.fromisoformat(str(args.start_date))
     end = datetime.fromisoformat(str(args.end_date))
     rv = pl.scan_parquet(f'{args.target_path}/*/*/spot/*').select(['symbol', 'timestamp', 'mid_price[0]'])
@@ -1498,12 +1501,9 @@ if __name__ == '__main__':
             sharpe_per_volatility_regime_xs.to_numpy(), xs_wins.to_numpy())
         tmp_sharpe.loc[:, pd.IndexSlice[:, '$X^{(S,O)}$']] = np.vectorize(_bold_if, otypes=[object])(
             sharpe_per_volatility_regime_x_so.to_numpy(), ~xs_wins.to_numpy())
-        with open(f'{args.target_path}/crypto_option_spot/'
-                  f'sharpe_per_volatility{dict([(False, "_non_aggregated"), (True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
-                  'w') as sharpe_file:
-            sharpe_file.write(sharpe_table_latex(tmp_sharpe.droplevel('aggregated', axis=0)))
-        with open(f'{args.target_path}/crypto_option_spot/'
-                  f'proba_sharpe_per_volatility'
-                  f'{dict([(False, "_non_aggregated"),(True, "_aggregated")])[aggregated]}{fee_suffix}.tex',
-                  'w') as proba_sharpe_file:
-            proba_sharpe_file.write(sharpe_table_latex(tmp_proba_sharpe.droplevel('aggregated', axis=0)))
+    strategy_long = strategy_sharpe_long(
+        pnl, regime_sharpe=pd.concat([sharpe_pnl_per_vol_regime_returns, sharpe_pnl_per_vol_regime_rv]),
+        regime_psr=pd.concat([pnl_returns_proba_sharpe, pnl_rv_proba_sharpe]),
+        regime_mean=pd.concat([pnl_returns_mean, pnl_rv_mean]))
+    for path in write_strategy_tables(strategy_long, f'{args.target_path}/crypto_option_spot'):
+        print(f'Table written to {path}', flush=True)
