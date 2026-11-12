@@ -5,7 +5,7 @@ import polars as pl
 DAYS = {'1D': 1, '1W': 7, '1M': 30}
 HORIZON_LABELS = {'1D': r'\textit{1d}', '1W': r'\textit{1w}', '1M': r'\textit{1m}'}
 REGRESSION_LABELS = {'lightgbm': 'LightGBM', 'mlp': 'MLP'}
-PAIR_ORDER = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
+PAIR_ORDER = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']      # the pairs of the paper: any other pair is left out
 KEYS = ['underlying_name', 'target', 'regression', 'freq', 'D']
 
 
@@ -48,7 +48,7 @@ def select_best_models(forecasts_path: str, selection_end=None) -> pl.DataFrame:
     """Best (regression, freq) of every (target, underlying_name, D): lowest MASE_both, or lowest MASE_S when the
     (pair, D) has no timestamp where both markets have a forecast. Ties are broken by name for reproducibility.
     Columns: target, underlying_name, D, regression, freq, MASE, basis, n."""
-    scan = pl.scan_parquet(forecasts_path)
+    scan = pl.scan_parquet(forecasts_path).filter(pl.col('underlying_name').is_in(PAIR_ORDER))
     if selection_end is not None:
         selection_end = pd.Timestamp(selection_end)
         selection_end = (selection_end.tz_localize('UTC') if selection_end.tzinfo is None
@@ -71,7 +71,6 @@ def select_best_models(forecasts_path: str, selection_end=None) -> pl.DataFrame:
 def latex_table(best: pl.DataFrame) -> str:
     horizons = [D for D in DAYS if D in best['D'].unique().to_list()]
     pairs = [p for p in PAIR_ORDER if p in best['underlying_name'].unique().to_list()]
-    pairs += sorted(set(best['underlying_name'].unique().to_list()) - set(pairs))
     cell = {(r['underlying_name'], r['D']): r for r in best.iter_rows(named=True)}
     lines = [r'\begin{tabular}{l' + 'c' * len(horizons) + '}', r'\toprule',
              'Pair & ' + ' & '.join(HORIZON_LABELS[D] for D in horizons) + r' \\', r'\midrule']

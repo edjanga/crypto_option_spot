@@ -580,6 +580,144 @@ def pair_label(pair: str) -> str:
     return pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') and '/' not in pair else pair
 
 
+########################################################################################################################
+## Tables of the paper
+########################################################################################################################
+PAPER_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
+PAPER_HORIZONS = ['1D', '1W', '1M']
+PAPER_REGIMES = ['all', 'low', 'normal', 'high']           # 'all': unconditional
+# strategy -> (target, aggregated): first moment, second moment on aggregated and on non-aggregated Crypto SVIX
+PAPER_STRATEGIES = {'first': ('returns', ''), 'second': ('RV', '1'), 'second_non_aggregated': ('RV', '0')}
+# statistic -> (title in the panel, decimals, scale, X^(S,O) shown as the change relative to X^S)
+PAPER_STATISTICS = {'mean_pnl': (r'Daily mean P\&L (\%)', 3, 100., True),
+                    'sharpe': ('Sharpe ratio', 2, 1., True),
+                    'proba_sharpe': ('Probabilistic Sharpe ratio', 2, 1., False)}
+PAPER_TABLE_HEADER = (r'\setlength{\aboverulesep}{0pt}\setlength{\belowrulesep}{0pt}\renewcommand{\arraystretch}{1.15}'
+                      r'\setlength{\tabcolsep}{4.8pt}')
+PSR_BOLD = .95                                              # PSR above this (after rounding) in bold
+
+
+def _aggregated_key(target: str, value) -> str:
+    """The 'aggregated' level as a string: '' for returns, '0' or '1' for RV, whatever its dtype after reshaping."""
+    if target == 'returns':
+        return ''
+    return str(int(float(value)))
+
+
+def paper_pnl_statistics(pnl: dict, pnl_long: pd.DataFrame) -> pd.DataFrame:
+    """Daily mean P&L, annualized Sharpe ratio and probabilistic Sharpe ratio of every (target, aggregated,
+    transaction_fees, spread, underlying_name, D, market), unconditional (vol_regime 'all') and by volatility regime,
+    computed exactly as the other tables of this script: the unconditional statistics from the daily P&L, the
+    conditional ones from the daily P&L merged with the regime of its D-day window, the conditional Sharpe ratio
+    annualized with regime_annualisation. Values are not rounded."""
+    keys = ['target', 'aggregated', 'transaction_fees', 'spread', 'vol_regime', 'underlying_name', 'D', 'market']
+    frames = []
+    levels = ['aggregated', 'target', 'transaction_fees', 'spread']
+    for target in ['returns', 'RV']:
+        wide = pnl[target].droplevel(0, 1)
+        group = wide.groupby(level=levels)
+        mean, std = group.mean(), group.std()
+        stats = pd.concat({'mean_pnl': mean, 'sharpe': mean.div(std).mul(360 ** .5),
+                           'proba_sharpe': probabilistic_sharpe_ratio(pnl=pnl[target])}, names=['statistic'])
+        stats = stats.stack(['underlying_name', 'D', 'market'], future_stack=True).rename('value').reset_index()
+        frames.append(stats.assign(vol_regime='all'))
+    group_keys = ['aggregated', 'target', 'transaction_fees', 'spread', 'vol_regime', 'D', 'underlying_name', 'market']
+    for target in ['returns', 'RV']:
+        long = pnl_long[pnl_long['target'] == target]
+        group = long.groupby(group_keys, dropna=False)['returns']
+        mean, std, count = group.mean(), group.std(), group.count()
+        sharpe = mean.div(std).mul(regime_annualisation(count))
+        proba = probabilistic_sharpe_ratio(long, vol_regime=True)
+        proba = proba.stack(['underlying_name', 'market'], future_stack=True)
+        proba = proba.reorder_levels(group_keys)
+        stats = pd.concat({'mean_pnl': mean, 'sharpe': sharpe, 'proba_sharpe': proba}, names=['statistic'])
+        frames.append(stats.rename('value').reset_index())
+    stats = pd.concat(frames, ignore_index=True)
+    stats['vol_regime'] = stats['vol_regime'].astype(str).str.replace(r'\\textit\{(.*)\}', r'\1', regex=True).str.lower()
+    stats['aggregated'] = [_aggregated_key(t, a) for t, a in zip(stats['target'], stats['aggregated'])]
+    stats['D'] = stats['D'].astype(str).str.upper()
+    stats['market'] = stats['market'].astype(int)
+    stats['transaction_fees'] = stats['transaction_fees'].astype(int)
+    stats['spread'] = stats['spread'].astype(int)
+    return stats.set_index(['statistic'] + keys)['value'].sort_index()
+
+
+def _paper_value(value, decimals: int, bold: bool = False, math: bool = True, sign: bool = False) -> str:
+    if value is None or pd.isna(value):
+        return 'NaN'
+    text = f'{value:+.{decimals}f}' if sign else f'{value:.{decimals}f}'
+    if bold:
+        return rf'$\mathbf{{{text}}}$'
+    return f'${text}$' if math else text
+
+
+def paper_pnl_panel(stats: pd.Series, statistic: str, target: str, aggregated, fees: tuple, title: str) -> str:
+    """One panel of the P&L tables of the paper: a row per (pair, horizon); for the unconditional sample and each
+    volatility regime, X^S and X^(S,O). X^(S,O) is the change relative to X^S (+ sign, bold when positive) for the mean
+    P&L and the Sharpe ratio, the level (bold above PSR_BOLD) for the PSR. The change is computed before rounding, so
+    X^S plus the change can differ from the rounded X^(S,O) by one unit of the last decimal."""
+    _, decimals, scale, as_change = PAPER_STATISTICS[statistic]
+
+    def get(pair, D, regime, market):
+        try:
+            value = stats.loc[(statistic, target, aggregated, *fees, regime, pair, D, market)]
+        except KeyError:
+            return np.nan
+        return value * scale
+
+    lines = [r'\begin{tabular}{ll|rr|rr|rr|rr}', r'\toprule', rf'\multicolumn{{10}}{{c}}{{{title}}} \\', r'\midrule',
+             r' &  & \multicolumn{2}{c|}{Unconditional} & \multicolumn{6}{c}{Conditional} \\',
+             r' &  & \multicolumn{2}{c|}{} & ' + ' & '.join(
+                 rf'\multicolumn{{2}}{{c{"|" if regime != PAPER_REGIMES[-1] else ""}}}{{\textit{{{regime}}}}}'
+                 for regime in PAPER_REGIMES[1:]) + r' \\',
+             r' &  & ' + ' & '.join([r'$X^S$ & $X^{(S,O)}$'] * len(PAPER_REGIMES)) + r' \\', r'\midrule']
+    for i_pair, pair in enumerate(PAPER_PAIRS):
+        if i_pair:
+            lines.append(r' \cmidrule{2-10}')
+        for i_D, D in enumerate(PAPER_HORIZONS):
+            cells = []
+            for regime in PAPER_REGIMES:
+                x_s, x_so = get(pair, D, regime, 0), get(pair, D, regime, 1)
+                if as_change:
+                    change = x_so - x_s
+                    cells += [_paper_value(x_s, decimals),
+                              _paper_value(change, decimals, bold=round(change, decimals) > 0,
+                                           sign=round(change, decimals) > 0)]
+                else:
+                    cells += [_paper_value(x, decimals, bold=round(x, decimals) > PSR_BOLD if pd.notna(x) else False,
+                                           math=False) for x in (x_s, x_so)]
+            label = pair_label(pair) if i_D == 0 else ''
+            lines.append(f'{label} & \\textit{{{D.lower()}}} & ' + ' & '.join(cells) + r' \\')
+    lines += [r' \bottomrule', r'\end{tabular}']
+    return '\n'.join(lines)
+
+
+def write_paper_pnl_tables(pnl: dict, pnl_long: pd.DataFrame, folder: str, fee_variants: list) -> None:
+    """The P&L tables of the paper, ready to \\input inside a table environment (the captions are in the paper):
+    {statistic}_panels{fee}.tex: first-moment strategy in Panel A, second-moment strategy on aggregated Crypto SVIX in
+                                 Panel B (mean_pnl_panels.tex, sharpe_panels.tex and proba_sharpe_panels.tex);
+    {statistic}_second_moment_non_aggregated{fee}.tex: second-moment strategy on non-aggregated Crypto SVIX.
+    fee is '' (no transaction cost, the tables of the paper), '_tf' (transaction fees) or '_basc' (bid-ask spread)."""
+    stats = paper_pnl_statistics(pnl, pnl_long)
+    first, second, non_aggregated = (PAPER_STRATEGIES[k] for k in ['first', 'second', 'second_non_aggregated'])
+    for tf_flag, spread_flag, fee_suffix in fee_variants:
+        fees = (tf_flag, spread_flag)
+        for statistic, (title, _, _, _) in PAPER_STATISTICS.items():
+            panels = [paper_pnl_panel(stats, statistic, *first, fees,
+                                      f'Panel A: {title} of the first-moment strategy'),
+                      paper_pnl_panel(stats, statistic, *second, fees,
+                                      f'Panel B: {title} of the second-moment strategy')]
+            outputs = [(f'{statistic}_panels{fee_suffix}.tex',
+                        PAPER_TABLE_HEADER + '\n' + '\n\n\\vspace{1em}\n\n'.join(panels) + '\n'),
+                       (f'{statistic}_second_moment_non_aggregated{fee_suffix}.tex',
+                        PAPER_TABLE_HEADER + '\n' + paper_pnl_panel(stats, statistic, *non_aggregated, fees, title)
+                        + '\n')]
+            for name, text in outputs:
+                with open(f'{folder}/{name}', 'w') as file:
+                    file.write(text)
+    print(f'Tables of the paper (mean P&L, Sharpe and probabilistic Sharpe ratios) written to {folder}', flush=True)
+
+
 SHARPE_TARGET_LABELS = {'returns': 'First', 'RV': 'Second'}   # first column (Moment) of the Sharpe tables
 
 
@@ -1392,6 +1530,7 @@ if __name__ == '__main__':
     rv = rv.rename({'symbol': 'underlying_name',
                     'mid_price[0]': 'mid_price'}).with_columns([pl.col('timestamp').cast(pl.Datetime(time_unit='ms'))])
     rv = rv.filter(pl.col('timestamp').is_between(pl.lit(start), pl.lit(end), closed='left'))
+    rv = rv.filter(pl.col('underlying_name').is_in(list(pairs_order.categories)))   # market RV of the paper pairs only
     rv = rv.sort(['underlying_name', 'timestamp']).group_by_dynamic(index_column='timestamp',
                                                                     every='5m',
                                                                     group_by='underlying_name')
@@ -1425,6 +1564,9 @@ if __name__ == '__main__':
     pnl_rv = pnl_rv.merge(rv.collect().to_pandas(), on=['D', 'timestamp'], how='inner')
     pnl_rv_proba_sharpe = probabilistic_sharpe_ratio(pnl_rv, vol_regime=True)
     pnl_proba_sharpe_vol_regime = pd.concat([pnl_returns_proba_sharpe, pnl_rv_proba_sharpe])
+    # the mean P&L, Sharpe and probabilistic Sharpe ratio tables of the paper (unconditional and by regime)
+    write_paper_pnl_tables(pnl, pd.concat([pnl_returns, pnl_rv], ignore_index=True),
+                           f'{args.target_path}/crypto_option_spot', fee_variants)
     pnl_proba_sharpe_vol_regime = \
         pnl_proba_sharpe_vol_regime.rename(index=lambda x: rf'\textit{{{x.lower()}}}', level='D')
     pnl_proba_sharpe_vol_regime = pnl_proba_sharpe_vol_regime.rename(columns=market_label_map, level='market')

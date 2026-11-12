@@ -30,13 +30,17 @@ BARS_PER_DAY = 288
 MIN_BARS_PER_DAY = BARS_PER_DAY // 2
 # daily realised variance is printed in units of 10^-4 (multiplied by this factor), returns as they are
 RV_SCALE = 1e4
-SPOT_STATS = [('max', 'max'), ('mean', 'mean'), ('min', 'min'), ('75', r'75$^{\text{th}}$'),
-              ('50', r'50$^{\text{th}}$'), ('25', r'25$^{\text{th}}$')]
+SPOT_STATS = [('max', 'max'), ('mean', 'mean'), ('min', 'min'), ('75', r'75$^{\text{th}}$ percentile'),
+              ('50', r'50$^{\text{th}}$ percentile'), ('25', r'25$^{\text{th}}$ percentile')]
 STATS = ['max', 'mean', 'min']
 
 
+# column headers of the summary tables, as in the paper
+PAIR_NAMES = {'BTCUSDT': 'Bitcoin', 'ETHUSDT': 'Ethereum', 'SOLUSDT': 'Solana', 'BNBUSDT': 'Binance Coin'}
+
+
 def pair_label(pair: str) -> str:
-    return pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') else pair
+    return PAIR_NAMES.get(pair, pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') else pair)
 
 
 def option_aggregation(paths: list) -> pl.LazyFrame:
@@ -132,12 +136,12 @@ class EDA:
                 value = None if value is None else value.get(key) if isinstance(value, dict) else None
             return value
 
-        lines = [r'\begin{table}[H]', r'\centering', r'\scriptsize', r'\setlength{\tabcolsep}{1.5pt}',
+        lines = [r'\begin{table}[H]', r'\centering', r'\scriptsize', r'\setlength{\tabcolsep}{3.5pt}',
                  r'\begin{tabular}{l l ' + 'r' * len(columns) + '}', r'\toprule',
                  ' &  & ' + ' & '.join(rf'\multicolumn{{2}}{{c}}{{{pair_label(pair)}}}' for pair in OPTION_PAIRS)
                  + r' \\',
                  ' '.join(rf'\cmidrule(lr){{{3 + 2 * i}-{4 + 2 * i}}}' for i in range(len(OPTION_PAIRS))),
-                 ' & No. obs. & ' + ' & '.join(option_type.capitalize() for _, option_type in columns) + r' \\',
+                 ' &  & ' + ' & '.join(option_type.capitalize() for _, option_type in columns) + r' \\',
                  r'\midrule']
         for label in LABELS:
             lines.append(row('', label, [count(get(c, 'categories', label)) for c in columns]))
@@ -147,14 +151,16 @@ class EDA:
                 lines += [row('', 'Strikes', [count(get(c, 'strikes')) for c in columns]), r'\midrule']
                 continue
             for i, stat in enumerate(STATS):
-                lines.append(row(label if i == 0 else '', stat, [number(get(c, variable, stat)) for c in columns]))
+                first = rf'\multirow[c]{{{len(STATS)}}}{{*}}{{{label}}}' if i == 0 else ''
+                lines.append(row(first, stat, [number(get(c, variable, stat)) for c in columns]))
             lines.append(r'\midrule' if variable != 'ttm' else r'\bottomrule')
         lines += [r'\end{tabular}',
                   r'\caption{Summary statistics of option chain data. We report the total number of observations '
                   r'\mc{across each moneyness category}. The (max, mean, min) triplets represent the maximum, average, '
-                  r'and minimum values of the variables \mc{across observations} in the dataset. The figures reported '
+                  r'and minimum values of the variables \mc{across observations} in the dataset, whereas TTM stands for the '
+                  r'annualized time-to-maturity. The figures reported '
                   r'across the different moneyness categories indicate the number of contracts classified into each '
-                  r'category. Calls and puts share the same log-moneyness, strike, implied volatility and time-to-maturity '
+                  r'category. Calls and puts share the same log-moneyness, strike, implied volatility, and time-to-maturity '
                   r'statistics because \deribit{} lists a call and a put for every strike and expiry, and both legs carry the '
                   r'same mark implied volatility. For the same reason, the moneyness counts of calls and puts mirror each other: '
                   r'a strike that is deep out of the money for the call is deep in the money for the put.}',
@@ -209,11 +215,11 @@ class EDA:
         def number(value, scale=1., decimals=4):
             return 'NA' if value is None or not np.isfinite(value) else f'{value * scale:.{decimals}f}'
 
-        lines = [r'\begin{table}[H]', r'\centering', r'\small', r'\setlength{\tabcolsep}{3pt}',
+        lines = [r'\begin{table}[H]', r'\centering', r'\small', r'\setlength{\tabcolsep}{4pt}',
                  r'\begin{tabular}{l l ' + 'r' * len(OPTION_PAIRS) + '}', r'\toprule',
                  ' &  & ' + ' & '.join(pair_label(pair) for pair in OPTION_PAIRS) + r' \\', r'\midrule']
         for i_variable, (variable, label, scale, decimals) in enumerate(
-                [('returns', 'Returns', 1., 4), ('rv', r'RV ($\times 10^{-4}$)', RV_SCALE, 2)]):
+                [('returns', 'Returns', 1., 4), ('rv', 'RV', RV_SCALE, 2)]):
             if i_variable:
                 lines.append(r'\midrule')
             for i, (stat, name) in enumerate(SPOT_STATS):
