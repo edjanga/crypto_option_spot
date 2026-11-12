@@ -134,7 +134,9 @@ if __name__ == '__main__':
                     ####################################################################################################
                     ## First aggregation in USDT and level terms
                     ####################################################################################################
-                    agg_option_chain_data = exposure.join(pcr, on=['underlying_name', 'timestamp'])
+                    # exposure, pcr and spread are DataFrames with --collect=1 (default) and LazyFrames with --collect=0,
+                    # mkt_participants is always lazy: everything is joined lazily and collected once below
+                    agg_option_chain_data = exposure.lazy().join(pcr.lazy(), on=['underlying_name', 'timestamp'])
                     ####################################################################################################
                     ## Aggregation per contract type: call and put
                     ####################################################################################################
@@ -156,8 +158,8 @@ if __name__ == '__main__':
                              .alias(f'is_{mkt_participant}') for mkt_participant in
                              ['retail', 'informed', 'institutional']]).drop('mkt_participants')
                     agg_option_chain_data = \
-                        agg_option_chain_data.join(mkt_participants, on=['underlying_name', 'timestamp'],
-                                                   how='left').join(spread, on=['underlying_name', 'timestamp'])
+                        agg_option_chain_data.join(mkt_participants.lazy(), on=['underlying_name', 'timestamp'],
+                                                   how='left').join(spread.lazy(), on=['underlying_name', 'timestamp'])
                     agg_option_chain_data = \
                         agg_option_chain_data.unpivot(index=['underlying_name', 'timestamp'], variable_name='features',
                                                       value_name='features_values')
