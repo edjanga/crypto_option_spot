@@ -36,30 +36,6 @@ class FeatureBuilder:
                                            .forward_fill().over('underlying_name').alias(f'm{m}'))
         return moments.collect()
 
-    # @staticmethod
-    # def lags(data: pl.DataFrame, features: List[str] = ['RV']+[f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
-    #     intraday_lags_exprs = [pl.col(feature) for feature in features]
-    #     for lag in INTRADAY_LAGS:
-    #         window_size = int(pd.to_timedelta(lag) // pd.to_timedelta('5m'))
-    #         for feature in features:
-    #             intraday_lags_exprs.append((pl.col(f'{feature}').rolling_mean(window_size)).shift().over
-    #                                        ('underlying_name').alias(f'{feature}_{lag}'))
-    #     for lag in INTERDAY_LAGS:
-    #         feature_lag = list(product(features, [lag]))
-    #         pl_lag = f'{lag[:-1]}mo' if 'M' in lag else lag.lower()
-    #         if 'feature_lags' not in vars():
-    #             feature_lags = data.with_columns(intraday_lags_exprs)
-    #         feature_interday_lag = \
-    #             (data.group_by_dynamic(index_column='timestamp', every=pl_lag.lower(),  by='underlying_name')
-    #              .agg([(pl.col(f'{feature}').mean()).alias(f'{feature}_{lag}') for feature, lag in feature_lag]))
-    #         feature_interday_lag = feature_interday_lag.select(
-    #             [pl.col('underlying_name'), pl.col('timestamp')]+
-    #             [(pl.col(f'{feature}_{lag}').shift(1).over('underlying_name')) for feature, lag in feature_lag])
-    #     feature_lags = feature_lags.join(feature_interday_lag, on=['underlying_name', 'timestamp'], how='left')
-    #     feature_lags = \
-    #         feature_lags.with_columns([pl.col(f'{feature}_{lag}').fill_null(strategy='forward').over('underlying_name')
-    #              for feature, lag in feature_lag])
-    #     return feature_lags
     @staticmethod
     def lags(data: pl.DataFrame, features: List[str] = ['RV'] + [f'm{i}' for i in range(2, 7)]) -> pl.LazyFrame:
         intraday_lags_exprs = [pl.col(feature) for feature in features]
@@ -96,6 +72,11 @@ class FeatureBuilder:
 
     @staticmethod
     def compute_exposure(data: pl.DataFrame, freq: str, collect: bool = True) -> pd.DataFrame:
+        """Dealer exposures per bar. 'moneyness' is the log-moneyness k = log(K/F), F = S since r = 0
+        (generate_features.py converts the files' log(S/K)); sigma is the mark IV, tau the time to maturity in years.
+        With r = 0 these are the Black-Scholes exposures of the net dealer position: gex = Gamma S^2,
+        vex = gex tau sigma^2 = sigma * vega, vax = gex (k + tau sigma^2 / 2) = sigma S * vanna and
+        vox = vax (k - tau sigma^2 / 2) / sigma^2 = volga."""
         exposure = data
         pl_freq = freq.replace('min', 'm')
         for exp, greek in GREEKS_EXPOSURE.items():
@@ -108,7 +89,9 @@ class FeatureBuilder:
             elif exp == "vax":
                 expr = (pl.col('gex') * (pl.col('moneyness') + 0.5 * pl.col('tau') * (pl.col('mark_iv') ** 2)))
             elif exp == "vox":
-                expr = (pl.col('vax') * (-pl.col('moneyness') - 0.5 * pl.col('tau') * (pl.col('mark_iv') ** 2)))
+                # Black-Scholes volga (r = 0): vanna exposure times (k - tau sigma^2 / 2) / sigma^2
+                iv2 = pl.when(pl.col('mark_iv') > 0).then(pl.col('mark_iv') ** 2).otherwise(None)
+                expr = (pl.col('vax') * (pl.col('moneyness') - 0.5 * pl.col('tau') * iv2) / iv2)
             exposure = exposure.with_columns(expr.alias(exp))
         exposure = exposure.sort(by=[pl.col('underlying_name'), pl.col('timestamp')]).group_by_dynamic(
             index_column='timestamp', every=pl_freq, by='underlying_name').agg([pl.col(exp).sum() for exp in
@@ -176,8 +159,3 @@ class FeatureBuilder:
         mkt_participants_put = mkt_participants_put.drop('moneyness_label')
         mkt_participants = mkt_participants.join(mkt_participants_put, on=['underlying_name', 'timestamp'])
         return mkt_participants
-
-
-
-
-

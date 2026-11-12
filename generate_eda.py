@@ -19,8 +19,8 @@ YEARS = list(range(2023, 2026))
 # option files aggregated per query: one query per batch bounds the size of a query plan; the streaming engine
 # bounds memory within a batch
 FILES_PER_BATCH = 200
-# moneyness in the option files is log(S/K): the category thresholds are the logs of the S/K ratios in constants.py
-# (constants.MONEYNESS_BINS only logs the two middle ones, and polars sorts unsorted breaks silently)
+# the option files store log(S/K), S the spot price; the tables use the log-moneyness k = log(K/F) = -moneyness
+# (F = S since r = 0), cut at the logs of the K/F ratios in constants.py
 MONEYNESS_LOG_BINS = list(np.log([DOTM, OTM, ITM, DITM]))
 TYPES = ['call', 'put']
 # spot summary: returns are built from the last mid price of every SPOT_FREQ bar
@@ -43,9 +43,11 @@ def option_aggregation(paths: list) -> pl.LazyFrame:
     """One aggregation of a set of option files per (option type, moneyness category): number of rows, sum, count,
     min and max of log-moneyness, mark IV and time to maturity, and the distinct strikes."""
     chain = pl.scan_parquet(paths).select(['type', 'timestamp', 'strike_price', 'expiration', 'moneyness', 'mark_iv'])
+    chain = chain.with_columns(pl.col('moneyness').neg())                 # k = log(K/F)
     # exact time to maturity in years of 360 days
     ttm = (pl.col('expiration') - pl.col('timestamp')).dt.total_milliseconds() / (86_400_000 * 360)
-    # moneyness category 0..4 (DOTM..DITM for a call), intervals closed on the right as in polars' cut
+    # moneyness category 0..4 (DITM..DOTM for a call, DOTM..DITM for a put), intervals closed on the right as in
+    # polars' cut
     category = pl.sum_horizontal([(pl.col('moneyness') > b).cast(pl.Int8) for b in MONEYNESS_LOG_BINS])
     category = pl.when(pl.col('moneyness').is_null()).then(None).otherwise(category)
     chain = chain.select('type', 'strike_price', category.alias('category'), pl.col('moneyness'),
@@ -95,7 +97,7 @@ class EDA:
             print(f'[EDA] {pair}: {len(paths)} option files read', flush=True)
             for option_type in TYPES:
                 rows = parts.filter(pl.col('type') == option_type)
-                labels = LABELS if option_type == 'call' else LABELS[::-1]   # a deep OTM call is a deep ITM put
+                labels = LABELS[::-1] if option_type == 'call' else LABELS   # a deep ITM call is a deep OTM put
                 categories = dict((label, 0) for label in LABELS)
                 for category_index, n in rows.filter(pl.col('category').is_not_null()).group_by('category').agg(
                         pl.col('n').sum()).iter_rows():
@@ -140,7 +142,7 @@ class EDA:
         for label in LABELS:
             lines.append(row('', label, [count(get(c, 'categories', label)) for c in columns]))
         lines += [r'\midrule', row('', 'Total', [count(get(c, 'total')) for c in columns]), r'\midrule']
-        for variable, label in [('moneyness', r'\textit{log m}'), ('strikes', None), ('iv', 'IV'), ('ttm', 'TTM')]:
+        for variable, label in [('moneyness', r'$k$'), ('strikes', None), ('iv', 'IV'), ('ttm', 'TTM')]:
             if variable == 'strikes':
                 lines += [row('', 'Strikes', [count(get(c, 'strikes')) for c in columns]), r'\midrule']
                 continue
@@ -220,7 +222,7 @@ class EDA:
                           for pair in OPTION_PAIRS]
                 lines.append(f'{first} & {name} & ' + ' & '.join(values) + r' \\')
         lines += [r'\bottomrule', r'\end{tabular}',
-                  r'\caption{Summary statistics for daily \mc{log-}returns and daily realised variance (RV). '
+                  r'\caption{Summary statistics for daily \mc{log-}returns and daily realized variance (RV). '
                   r'\edd{Both are computed from non-overlapping 5-minute log-returns of the mid price, 288 per day: the '
                   r'daily log-return is their sum and the daily RV the sum of their squares. RV is reported in units of '
                   r'$10^{-4}$.}}',

@@ -14,8 +14,10 @@ zeroDTE, SHORT, MID = 1/360, 7/360, 30/360
 MATURITY_BINS = [-np.inf, zeroDTE, SHORT, MID, np.inf]
 MATURITY_LABELS = ['0DTE', 'Short', 'Mid', 'Long']
 DOTM, OTM, ITM, DITM = .85, .95, 1.05, 1.15
-MONEYNESS_BINS = [DOTM, OTM, ITM, DITM]
-MONEYNESS_BINS[1:-1] = list(map(lambda x: np.log(x), MONEYNESS_BINS[1:-1]))
+# cut points of the log-moneyness k = log(K/F), F = S e^{r tau} = S since r = 0 (S: underlying spot price); every
+# threshold is a log ratio (the two outer ones used not to be logged). The option files store log(S/K): readers use
+# k = -moneyness.
+MONEYNESS_BINS = list(np.log([DOTM, OTM, ITM, DITM]))
 LABELS = ['DOTM', 'OTM', 'ATM', 'ITM', 'DITM']
 SUPERSCRIPT = {1: 'st', 2: 'nd', 3: 'rd'}
 EXPOSURE = ['gex', 'vax', 'vex', 'vox']
@@ -32,7 +34,7 @@ LABEL_AXIS_FONT_SIZE = 30
 LEGEND_FONT_SIZE = 20
 HEIGHT = 900
 WIDTH = 1_300
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'] #'XRPUSDT',
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
 LOW_ATM_MONEYNESS = .85
 HIGH_ATM_MONEYNESS = 1.15
 ATM_MONEYNESSES = \

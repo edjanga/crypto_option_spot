@@ -95,6 +95,8 @@ if __name__ == '__main__':
                      os.path.exists(option_chain_filename)]
                 if len(option_chain_filenames) > 0:
                     options = pl.scan_parquet(option_chain_filenames)
+                    # the files store log(S/K), S the spot price: from here on, moneyness is k = log(K/F) = log(K/S) (r = 0)
+                    options = options.with_columns(pl.col('moneyness').neg())
                     tmp_options = \
                         options.with_columns(
                             ((pl.col('expiration') - pl.col('timestamp')) / pl.duration(days=360)).alias('tau'))
@@ -110,6 +112,8 @@ if __name__ == '__main__':
                     #         .when(is_call).then(pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS[::-1]))
                     #         .otherwise(None).alias('moneyness_label'))
                     moneyness_dtype = pl.Enum(LABELS)
+                    # k = log(K/F): its lowest bin (K far below F = S) is deep in the money for a call and deep out of the
+                    # money for a put, so puts take LABELS in order and calls in reverse order
                     tmp_options = tmp_options.with_columns(
                         pl.when(is_put).then(
                             pl.col('moneyness').cut(MONEYNESS_BINS, labels=LABELS).cast(moneyness_dtype))
@@ -173,4 +177,3 @@ if __name__ == '__main__':
                     print(f'[Features]: No data for {symbol} between {date.strftime(DATE_FORMAT)} and '
                           f'{(date+relativedelta(days=30)).strftime(DATE_FORMAT)}.')
             print(f'[Insertion]: Option features for {symbol} have been inserted into the database.')
-
