@@ -7,6 +7,7 @@ _cpu_count = _pre_parser.parse_known_args()[0].cpu_count
 if _cpu_count:
     os.environ['POLARS_MAX_THREADS'] = str(_cpu_count)
 import itertools
+from datetime import date
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -16,6 +17,9 @@ import polars as pl
 # pairs (columns) of the option summary table, in this order
 OPTION_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']
 YEARS = list(range(2023, 2026))
+# sample of the paper: 1 January 2023 to 30 June 2025, both included (UTC dates)
+START_DATE = date(2023, 1, 1)
+END_DATE = date(2025, 6, 30)
 # option files aggregated per query: one query per batch bounds the size of a query plan; the streaming engine
 # bounds memory within a batch
 FILES_PER_BATCH = 200
@@ -43,10 +47,40 @@ def pair_label(pair: str) -> str:
     return PAIR_NAMES.get(pair, pair[:-len('USDT')] + '/USDT' if pair.endswith('USDT') else pair)
 
 
+def in_sample() -> pl.Expr:
+    """Rows whose UTC date lies in [START_DATE, END_DATE]."""
+    return pl.col('timestamp').dt.date().is_between(pl.lit(START_DATE), pl.lit(END_DATE), closed='both')
+
+
+def sample_files(folder: Path) -> list:
+    """Files of a folder named by date (YYYY-MM-DD) whose date lies in [START_DATE, END_DATE]; a file whose name is not a
+    date is kept, its rows being filtered by timestamp anyway."""
+    out = []
+    for path in folder.glob('*-*-*'):
+        try:
+            day = date.fromisoformat(path.name[:10])
+        except ValueError:
+            out.append(str(path))
+            continue
+        if START_DATE <= day <= END_DATE:
+            out.append(str(path))
+    return out
+
+
+def write_file(path: str, text: str) -> None:
+    """Writes a table once it has been computed, through a temporary file, so that an interrupted run never leaves an
+    empty or partial table behind."""
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as file:
+        file.write(text)
+    os.replace(tmp, path)
+
+
 def option_aggregation(paths: list) -> pl.LazyFrame:
     """One aggregation of a set of option files per (option type, moneyness category): number of rows, sum, count,
     min and max of log-moneyness, mark IV and time to maturity, and the distinct strikes."""
     chain = pl.scan_parquet(paths).select(['type', 'timestamp', 'strike_price', 'expiration', 'moneyness', 'mark_iv'])
+    chain = chain.filter(in_sample())
     chain = chain.with_columns(pl.col('moneyness').neg())                 # k = log(K/F)
     # exact time to maturity in years of 360 days
     ttm = (pl.col('expiration') - pl.col('timestamp')).dt.total_milliseconds() / (86_400_000 * 360)
@@ -74,7 +108,7 @@ def collect_fast(query: pl.LazyFrame) -> pl.DataFrame:
 def spot_bars(paths: list) -> pl.LazyFrame:
     """Last mid price of every SPOT_FREQ bar of a set of spot files (bars labelled by their start)."""
     spot = pl.scan_parquet(paths).select([pl.col('timestamp').cast(pl.Datetime('ms')), pl.col('mid_price[0]').alias('mid')])
-    spot = spot.filter(pl.col('mid') > 0)
+    spot = spot.filter((pl.col('mid') > 0) & in_sample())
     return spot.group_by(pl.col('timestamp').dt.truncate(SPOT_FREQ).alias('bar')).agg(
         pl.col('mid').sort_by('timestamp').last(), pl.col('timestamp').max().alias('last_update'))
 
@@ -84,16 +118,16 @@ class EDA:
         self._target_path = target_path
 
     def option_statistics(self) -> dict:
-        """Exact summary statistics of the option chains of every pair and option type, over every option file of
-        YEARS: number of observations per moneyness category and in total, (max, mean, min) of log-moneyness, mark IV
+        """Exact summary statistics of the option chains of every pair and option type, over every option observation
+        from START_DATE to END_DATE: number of observations per moneyness category and in total, (max, mean, min) of log-moneyness, mark IV
         and time to maturity (means over all observations), and number of distinct strikes.
         Every file is read once: a single aggregation query per batch of files, run on polars' streaming engine."""
         out = dict()
         for pair in OPTION_PAIRS:
-            paths = sorted(str(path) for year in YEARS
-                           for path in Path(f'{self._target_path}/{pair}/{year}/options').glob('*-*-*'))
+            paths = sorted(path for year in YEARS
+                           for path in sample_files(Path(f'{self._target_path}/{pair}/{year}/options')))
             if not paths:
-                print(f'WARNING: no option file for {pair} in {YEARS} -- its columns are left as NA.')
+                print(f'WARNING: no option file for {pair} from {START_DATE} to {END_DATE} -- its columns are left as NA.')
                 continue
             parts = [collect_fast(option_aggregation(paths[start:start + FILES_PER_BATCH]))
                      for start in range(0, len(paths), FILES_PER_BATCH)]
@@ -171,25 +205,24 @@ class EDA:
         summary_eda = dict()
         if options:
             path = f'{self._target_path}/crypto_option_spot/data_summary_option.tex'
-            with open(path, 'w') as summary_file:
-                summary_file.write(self.option_latex(self.option_statistics()))
+            write_file(path, self.option_latex(self.option_statistics()))
             print(f'[EXPORT]: Summary EDA table for options has been exported to {path}.')
             return
         path = f'{self._target_path}/crypto_option_spot/data_summary_spot.tex'
-        with open(path, 'w') as summary_file:
-            summary_file.write(self.spot_latex(self.spot_statistics()))
+        write_file(path, self.spot_latex(self.spot_statistics()))
         print(f'[EXPORT]: Summary EDA table for the spot market has been exported to {path}.')
 
     def spot_statistics(self) -> dict:
-        """Daily log returns and daily realised variance of every pair, from 5-minute log returns of the mid price:
+        """Daily log returns and daily realised variance of every pair from START_DATE to END_DATE (both included),
+        from 5-minute log returns of the mid price:
         the daily log return is the sum of the day's 5-minute log returns (close to close), the daily realised variance
         the sum of their squares. Returns {pair: {'returns': {stat: value}, 'rv': {stat: value}, 'days': n}}."""
         out = dict()
         for pair in OPTION_PAIRS:
-            paths = sorted(str(path) for year in YEARS
-                           for path in Path(f'{self._target_path}/{pair}/{year}/spot').glob('*-*-*'))
+            paths = sorted(path for year in YEARS
+                           for path in sample_files(Path(f'{self._target_path}/{pair}/{year}/spot')))
             if not paths:
-                print(f'WARNING: no spot file for {pair} in {YEARS} -- its column is left as NA.')
+                print(f'WARNING: no spot file for {pair} from {START_DATE} to {END_DATE} -- its column is left as NA.')
                 continue
             bars = pl.concat([collect_fast(spot_bars(paths[start:start + FILES_PER_BATCH]))
                               for start in range(0, len(paths), FILES_PER_BATCH)])
@@ -199,7 +232,8 @@ class EDA:
             daily = returns.group_by(pl.col('bar').dt.date().alias('date')).agg(
                 pl.col('r').sum().alias('returns'), pl.col('r').pow(2).sum().alias('rv'), pl.len().alias('n_bars'))
             kept = daily.filter(pl.col('n_bars') >= MIN_BARS_PER_DAY)
-            print(f'[EDA] {pair}: {len(paths)} spot files, {daily.height} days, {daily.height - kept.height} day(s) '
+            print(f'[EDA] {pair}: {len(paths)} spot files, {daily.height} days from {daily["date"].min()} to '
+                  f'{daily["date"].max()}, {daily.height - kept.height} day(s) '
                   f'with fewer than {MIN_BARS_PER_DAY} 5-minute returns left out', flush=True)
             out[pair] = dict(days=kept.height)
             for variable in ['returns', 'rv']:
